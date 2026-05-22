@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements.ntc.txt /app/requirements.ntc.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev libopus0 \
+    && pip install --no-cache-dir -r /app/requirements.ntc.txt \
+    && apt-get purge -y --auto-remove gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /app
+
+EXPOSE 1977
+
+CMD ["gunicorn", "-w", "1", "--threads", "4", "-b", "0.0.0.0:1977", "ntc_recordings_panel:app"]
