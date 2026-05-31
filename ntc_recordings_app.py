@@ -74,6 +74,8 @@ class RecordingCandidate:
     size_bytes: int
     modified_at: str
     relative_path: str
+    target_type: str = "file"
+    file_count: int = 1
 
 
 class ClosingSQLiteConnection(sqlite3.Connection):
@@ -187,7 +189,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not requester_name or not email or not requested_date:
             return redirect(url_for("public_form", error="Name, email, and recording date are required."))
         recordings = _get_recordings(app)
-        candidate = _default_candidate_for_date(recordings, requested_date, recording_kind)
+        candidate = _default_candidate_for_date(app, recordings, requested_date, recording_kind)
         if not candidate:
             return redirect(url_for("public_form", error="Please choose one of the available recording dates."))
         request_id = _insert_request(
@@ -244,41 +246,79 @@ def create_app(test_config: dict | None = None) -> Flask:
         guard = _require_admin()
         if guard:
             return guard
-        _auto_archive_completed_requests(app)
+        _auto_archive_closed_requests(app)
         recordings = _get_recordings(app)
         requests = _list_requests(app)
         active_tab = (request.args.get("tab") or "pending").strip().lower()
-        if active_tab not in {"pending", "completed", "archived"}:
+        if active_tab == "completed":
+            active_tab = "active"
+        if active_tab not in {"pending", "active", "closed", "archived"}:
             active_tab = "pending"
-        pending_requests = [item for item in requests if not item["archived_at"] and item["status"] in {"pending", "ready"}]
-        completed_requests = [item for item in requests if not item["archived_at"] and item["status"] in {"sent", "revoked"}]
+        pending_requests = [item for item in requests if not item["archived_at"] and item["status"] == "pending"]
+        active_requests = [item for item in requests if not item["archived_at"] and item["status"] in {"ready", "sent"}]
+        closed_requests = [item for item in requests if not item["archived_at"] and item["status"] == "revoked"]
         archived_requests = [item for item in requests if item["archived_at"]]
         if active_tab == "pending":
             visible_requests = pending_requests
-        elif active_tab == "completed":
-            visible_requests = completed_requests
+        elif active_tab == "active":
+            visible_requests = active_requests
+        elif active_tab == "closed":
+            visible_requests = closed_requests
         else:
             visible_requests = archived_requests
         candidates_by_request = {}
         for item in visible_requests:
-            candidates_by_request[item["id"]] = _candidate_options_for_request(recordings, item)
+            candidates_by_request[item["id"]] = _candidate_options_for_request(app, recordings, item)
+        candidate_groups_by_request = {
+            item["id"]: _candidate_groups(candidates_by_request[item["id"]])
+            for item in visible_requests
+        }
+        tab_copy = {
+            "pending": (
+                "Pending Requests",
+                "New requests. Open a row, confirm the selection, then send the link.",
+                "No pending requests.",
+            ),
+            "active": (
+                "Active Links",
+                "Sent and prepared links stay visible here until access is revoked.",
+                "No active links.",
+            ),
+            "closed": (
+                "Closed Requests",
+                "Revoked requests can be reviewed and archived after access is closed.",
+                "No closed requests.",
+            ),
+            "archived": (
+                "Archived Requests",
+                "Archived requests are kept for history. Active links should be revoked before archiving.",
+                "No archived requests.",
+            ),
+        }
+        tab_title, tab_description, empty_message = tab_copy[active_tab]
         return render_template_string(
             RECORDING_ADMIN_TEMPLATE,
             title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
             requests=visible_requests,
             pending_count=len(pending_requests),
-            completed_count=len(completed_requests),
+            active_count=len(active_requests),
+            closed_count=len(closed_requests),
             archived_count=len(archived_requests),
             recording_count=len(recordings),
             recording_counts_by_kind=_recording_counts_by_kind(recordings),
             active_tab=active_tab,
+            tab_title=tab_title,
+            tab_description=tab_description,
+            empty_message=empty_message,
             auto_archive_days=int(app.config.get("NTC_RECORDINGS_AUTO_ARCHIVE_DAYS") or 0),
             candidates_by_request=candidates_by_request,
+            candidate_groups_by_request=candidate_groups_by_request,
             email_enabled=_email_enabled(app),
             share_provider=(app.config.get("NTC_RECORDINGS_SHARE_PROVIDER") or "internal"),
             message=request.args.get("message"),
             error=request.args.get("error"),
             default_email_message=_default_recording_email_message,
+            candidate_option_label=_candidate_option_label,
             status_label=_status_label,
             format_date=_format_date,
             format_datetime=_format_datetime,
@@ -293,14 +333,14 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not row:
             return redirect(url_for("admin_panel", tab="pending", error="Request was not found."))
         recording_id = (request.form.get("recording_id") or "").strip()
-        candidate = _recording_by_id(app, recording_id)
+        candidate = _recording_target_by_id(app, recording_id)
         if not candidate:
             return redirect(url_for("admin_panel", tab="pending", error="Selected recording was not found."))
         email_message = (request.form.get("email_message") or "").strip()
         if not email_message:
             email_message = _default_recording_email_message(row, candidate)
         token = row["share_token"] or secrets.token_urlsafe(22)
-        share_url, share_provider, share_external_id, share_error = _create_share_link(app, candidate, token)
+        share_url, share_provider, share_external_id, share_error = _create_share_link(app, candidate, token, existing_row=row)
         email_sent, email_error = _send_recording_email(app, row, candidate, share_url, email_message)
         status = "sent" if email_sent else "ready"
         combined_error = "; ".join(item for item in (share_error, email_error) if item)
@@ -317,8 +357,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             email_message=email_message,
         )
         if email_sent:
-            return redirect(url_for("admin_panel", tab="completed", message=f"Recording link emailed to {row['email']}."))
-        return redirect(url_for("admin_panel", tab="pending", message="Share link is ready."))
+            return redirect(url_for("admin_panel", tab="active", message=f"Recording link emailed to {row['email']}."))
+        return redirect(url_for("admin_panel", tab="active", message="Share link is ready."))
 
     @app.post("/admin/requests/<int:request_id>/revoke")
     def revoke_request_link(request_id: int):
@@ -329,13 +369,15 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not row:
             return redirect(url_for("admin_panel", tab="pending", error="Request was not found."))
         target_tab = (request.form.get("tab") or "").strip().lower()
-        if target_tab not in {"pending", "completed", "archived"}:
-            target_tab = "completed"
+        if target_tab == "completed":
+            target_tab = "active"
+        if target_tab not in {"pending", "active", "closed", "archived"}:
+            target_tab = "closed"
         revoke_error = _revoke_share_link(app, row)
         _mark_request_revoked(app, request_id, revoke_error=revoke_error)
         if revoke_error:
-            return redirect(url_for("admin_panel", tab=target_tab, error=f"Request closed locally. Revoke warning: {revoke_error}"))
-        return redirect(url_for("admin_panel", tab=target_tab, message="Recording access revoked."))
+            return redirect(url_for("admin_panel", tab="closed", error=f"Request closed locally. Revoke warning: {revoke_error}"))
+        return redirect(url_for("admin_panel", tab="closed", message="Recording access revoked."))
 
     @app.post("/admin/requests/<int:request_id>/archive")
     def archive_request(request_id: int):
@@ -344,9 +386,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             return guard
         row = _get_request(app, request_id)
         if not row:
-            return redirect(url_for("admin_panel", tab="completed", error="Request was not found."))
-        if row["status"] not in {"sent", "revoked"}:
-            return redirect(url_for("admin_panel", tab="pending", error="Only completed or revoked requests can be archived."))
+            return redirect(url_for("admin_panel", tab="closed", error="Request was not found."))
+        if row["status"] != "revoked":
+            return redirect(url_for("admin_panel", tab="active", error="Revoke access before archiving a request."))
         _archive_request(app, request_id)
         return redirect(url_for("admin_panel", tab="archived", message="Request archived."))
 
@@ -355,11 +397,14 @@ def create_app(test_config: dict | None = None) -> Flask:
         row = _get_request_by_token(app, token)
         if not row or not row["recording_path"]:
             return render_template_string(RECORDING_SHARE_MISSING_TEMPLATE), 404
+        shared_path = Path(row["recording_path"])
         return render_template_string(
             RECORDING_SHARE_TEMPLATE,
             title=row["recording_title"] or "Requested Recording",
             request_row=row,
             download_url=url_for("download_recording", token=token),
+            is_folder=shared_path.exists() and shared_path.is_dir(),
+            folder_items=_folder_audio_items(app, shared_path),
             format_date=_format_date,
         )
 
@@ -527,7 +572,7 @@ def _status_label(status: str) -> str:
     labels = {
         "pending": "Pending",
         "ready": "Link Ready",
-        "sent": "Completed",
+        "sent": "Sent",
         "revoked": "Revoked",
     }
     return labels.get(status, status.replace("_", " ").title())
@@ -622,13 +667,13 @@ def _archive_request(app: Flask, request_id: int) -> None:
             """
             UPDATE recording_requests
             SET archived_at = ?
-            WHERE id = ? AND status IN ('sent', 'revoked')
+            WHERE id = ? AND status = 'revoked'
             """,
             (_utc_now(), request_id),
         )
 
 
-def _auto_archive_completed_requests(app: Flask) -> int:
+def _auto_archive_closed_requests(app: Flask) -> int:
     days = int(app.config.get("NTC_RECORDINGS_AUTO_ARCHIVE_DAYS") or 0)
     if days <= 0:
         return 0
@@ -640,8 +685,8 @@ def _auto_archive_completed_requests(app: Flask) -> int:
             UPDATE recording_requests
             SET archived_at = ?
             WHERE archived_at IS NULL
-              AND status IN ('sent', 'revoked')
-              AND COALESCE(revoked_at, sent_at, created_at) <= ?
+              AND status = 'revoked'
+              AND COALESCE(revoked_at, created_at) <= ?
             """,
             (_utc_now(), cutoff_iso),
         )
@@ -685,6 +730,22 @@ def _path_allowed(app: Flask, path: Path) -> bool:
     return False
 
 
+def _folder_audio_items(app: Flask, path: Path) -> list[str]:
+    if not _path_allowed(app, path) or not path.exists() or not path.is_dir():
+        return []
+    items = []
+    for item in path.rglob("*"):
+        if not item.is_file() or item.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        if item.name.startswith("._") or any(part.startswith(".") for part in item.parts):
+            continue
+        try:
+            items.append(str(item.relative_to(path)))
+        except ValueError:
+            items.append(item.name)
+    return sorted(items)
+
+
 def _scan_recordings(app: Flask) -> list[RecordingCandidate]:
     recordings = []
     max_files = int(app.config.get("NTC_RECORDINGS_MAX_SCAN_FILES") or 4000)
@@ -707,13 +768,14 @@ def _scan_recordings(app: Flask) -> list[RecordingCandidate]:
                 relative_path = str(path.relative_to(root))
             except ValueError:
                 relative_path = path.name
+            path_kind = _recording_kind_for_path(path)
             recordings.append(
                 RecordingCandidate(
                     id=_recording_id(path),
                     path=str(path),
                     title=_display_title(path),
                     recording_date=recording_date,
-                    kind=root_kind,
+                    kind=path_kind if path_kind != "unsure" else root_kind,
                     size_bytes=stat.st_size,
                     modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
                     relative_path=relative_path,
@@ -913,7 +975,7 @@ def _public_recording_date_options(recordings: Iterable[RecordingCandidate]) -> 
 
 
 def _recording_counts_by_kind(recordings: Iterable[RecordingCandidate]) -> dict[str, int]:
-    counts = {"message": 0, "worship": 0, "unsure": 0}
+    counts = {"message": 0, "worship": 0, "testimony": 0, "unsure": 0}
     for recording in recordings:
         kind = recording.kind if recording.kind in counts else "unsure"
         counts[kind] += 1
@@ -921,45 +983,141 @@ def _recording_counts_by_kind(recordings: Iterable[RecordingCandidate]) -> dict[
 
 
 def _default_candidate_for_date(
+    app: Flask,
     recordings: Iterable[RecordingCandidate],
     requested_date: str,
     recording_kind: str,
 ) -> RecordingCandidate | None:
-    recordings_list = [item for item in recordings if item.recording_date == requested_date]
-    if recording_kind in {"message", "worship"}:
-        return next((item for item in recordings_list if item.kind == recording_kind), None)
-    return recordings_list[0] if recordings_list else None
+    options = _target_options_for_date(app, recordings, requested_date, recording_kind)
+    return options[0] if options else None
 
 
-def _candidate_options_for_request(recordings: Iterable[RecordingCandidate], row: sqlite3.Row) -> list[RecordingCandidate]:
+def _candidate_options_for_request(app: Flask, recordings: Iterable[RecordingCandidate], row: sqlite3.Row) -> list[RecordingCandidate]:
     recordings_list = list(recordings)
-    selected = next((item for item in recordings_list if item.id == row["recording_id"]), None)
+    selected = _target_from_recordings(app, recordings_list, row["recording_id"])
     requested_kind = _normalize_recording_kind(row["recording_kind"] if "recording_kind" in row.keys() else "")
     same_date = [
         item
-        for item in recordings_list
-        if item.recording_date == row["requested_date"]
-        and item.id != row["recording_id"]
-        and (requested_kind not in {"message", "worship"} or item.kind == requested_kind)
-    ]
-    fallback_same_date = [
-        item
-        for item in recordings_list
-        if item.recording_date == row["requested_date"]
-        and item.id != row["recording_id"]
-        and item not in same_date
+        for item in _target_options_for_date(app, recordings_list, row["requested_date"], requested_kind)
+        if item.id != row["recording_id"]
     ]
     ordered = []
     if selected:
         ordered.append(selected)
-    ordered.extend(same_date[:7])
-    if len(ordered) < 8:
-        ordered.extend(fallback_same_date[: 8 - len(ordered)])
-    return ordered[:8]
+    ordered.extend(same_date)
+    return ordered[:12]
+
+
+def _target_options_for_date(
+    app: Flask,
+    recordings: Iterable[RecordingCandidate],
+    requested_date: str,
+    recording_kind: str,
+) -> list[RecordingCandidate]:
+    recordings_list = [item for item in recordings if item.recording_date == requested_date]
+    requested_kind = _normalize_recording_kind(recording_kind)
+    if requested_kind == "worship":
+        return _worship_collection_options(app, recordings_list)
+    if requested_kind in {"message", "testimony"}:
+        return [item for item in recordings_list if item.kind == requested_kind]
+
+    message_options = [item for item in recordings_list if item.kind == "message"]
+    worship_options = _worship_collection_options(app, recordings_list)
+    testimony_options = [item for item in recordings_list if item.kind == "testimony"]
+    unsure_options = [item for item in recordings_list if item.kind not in {"message", "worship", "testimony"}]
+    return [*message_options, *worship_options, *testimony_options, *unsure_options]
+
+
+def _worship_collection_options(app: Flask, recordings: Iterable[RecordingCandidate]) -> list[RecordingCandidate]:
+    grouped: dict[Path, list[RecordingCandidate]] = {}
+    for recording in recordings:
+        if recording.kind != "worship":
+            continue
+        grouped.setdefault(_worship_collection_path(app, recording), []).append(recording)
+
+    collections = []
+    for collection_path, files in grouped.items():
+        files.sort(key=lambda item: (item.modified_at, item.title), reverse=True)
+        root_path = _matched_library_root(app, collection_path)
+        try:
+            relative_path = str(collection_path.relative_to(Path(root_path))) if root_path else collection_path.name
+        except ValueError:
+            relative_path = collection_path.name
+        collections.append(
+            RecordingCandidate(
+                id=_collection_id(collection_path),
+                path=str(collection_path),
+                title=collection_path.name,
+                recording_date=files[0].recording_date,
+                kind="worship",
+                size_bytes=sum(item.size_bytes for item in files),
+                modified_at=max(item.modified_at for item in files),
+                relative_path=relative_path,
+                target_type="folder",
+                file_count=len(files),
+            )
+        )
+    collections.sort(key=lambda item: (item.recording_date, item.modified_at, item.title), reverse=True)
+    return collections
+
+
+def _worship_collection_path(app: Flask, recording: RecordingCandidate) -> Path:
+    path = Path(recording.path)
+    root_path = _matched_library_root(app, path)
+    root = Path(root_path) if root_path else None
+    for parent in path.parents:
+        if root and parent == root:
+            break
+        if _extract_recording_date(parent.name) == recording.recording_date:
+            return parent
+    return path.parent
+
+
+def _target_from_recordings(app: Flask, recordings: Iterable[RecordingCandidate], recording_id: str) -> RecordingCandidate | None:
+    if not recording_id:
+        return None
+    recordings_list = list(recordings)
+    selected = next((item for item in recordings_list if item.id == recording_id), None)
+    if selected:
+        return selected
+    return next((item for item in _all_recording_targets(app, recordings_list) if item.id == recording_id), None)
+
+
+def _recording_target_by_id(app: Flask, recording_id: str) -> RecordingCandidate | None:
+    selected = _recording_by_id(app, recording_id)
+    if selected:
+        return selected
+    recordings = _get_recordings(app)
+    return _target_from_recordings(app, recordings, recording_id)
+
+
+def _all_recording_targets(app: Flask, recordings: Iterable[RecordingCandidate]) -> list[RecordingCandidate]:
+    recordings_list = list(recordings)
+    file_targets = [item for item in recordings_list if item.kind != "worship"]
+    return [*file_targets, *_worship_collection_options(app, recordings_list)]
+
+
+def _candidate_groups(candidates: Iterable[RecordingCandidate]) -> list[dict]:
+    order = {"message": 0, "worship": 1, "testimony": 2, "unsure": 3}
+    grouped: dict[str, list[RecordingCandidate]] = {}
+    for candidate in candidates:
+        grouped.setdefault(candidate.kind, []).append(candidate)
+    return [
+        {"kind": kind, "label": _recording_kind_label(kind), "options": grouped[kind]}
+        for kind in sorted(grouped, key=lambda item: order.get(item, 99))
+    ]
+
+
+def _candidate_option_label(candidate: RecordingCandidate) -> str:
+    if candidate.target_type == "folder":
+        return f"{candidate.title} · {candidate.file_count} files · {candidate.relative_path}"
+    return f"{candidate.title} · {candidate.relative_path}"
 
 
 def _normalize_recording_kind(value: str) -> str:
     normalized = re.sub(r"[^a-z]+", "", str(value or "").lower())
+    if normalized in {"testimony", "testimonies", "testimonyrecording", "testimoniesrecording"}:
+        return "testimony"
     if normalized in {"worship", "worshiprecording", "music", "song"}:
         return "worship"
     if normalized in {"message", "messagerecording", "sermon", "teaching"}:
@@ -969,6 +1127,8 @@ def _normalize_recording_kind(value: str) -> str:
 
 def _recording_kind_for_path(path: Path) -> str:
     normalized = re.sub(r"[^a-z]+", "", str(path).lower())
+    if "testimony" in normalized or "testimonies" in normalized:
+        return "testimony"
     if "worshiprecordings" in normalized or "worship" in normalized:
         return "worship"
     if "messagerecordings" in normalized or "message" in normalized:
@@ -980,6 +1140,7 @@ def _recording_kind_label(kind: str) -> str:
     labels = {
         "message": "Message",
         "worship": "Worship",
+        "testimony": "Testimony",
         "unsure": "Recording",
     }
     return labels.get(kind, "Recording")
@@ -987,6 +1148,10 @@ def _recording_kind_label(kind: str) -> str:
 
 def _recording_id(path: Path) -> str:
     return hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:24]
+
+
+def _collection_id(path: Path) -> str:
+    return "folder-" + hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:24]
 
 
 def _display_title(path: Path) -> str:
@@ -1059,11 +1224,23 @@ def _share_url(app: Flask, token: str) -> str:
     return url_for("share_recording", token=token, _external=True)
 
 
-def _create_share_link(app: Flask, candidate: RecordingCandidate, token: str) -> tuple[str, str, str, str]:
+def _create_share_link(
+    app: Flask,
+    candidate: RecordingCandidate,
+    token: str,
+    *,
+    existing_row: sqlite3.Row | None = None,
+) -> tuple[str, str, str, str]:
     provider = str(app.config.get("NTC_RECORDINGS_SHARE_PROVIDER") or "internal").strip().lower()
     internal_url = _share_url(app, token)
     if provider != "nextcloud":
         return internal_url, "internal", "", ""
+
+    if existing_row and str(existing_row["share_provider"] or "").strip().lower() == "nextcloud":
+        existing_url = str(existing_row["share_url"] or "").strip()
+        existing_id = str(existing_row["share_external_id"] or "").strip()
+        if existing_url and existing_id and existing_row["recording_id"] == candidate.id:
+            return existing_url, "nextcloud", existing_id, ""
 
     nextcloud_url, nextcloud_share_id, error = _create_nextcloud_share_link(app, candidate)
     if nextcloud_url:
@@ -1072,16 +1249,20 @@ def _create_share_link(app: Flask, candidate: RecordingCandidate, token: str) ->
 
 
 def _create_nextcloud_share_link(app: Flask, candidate: RecordingCandidate) -> tuple[str, str, str]:
-    base_url = str(app.config.get("NTC_NEXTCLOUD_BASE_URL") or "").strip().rstrip("/")
-    username = str(app.config.get("NTC_NEXTCLOUD_USERNAME") or "").strip()
-    password = str(app.config.get("NTC_NEXTCLOUD_APP_PASSWORD") or "").strip()
-    if not base_url or not username or not password:
-        return "", "", "Nextcloud credentials are not configured"
-
     nextcloud_path = _nextcloud_path_for_candidate(app, candidate)
     if not nextcloud_path:
         return "", "", "recording path could not be mapped into Nextcloud"
 
+    existing_shares, lookup_error = _list_nextcloud_shares(app, nextcloud_path)
+    if existing_shares:
+        return existing_shares[0]["url"], existing_shares[0]["id"], ""
+    if lookup_error:
+        return "", "", lookup_error
+
+    config = _nextcloud_config(app)
+    if not config:
+        return "", "", "Nextcloud credentials are not configured"
+    base_url, username, password = config
     endpoint = f"{base_url}/ocs/v2.php/apps/files_sharing/api/v1/shares"
     try:
         response = requests.post(
@@ -1112,35 +1293,59 @@ def _create_nextcloud_share_link(app: Flask, candidate: RecordingCandidate) -> t
 def _revoke_share_link(app: Flask, row: sqlite3.Row) -> str:
     provider = str(row["share_provider"] or "").strip().lower()
     external_id = str(row["share_external_id"] or "").strip()
-    if provider != "nextcloud" or not external_id:
+    if provider != "nextcloud":
         return ""
 
-    base_url = str(app.config.get("NTC_NEXTCLOUD_BASE_URL") or "").strip().rstrip("/")
-    username = str(app.config.get("NTC_NEXTCLOUD_USERNAME") or "").strip()
-    password = str(app.config.get("NTC_NEXTCLOUD_APP_PASSWORD") or "").strip()
-    if not base_url or not username or not password:
+    config = _nextcloud_config(app)
+    if not config:
         return "Nextcloud credentials are not configured"
+    base_url, username, password = config
 
-    endpoint = f"{base_url}/ocs/v2.php/apps/files_sharing/api/v1/shares/{external_id}"
-    try:
-        response = requests.delete(
-            endpoint,
-            params={"format": "json"},
-            headers={"OCS-APIRequest": "true"},
-            auth=(username, password),
-            timeout=15,
-        )
-    except requests.RequestException as exc:
-        return str(exc)
-    if response.status_code >= 400:
-        return f"Nextcloud returned HTTP {response.status_code}"
+    share_ids = [external_id] if external_id else []
+    if not share_ids:
+        nextcloud_path = _nextcloud_path_for_path(app, Path(row["recording_path"] or ""))
+        if not nextcloud_path:
+            return "Nextcloud share id is missing and the recording path could not be mapped"
+        shares, lookup_error = _list_nextcloud_shares(app, nextcloud_path)
+        if lookup_error:
+            return lookup_error
+        share_url = str(row["share_url"] or "").strip()
+        if share_url:
+            share_ids = [share["id"] for share in shares if share.get("url") == share_url and share.get("id")]
+        elif len(shares) == 1:
+            share_ids = [shares[0]["id"]]
+        if not share_ids:
+            return "Nextcloud share id is missing and no matching share was found"
+
+    errors = []
+    for share_id in share_ids:
+        endpoint = f"{base_url}/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}"
+        try:
+            response = requests.delete(
+                endpoint,
+                params={"format": "json"},
+                headers={"OCS-APIRequest": "true"},
+                auth=(username, password),
+                timeout=15,
+            )
+        except requests.RequestException as exc:
+            errors.append(str(exc))
+            continue
+        if response.status_code >= 400:
+            errors.append(f"Nextcloud returned HTTP {response.status_code}")
+    if errors:
+        return "; ".join(errors)
     return ""
 
 
 def _nextcloud_path_for_candidate(app: Flask, candidate: RecordingCandidate) -> str:
+    return _nextcloud_path_for_path(app, Path(candidate.path))
+
+
+def _nextcloud_path_for_path(app: Flask, path: Path) -> str:
     for local_prefix, nextcloud_prefix in _nextcloud_path_mappings(app):
         try:
-            relative = Path(candidate.path).resolve().relative_to(local_prefix.resolve())
+            relative = path.resolve().relative_to(local_prefix.resolve())
         except (FileNotFoundError, ValueError):
             continue
         parts = [part for part in relative.parts if part and part != "."]
@@ -1150,7 +1355,7 @@ def _nextcloud_path_for_candidate(app: Flask, candidate: RecordingCandidate) -> 
     local_prefix = Path(str(app.config.get("NTC_NEXTCLOUD_LOCAL_PATH_PREFIX") or DEFAULT_RECORDING_DIR))
     nextcloud_prefix = str(app.config.get("NTC_NEXTCLOUD_PATH_PREFIX") or "").strip().strip("/")
     try:
-        relative = Path(candidate.path).resolve().relative_to(local_prefix.resolve())
+        relative = path.resolve().relative_to(local_prefix.resolve())
     except (FileNotFoundError, ValueError):
         return ""
     parts = [part for part in relative.parts if part and part != "."]
@@ -1175,6 +1380,51 @@ def _nextcloud_path_mappings(app: Flask) -> list[tuple[Path, str]]:
     return mappings
 
 
+def _nextcloud_config(app: Flask) -> tuple[str, str, str] | None:
+    base_url = str(app.config.get("NTC_NEXTCLOUD_BASE_URL") or "").strip().rstrip("/")
+    username = str(app.config.get("NTC_NEXTCLOUD_USERNAME") or "").strip()
+    password = str(app.config.get("NTC_NEXTCLOUD_APP_PASSWORD") or "").strip()
+    if not base_url or not username or not password:
+        return None
+    return base_url, username, password
+
+
+def _list_nextcloud_shares(app: Flask, nextcloud_path: str) -> tuple[list[dict[str, str]], str]:
+    config = _nextcloud_config(app)
+    if not config:
+        return [], "Nextcloud credentials are not configured"
+    base_url, username, password = config
+    endpoint = f"{base_url}/ocs/v2.php/apps/files_sharing/api/v1/shares"
+    try:
+        response = requests.get(
+            endpoint,
+            params={"format": "json", "path": nextcloud_path, "reshares": "true"},
+            headers={"OCS-APIRequest": "true"},
+            auth=(username, password),
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        return [], str(exc)
+    if response.status_code >= 400:
+        return [], f"Nextcloud returned HTTP {response.status_code}"
+    try:
+        payload = response.json()
+    except ValueError:
+        return [], "Nextcloud returned non-JSON response"
+    data = ((payload.get("ocs") or {}).get("data") or [])
+    if isinstance(data, dict):
+        data = [data]
+    shares: list[dict[str, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        share_url = str(item.get("url") or "").strip()
+        share_id = str(item.get("id") or "").strip()
+        if share_url and share_id:
+            shares.append({"url": share_url, "id": share_id})
+    return shares, ""
+
+
 def _email_enabled(app: Flask) -> bool:
     enabled = str(app.config.get("NTC_RECORDINGS_EMAIL_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
     return enabled and bool(app.config.get("NTC_RECORDINGS_SMTP_HOST")) and bool(app.config.get("NTC_RECORDINGS_EMAIL_FROM"))
@@ -1189,7 +1439,7 @@ def _send_recording_email(
 ) -> tuple[bool, str]:
     if not _email_enabled(app):
         return False, "email disabled"
-    subject = "Newark Worship Recording Request"
+    subject = "NTC Newark Recording Request"
     body = _recording_email_html(app, row, candidate, share_url, email_message)
     message = MIMEText(body, "html")
     message["Subject"] = subject
@@ -1212,11 +1462,12 @@ def _send_recording_email(
 
 
 def _default_recording_email_message(row: sqlite3.Row, candidate: RecordingCandidate) -> str:
+    selection_label = "Worship folder" if candidate.target_type == "folder" else f"{_recording_kind_label(candidate.kind)} recording"
     return (
         "Praise the Lord,\n\n"
         f"Your requested recording from {_format_date(row['requested_date'])} is ready.\n\n"
         "Please use the link below to listen to or download the recording.\n\n"
-        f"Recording: {candidate.title}\n\n"
+        f"{selection_label}: {candidate.title}\n\n"
         "God bless,\n"
         "NTC Newark"
     )
@@ -1373,7 +1624,7 @@ RECORDING_PUBLIC_TEMPLATE = """
         font: inherit;
       }
       textarea { min-height: 7rem; resize: vertical; }
-      select { cursor: pointer; }
+      select { cursor: pointer; padding-right: 2.35rem; }
       select option { background:#13233a; color:var(--text); }
       button {
         cursor: pointer;
@@ -1400,7 +1651,15 @@ RECORDING_PUBLIC_TEMPLATE = """
       .meta { color: var(--muted); font: 800 0.72rem ui-monospace, monospace; letter-spacing: 0.08em; text-transform: uppercase; }
       .muted { color: var(--muted); margin-top: 0.8rem; }
       .hint { color:var(--muted); font-size:.9rem; line-height:1.45; margin-top:-.35rem; }
+      .decision-row {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: minmax(0, .82fr) minmax(0, 1.18fr);
+        gap: .9rem;
+        padding-bottom: .25rem;
+      }
       @media (max-width: 840px) { .grid, .form-grid { grid-template-columns: 1fr; } .wide { grid-column:auto; } }
+      @media (max-width: 840px) { .decision-row { grid-template-columns: 1fr; } }
     </style>
   </head>
   <body>
@@ -1417,28 +1676,31 @@ RECORDING_PUBLIC_TEMPLATE = """
           <h2>Request a Recording</h2>
           <form method="post" action="{{ url_for('create_request') }}">
             <div class="form-grid">
+              <div class="decision-row">
+                <label>
+                  Recording Type
+                  <select name="recording_kind" required>
+                    <option value="message">Message recording</option>
+                    <option value="worship">Worship recordings</option>
+                    <option value="testimony">Testimony recording</option>
+                    <option value="unsure">Not sure</option>
+                  </select>
+                </label>
+                <label>
+                  Service Date
+                  <select name="requested_date" required {% if not recording_dates %}disabled{% endif %}>
+                    <option value="">Choose an available service date</option>
+                    {% for recording in recording_dates %}
+                      <option value="{{ recording.date }}" data-kinds="{{ recording.kinds|join(',') }}">{{ recording.label }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+              </div>
+              <p class="hint wide">Only dates already in the recording library are shown.</p>
               <label>First and Last Name <input name="requester_name" autocomplete="name" required></label>
               <label>Email <input name="email" type="email" autocomplete="email" required></label>
               <label>Send Copy To <span class="optional">Optional</span><input name="secondary_email" type="email" autocomplete="email" placeholder="Optional"></label>
               <label>Phone Number <span class="optional">Optional</span><input name="phone" autocomplete="tel" placeholder="Optional"></label>
-              <label>
-                Recording Type
-                <select name="recording_kind" required>
-                  <option value="message">Message recording</option>
-                  <option value="worship">Worship recording</option>
-                  <option value="unsure">Not sure</option>
-                </select>
-              </label>
-              <label>
-                Service Date
-                <select name="requested_date" required {% if not recording_dates %}disabled{% endif %}>
-                  <option value="">Choose an available service date</option>
-                  {% for recording in recording_dates %}
-                    <option value="{{ recording.date }}" data-kinds="{{ recording.kinds|join(',') }}">{{ recording.label }}</option>
-                  {% endfor %}
-                </select>
-              </label>
-              <p class="hint wide">Only dates already in the recording library are shown. The exact file is confirmed before the link is sent.</p>
               <label class="wide">Additional Instructions <textarea name="notes" placeholder="Optional"></textarea></label>
             </div>
             <button type="submit" {% if not recording_dates %}disabled{% endif %}>Send Request</button>
@@ -1451,12 +1713,12 @@ RECORDING_PUBLIC_TEMPLATE = """
           <h2>How Requests Work</h2>
           <div class="steps">
             <div class="step">
-              <strong>1. Choose the service date</strong>
-              <span>Only dates with available recordings can be selected.</span>
+              <strong>1. Choose the recording type</strong>
+                  <span>Pick message, worship, testimony, or not sure before choosing a service date.</span>
             </div>
             <div class="step">
-              <strong>2. We confirm the file</strong>
-              <span>The exact recording is selected internally before access is sent.</span>
+              <strong>2. Choose the service date</strong>
+              <span>Only dates with available recordings for that type can be selected.</span>
             </div>
             <div class="step">
               <strong>3. Check your email</strong>
@@ -1557,13 +1819,13 @@ RECORDING_ADMIN_TEMPLATE = """
       .actions { display:flex; gap:.6rem; flex-wrap:wrap; }
       a, button, select { border:1px solid var(--line); border-radius:14px; background:var(--panel2); color:var(--text); padding:.72rem .9rem; text-decoration:none; font:inherit; font-weight:850; }
       button { cursor:pointer; }
-      .tabs { display:inline-flex; gap:.28rem; flex-wrap:wrap; margin:.9rem 0; padding:.28rem; border:1px solid var(--line); border-radius:999px; background:rgba(5,13,24,.58); box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }
+      .tabs { display:inline-grid; grid-template-columns:repeat(4,minmax(0,auto)); gap:.28rem; margin:.9rem 0; padding:.28rem; border:1px solid var(--line); border-radius:999px; background:rgba(5,13,24,.58); box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }
       .tab { display:flex; align-items:center; gap:.44rem; border:1px solid transparent; border-radius:999px; color:var(--muted); background:transparent; padding:.5rem .72rem; font-size:.84rem; line-height:1; transition:background .16s ease, border-color .16s ease, color .16s ease, transform .16s ease; }
       .tab:hover { color:var(--text); border-color:rgba(143,211,255,.22); background:rgba(143,211,255,.06); transform:translateY(-1px); }
       .tab.active { color:var(--text); background:linear-gradient(135deg,rgba(143,211,255,.18),rgba(143,245,200,.12)); border-color:rgba(143,211,255,.42); box-shadow:0 10px 26px rgba(8,19,33,.26), inset 0 0 0 1px rgba(255,255,255,.04); }
       .tab strong { display:inline-grid; place-items:center; min-width:1.45rem; min-height:1.45rem; padding:0 .34rem; border-radius:999px; background:rgba(143,211,255,.1); color:inherit; font-size:.76rem; }
       .tab.active strong { background:linear-gradient(135deg,#8fd3ff,#8ff5c8); color:var(--ink); }
-      .metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.65rem; margin:.65rem 0 1rem; }
+      .metrics { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:.65rem; margin:.65rem 0 1rem; }
       .metric { border:1px solid var(--line); border-radius:18px; background:rgba(5,13,24,.58); padding:.78rem .85rem; min-width:0; }
       .metric span { display:block; color:var(--muted); font:800 .64rem ui-monospace,monospace; letter-spacing:.12em; text-transform:uppercase; }
       .metric strong { display:block; margin-top:.24rem; font-size:1.42rem; line-height:1; letter-spacing:-.04em; }
@@ -1577,6 +1839,7 @@ RECORDING_ADMIN_TEMPLATE = """
       .request { border:1px solid rgba(143,211,255,.16); border-radius:16px; background:linear-gradient(135deg,rgba(255,255,255,.04),rgba(143,211,255,.018)); overflow:hidden; transition:border-color .18s ease, transform .18s ease, background .18s ease; }
       .request:hover { border-color:var(--line2); transform:translateY(-1px); background:linear-gradient(135deg,rgba(255,255,255,.055),rgba(143,211,255,.035)); }
       .request.sent { border-color:rgba(116,221,180,.28); }
+      .request.ready { border-color:rgba(143,211,255,.28); }
       .request.revoked { opacity:.72; border-color:rgba(255,170,168,.22); }
       .request.archived { border-color:rgba(159,178,198,.22); }
       .request summary { list-style:none; cursor:pointer; padding:.78rem .86rem; }
@@ -1595,27 +1858,55 @@ RECORDING_ADMIN_TEMPLATE = """
       .pill.sent, .pill.ready { color:var(--good); border-color:rgba(116,221,180,.35); }
       .pill.revoked { color:var(--bad); border-color:rgba(255,170,168,.35); }
       .pill.archived { color:var(--muted); border-color:rgba(159,178,198,.28); }
-      .request-body { display:grid; gap:.85rem; padding:1rem; }
-      .detail-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.55rem; }
-      .detail { border:1px solid var(--line); border-radius:14px; background:var(--panel3); padding:.7rem .75rem; min-width:0; }
-      .detail span { display:block; color:var(--muted); font:800 .66rem ui-monospace,monospace; letter-spacing:.1em; text-transform:uppercase; }
-      .detail strong { display:block; margin-top:.28rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-      .approve-form { display:grid; gap:.72rem; border:1px solid var(--line); border-radius:18px; padding:.85rem; background:rgba(143,211,255,.055); }
+      .request-body { display:grid; gap:1rem; padding:1.05rem 1.08rem 1.12rem; background:linear-gradient(180deg,rgba(143,211,255,.028),rgba(4,11,20,.12)); }
+      .detail-overview { padding-bottom:.95rem; border-bottom:1px solid rgba(143,211,255,.14); }
+      .recording-focus { min-width:0; }
+      .recording-focus h3 { margin:.16rem 0 .42rem; font-size:clamp(1.22rem,2vw,1.72rem); line-height:1.08; letter-spacing:-.035em; overflow-wrap:anywhere; }
+      .summary-line { display:flex; flex-wrap:wrap; gap:.45rem; color:var(--muted); }
+      .summary-line span { border:1px solid rgba(143,211,255,.16); border-radius:999px; background:rgba(143,211,255,.055); padding:.32rem .48rem; font-weight:800; line-height:1.1; }
+      .more-details { border-top:1px solid rgba(143,211,255,.14); padding-top:.75rem; }
+      .more-details summary { display:flex; align-items:center; justify-content:space-between; gap:.7rem; padding:0; border:0; background:transparent; color:var(--accent); font:900 .68rem ui-monospace,monospace; letter-spacing:.12em; text-transform:uppercase; cursor:pointer; }
+      .more-details summary::after { content:"+"; display:inline-grid; place-items:center; width:1.45rem; height:1.45rem; border:1px solid var(--line); border-radius:999px; color:var(--muted); background:rgba(143,211,255,.055); }
+      .more-details[open] summary { margin-bottom:.78rem; }
+      .more-details[open] summary::after { content:"-"; }
+      .more-details-content { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1rem; align-items:start; }
+      .info-group { min-width:0; }
+      .info-group h3 { margin:0 0 .55rem; font-size:.98rem; letter-spacing:-.015em; }
+      .info-list { display:grid; gap:.48rem; margin:0; }
+      .info-list div { display:grid; grid-template-columns:minmax(7.2rem,.4fr) minmax(0,1fr); gap:.7rem; align-items:start; }
+      .info-list dt { color:var(--muted); font:800 .64rem ui-monospace,monospace; letter-spacing:.1em; text-transform:uppercase; }
+      .info-list dd { margin:0; color:var(--text); font-weight:850; overflow-wrap:anywhere; }
+      .note-strip { border-top:1px solid rgba(143,211,255,.14); padding-top:.82rem; }
+      .note-strip p { margin-top:.22rem; color:var(--muted); line-height:1.5; }
+      .action-panel { display:flex; justify-content:space-between; align-items:center; gap:1rem; flex-wrap:wrap; border:1px solid rgba(143,211,255,.2); border-radius:18px; background:rgba(143,211,255,.055); padding:.9rem; }
+      .action-panel strong { display:block; margin-top:.16rem; }
+      .action-panel p { margin-top:.16rem; color:var(--muted); line-height:1.45; }
+      .approve-form { display:grid; gap:.82rem; border:1px solid rgba(116,221,180,.34); border-radius:20px; padding:.95rem; background:linear-gradient(135deg,rgba(116,221,180,.09),rgba(143,211,255,.055)); box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }
+      .approval-head { display:flex; align-items:start; justify-content:space-between; gap:1rem; }
+      .approval-head strong { display:block; margin-top:.2rem; font-size:1.08rem; }
+      .approval-head p { margin-top:.16rem; color:var(--muted); line-height:1.4; }
+      .approve-grid { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:.8rem; align-items:end; }
       .approve-form label { display:grid; gap:.35rem; color:var(--muted); font-weight:850; }
-      .approve-form select { width:100%; min-height:3rem; background:rgba(4,11,20,.56); }
+      .approve-form select { width:100%; min-height:3.15rem; background:rgba(4,11,20,.56); }
       .approve-form option { background:#13233a; color:var(--text); }
-      .approve-footer { display:flex; gap:.65rem; align-items:center; justify-content:space-between; flex-wrap:wrap; }
-      .approve-footer button { width:auto; white-space:nowrap; background:rgba(116,221,180,.12); border-color:rgba(116,221,180,.35); }
+      .approve-submit { display:flex; align-items:end; justify-content:flex-end; }
+      .approve-submit button { width:auto; white-space:nowrap; color:#dcfff0; background:rgba(116,221,180,.15); border-color:rgba(116,221,180,.45); }
+      .email-details { border-top:1px solid rgba(116,221,180,.18); padding-top:.65rem; }
+      .email-details summary { display:inline-flex; align-items:center; justify-content:center; gap:.45rem; width:max-content; max-width:100%; padding:.42rem .7rem; border:1px solid rgba(116,221,180,.3); border-radius:999px; background:rgba(116,221,180,.075); color:var(--good); font:900 .68rem ui-monospace,monospace; letter-spacing:.12em; text-transform:uppercase; cursor:pointer; }
+      .email-details summary::after { content:""; width:.45rem; height:.45rem; border-right:2px solid currentColor; border-bottom:2px solid currentColor; transform:rotate(45deg) translateY(-.08rem); }
+      .email-details[open] summary { margin-bottom:.65rem; }
+      .email-details[open] summary::after { transform:rotate(225deg) translateY(-.08rem); }
       .request-actions { display:flex; gap:.55rem; flex-wrap:wrap; align-items:center; }
       .request-actions form { margin:0; }
+      .action-panel .request-actions { margin-left:auto; }
       .danger { color:#ffd7d7; border-color:rgba(255,170,168,.35); background:rgba(255,170,168,.1); }
       .email-note { display:grid; gap:.35rem; color:var(--muted); font-weight:850; }
-      .email-note textarea { min-height:8rem; resize:vertical; border:1px solid var(--line); border-radius:14px; background:rgba(4,11,20,.56); color:var(--text); padding:.82rem; font:inherit; line-height:1.45; }
+      .email-note textarea { min-height:7.25rem; resize:vertical; border:1px solid var(--line); border-radius:14px; background:rgba(4,11,20,.56); color:var(--text); padding:.82rem; font:inherit; line-height:1.45; }
       .muted { color:var(--muted); }
       .banner { margin-bottom:1rem; border:1px solid rgba(116,221,180,.35); background:rgba(116,221,180,.1); color:var(--good); border-radius:16px; padding:.85rem; font-weight:850; }
       .banner.error { border-color:rgba(255,154,154,.4); background:rgba(255,154,154,.1); color:#ffaaaa; }
-      @media (max-width:1100px) { .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } .request-table-head { display:none; } .request-head { grid-template-columns:minmax(0,1fr) minmax(0,1fr); align-items:start; } .detail-grid { grid-template-columns:1fr 1fr; } .pill, .open-hint { justify-self:start; } }
-      @media (max-width:760px) { header, .section-head { display:flex; align-items:start; flex-direction:column; } .metrics { grid-template-columns:1fr; } .detail-grid { grid-template-columns:1fr; } .request-head { grid-template-columns:1fr; } .pill, .open-hint { justify-self:start; } }
+      @media (max-width:1100px) { .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } .request-table-head { display:none; } .request-head { grid-template-columns:minmax(0,1fr) minmax(0,1fr); align-items:start; } .more-details-content, .approve-grid { grid-template-columns:1fr; } .approve-submit { justify-content:flex-start; } .pill, .open-hint { justify-self:start; } }
+      @media (max-width:760px) { header, .section-head, .approval-head { display:flex; align-items:start; flex-direction:column; } .metrics { grid-template-columns:1fr; } .tabs { display:grid; grid-template-columns:1fr; border-radius:24px; width:100%; } .tab { justify-content:space-between; } .request-head { grid-template-columns:1fr; } .request-body { padding:.78rem; } .detail-overview { padding-bottom:.8rem; } .info-list div { grid-template-columns:1fr; gap:.16rem; } .action-panel, .approve-form { border-radius:14px; padding:.78rem; } .approval-head .pill { order:2; } .approve-form select { font-size:.88rem; } .email-note textarea { min-height:6.5rem; font-size:.9rem; } .pill, .open-hint { justify-self:start; } .action-panel { align-items:flex-start; } .action-panel .request-actions { margin-left:0; } }
     </style>
   </head>
   <body>
@@ -1624,7 +1915,7 @@ RECORDING_ADMIN_TEMPLATE = """
         <div>
           <div class="eyebrow">NTC Newark</div>
           <h1>Recording Requests</h1>
-          <p class="muted">Approve message and worship recording requests from one queue.</p>
+          <p class="muted">Approve message, worship, and testimony recording requests from one queue.</p>
         </div>
         <div class="actions">
           <a href="{{ url_for('public_form') }}">Public Form</a>
@@ -1635,31 +1926,25 @@ RECORDING_ADMIN_TEMPLATE = """
       {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
       <section class="metrics" aria-label="Recording request status">
         <div class="metric"><span>Pending</span><strong>{{ pending_count }}</strong><small>Needs review</small></div>
-        <div class="metric"><span>Completed</span><strong>{{ completed_count }}</strong><small>Sent or revoked</small></div>
-        <div class="metric"><span>Library</span><strong>{{ recording_count }}</strong><small>{{ recording_counts_by_kind.get("message", 0) }} messages · {{ recording_counts_by_kind.get("worship", 0) }} worship</small></div>
+        <div class="metric"><span>Active Links</span><strong>{{ active_count }}</strong><small>Sent or prepared</small></div>
+        <div class="metric"><span>Closed</span><strong>{{ closed_count }}</strong><small>Revoked access</small></div>
+        <div class="metric"><span>Library</span><strong>{{ recording_count }}</strong><small>{{ recording_counts_by_kind.get("message", 0) }} messages · {{ recording_counts_by_kind.get("worship", 0) }} worship · {{ recording_counts_by_kind.get("testimony", 0) }} testimonies</small></div>
         <div class="metric"><span>Delivery</span><strong>{{ "Email" if email_enabled else "Link" }}</strong><small>{{ share_provider|title }} sharing</small></div>
       </section>
       <nav class="tabs" aria-label="Request list">
         <a class="tab {{ 'active' if active_tab == 'pending' else '' }}" {% if active_tab == "pending" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='pending') }}">Pending <strong>{{ pending_count }}</strong></a>
-        <a class="tab {{ 'active' if active_tab == 'completed' else '' }}" {% if active_tab == "completed" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='completed') }}">Completed <strong>{{ completed_count }}</strong></a>
+        <a class="tab {{ 'active' if active_tab == 'active' else '' }}" {% if active_tab == "active" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='active') }}">Active Links <strong>{{ active_count }}</strong></a>
+        <a class="tab {{ 'active' if active_tab == 'closed' else '' }}" {% if active_tab == "closed" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='closed') }}">Closed <strong>{{ closed_count }}</strong></a>
         <a class="tab {{ 'active' if active_tab == 'archived' else '' }}" {% if active_tab == "archived" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='archived') }}">Archived <strong>{{ archived_count }}</strong></a>
       </nav>
       <div class="grid">
         <section class="card">
           <div class="section-head">
             <div>
-              <h2>{{ "Pending Requests" if active_tab == "pending" else ("Completed Requests" if active_tab == "completed" else "Archived Requests") }}</h2>
-              <p class="muted">
-                {% if active_tab == "pending" %}
-                  New requests. Open a row, confirm the selected file, then send the link.
-                {% elif active_tab == "completed" %}
-                  Completed and revoked requests stay here until they are archived. Revoke access when a prepared link should stop working.
-                {% else %}
-                  Archived requests are kept for history. Active share links still work unless access is revoked.
-                {% endif %}
-              </p>
-              {% if active_tab == "completed" and auto_archive_days > 0 %}
-                <p class="muted">Auto-archive is on: completed requests move to Archived after {{ auto_archive_days }} days.</p>
+              <h2>{{ tab_title }}</h2>
+              <p class="muted">{{ tab_description }}</p>
+              {% if active_tab == "closed" and auto_archive_days > 0 %}
+                <p class="muted">Auto-archive is on: closed requests move to Archived after {{ auto_archive_days }} days.</p>
               {% endif %}
             </div>
             <span class="pill">{{ requests|length }} request{{ "" if requests|length == 1 else "s" }}</span>
@@ -1667,10 +1952,10 @@ RECORDING_ADMIN_TEMPLATE = """
           <div class="request-list">
           {% if requests %}
             <div class="request-table-head" aria-hidden="true">
-              <span>Requester</span>
-              <span>Date</span>
-              <span>File</span>
-              <span>Submitted</span>
+              <span>{{ "Recipient" if active_tab in ["active", "closed"] else "Requester" }}</span>
+              <span>Recording</span>
+              <span>{{ "Access" if active_tab == "active" else ("Closed Access" if active_tab == "closed" else "Selection") }}</span>
+              <span>{{ "Sent / Prepared" if active_tab == "active" else ("Revoked" if active_tab == "closed" else ("Archived" if active_tab == "archived" else "Submitted")) }}</span>
               <span>Status</span>
               <span>Action</span>
             </div>
@@ -1680,7 +1965,7 @@ RECORDING_ADMIN_TEMPLATE = """
               <summary>
                 <div class="request-head">
                   <div class="request-title queue-cell">
-                    <span class="queue-label">Requester</span>
+                    <span class="queue-label">{{ "Recipient" if active_tab in ["active", "closed"] else "Requester" }}</span>
                     <strong class="queue-value">{{ item.requester_name }}</strong>
                     <span class="queue-subvalue">{{ item.email }}</span>
                   </div>
@@ -1690,93 +1975,171 @@ RECORDING_ADMIN_TEMPLATE = """
                     <span class="queue-subvalue">{{ item.recording_kind|title if item.recording_kind else "Message" }}</span>
                   </div>
                   <div class="queue-cell">
-                    <span class="queue-label">Selected File</span>
-                    <span class="queue-value">{{ item.recording_title or "Selected by date" }}</span>
-                    <span class="queue-subvalue">{% if item.secondary_email %}CC {{ item.secondary_email }}{% elif item.phone %}{{ item.phone }}{% else %}No extra contact{% endif %}</span>
+                    <span class="queue-label">{{ "Access" if active_tab == "active" else ("Closed Access" if active_tab == "closed" else "Selection") }}</span>
+                    <span class="queue-value">
+                      {% if active_tab == "active" %}
+                        {{ item.share_provider|title if item.share_provider else share_provider|title }} link
+                      {% elif active_tab == "closed" %}
+                        Access revoked
+                      {% else %}
+                        {{ item.recording_title or "Selected by date" }}
+                      {% endif %}
+                    </span>
+                    <span class="queue-subvalue">
+                      {% if active_tab == "active" %}
+                        {{ "Emailed" if item.status == "sent" else "Prepared" }} · {{ item.recording_title or "Selected by date" }}
+                      {% elif active_tab == "closed" %}
+                        {{ item.recording_title or "Selected by date" }}
+                      {% elif item.secondary_email %}
+                        CC {{ item.secondary_email }}
+                      {% elif item.phone %}
+                        {{ item.phone }}
+                      {% else %}
+                        No extra contact
+                      {% endif %}
+                    </span>
                   </div>
                   <div class="queue-cell">
-                    <span class="queue-label">Submitted</span>
-                    <span class="queue-value">{{ format_datetime(item.created_at) }}</span>
+                    <span class="queue-label">{{ "Sent / Prepared" if active_tab == "active" else ("Revoked" if active_tab == "closed" else ("Archived" if active_tab == "archived" else "Submitted")) }}</span>
+                    <span class="queue-value">{{ format_datetime(item.sent_at or item.created_at) if active_tab == "active" else (format_datetime(item.revoked_at) if active_tab == "closed" else (format_datetime(item.archived_at) if active_tab == "archived" else format_datetime(item.created_at))) }}</span>
                   </div>
                   <span class="pill {{ 'archived' if item.archived_at else item.status }}">{{ "Archived" if item.archived_at else status_label(item.status) }}</span>
-                  <span class="open-hint">Review</span>
+                  <span class="open-hint">{{ "Manage" if active_tab == "active" else ("Archive" if active_tab == "closed" else ("View" if active_tab == "archived" else "Review")) }}</span>
                 </div>
               </summary>
               <div class="request-body">
-                <div class="detail-grid">
-                  <div class="detail"><span>Send To</span><strong>{{ item.email }}</strong></div>
-                  <div class="detail"><span>Additional Recipient</span><strong>{{ item.secondary_email or "None" }}</strong></div>
-                  <div class="detail"><span>Phone</span><strong>{{ item.phone or "None" }}</strong></div>
-                  <div class="detail"><span>Type</span><strong>{{ item.recording_kind|title if item.recording_kind else "Message" }}</strong></div>
-                  <div class="detail"><span>{{ "Archived" if item.archived_at else ("Completed" if item.status == "sent" else ("Revoked" if item.status == "revoked" else "Status")) }}</span><strong>{{ format_datetime(item.archived_at) if item.archived_at else (format_datetime(item.sent_at) if item.status == "sent" else (format_datetime(item.revoked_at) if item.status == "revoked" else status_label(item.status))) }}</strong></div>
+                <div class="detail-overview">
+                  <section class="recording-focus">
+                    <div class="meta">Selection</div>
+                    <h3>{{ item.recording_title or "Selected by date" }}</h3>
+                    <div class="summary-line">
+                      <span>{{ format_date(item.requested_date) }}</span>
+                      <span>{{ item.recording_kind|title if item.recording_kind else "Message" }}</span>
+                      <span>{{ "Archived" if item.archived_at else status_label(item.status) }}</span>
+                      <span>{{ item.share_provider|title if item.share_provider else share_provider|title }} sharing</span>
+                    </div>
+                  </section>
                 </div>
-                {% if item.recording_title %}
-                  <div class="detail"><span>Requested Recording</span><strong>{{ item.recording_title }}</strong></div>
-                {% endif %}
-                {% if item.notes %}<p>{{ item.notes }}</p>{% endif %}
-                {% if item.email_error %}
-                  <p class="muted">Delivery note: {{ item.email_error }}</p>
-                {% endif %}
                 {% if item.share_token and item.status != "revoked" %}
-                  <div class="request-actions">
-                    <a href="{{ item.share_url or url_for('share_recording', token=item.share_token) }}">Open prepared share link</a>
-                    <form method="post" action="{{ url_for('revoke_request_link', request_id=item.id) }}">
-                      <input type="hidden" name="tab" value="{{ active_tab }}">
-                      <button class="danger" type="submit">Revoke Access</button>
-                    </form>
-                    {% if active_tab == "completed" %}
+                  <section class="action-panel">
+                    <div>
+                      <div class="meta">Active Share</div>
+                      <strong>{{ "Emailed link" if item.status == "sent" else "Prepared link" }}</strong>
+                      <p>This link stays active until access is revoked.</p>
+                      {% if item.share_provider %}<p class="meta">Share provider: {{ item.share_provider }}</p>{% endif %}
+                    </div>
+                    <div class="request-actions">
+                      <a href="{{ item.share_url or url_for('share_recording', token=item.share_token) }}">Open prepared share link</a>
+                      <form method="post" action="{{ url_for('revoke_request_link', request_id=item.id) }}">
+                        <input type="hidden" name="tab" value="{{ active_tab }}">
+                        <button class="danger" type="submit">Revoke Access</button>
+                      </form>
+                    </div>
+                  </section>
+                {% elif active_tab == "closed" and item.status == "revoked" %}
+                  <section class="action-panel">
+                    <div>
+                      <div class="meta">Closed Access</div>
+                      <strong>Access is revoked</strong>
+                      <p>Archive when no more follow-up is needed.</p>
+                    </div>
+                    <div class="request-actions">
                       <form method="post" action="{{ url_for('archive_request', request_id=item.id) }}">
                         <button type="submit">Archive</button>
                       </form>
-                    {% endif %}
-                  </div>
-                  {% if item.share_provider %}<div class="meta">Share provider: {{ item.share_provider }}</div>{% endif %}
-                {% elif active_tab == "completed" and item.status in ["sent", "revoked"] %}
-                  <div class="request-actions">
-                    <form method="post" action="{{ url_for('archive_request', request_id=item.id) }}">
-                      <button type="submit">Archive</button>
-                    </form>
-                  </div>
-                {% elif item.status == "pending" %}
-                  <div class="request-actions">
-                    <form method="post" action="{{ url_for('revoke_request_link', request_id=item.id) }}">
-                      <input type="hidden" name="tab" value="completed">
-                      <button class="danger" type="submit">Close Request</button>
-                    </form>
-                  </div>
+                    </div>
+                  </section>
                 {% endif %}
-                {% if item.status != "revoked" %}
+                {% if item.status in ["pending", "ready"] %}
                   {% set candidates = candidates_by_request.get(item.id, []) %}
                   {% if candidates %}
                     <form class="approve-form" method="post" action="{{ url_for('send_request_link', request_id=item.id) }}">
-                      <label>
-                        Selected file
-                        <select name="recording_id" required>
-                          {% for candidate in candidates %}
-                            <option value="{{ candidate.id }}" data-title="{{ candidate.title }}" {% if candidate.id == item.recording_id %}selected{% endif %}>
-                              {{ format_date(candidate.recording_date) }} - {{ candidate.kind|title }} - {{ candidate.title }} · {{ candidate.relative_path }}
-                            </option>
-                          {% endfor %}
-                        </select>
-                      </label>
-                      <div class="meta">Options are limited to recordings found for the requested date. Change this only if the automatic match is wrong.</div>
-                      <label class="email-note">
-                        Email message
-                        <textarea name="email_message">{{ item.email_message or default_email_message(item, candidates[0]) }}</textarea>
-                      </label>
-                      <div class="approve-footer">
-                        <span class="muted">Review the selected file before sending access.</span>
-                        <button type="submit">{{ "Send Link" if email_enabled else "Prepare Link" }}</button>
+                      <div class="approval-head">
+                        <div>
+                          <div class="meta">{{ "Delivery Retry" if item.status == "ready" else "Approval" }}</div>
+                          <strong>{{ "Send prepared link by email" if item.status == "ready" else "Confirm selection and send access" }}</strong>
+                        </div>
+                        <span class="pill {{ 'ready' if item.status == 'ready' else 'pending' }}">{{ status_label(item.status) }}</span>
                       </div>
+                      <div class="approve-grid">
+                        <label>
+                          Selection
+                          <select name="recording_id" required>
+                            {% for group in candidate_groups_by_request.get(item.id, []) %}
+                              <optgroup label="{{ group.label }}">
+                                {% for candidate in group.options %}
+                                  <option value="{{ candidate.id }}" data-title="{{ candidate.title }}" {% if candidate.id == item.recording_id %}selected{% endif %}>
+                                    {{ candidate_option_label(candidate) }}
+                                  </option>
+                                {% endfor %}
+                              </optgroup>
+                            {% endfor %}
+                          </select>
+                        </label>
+                        <div class="approve-submit">
+                          <button type="submit">{{ "Send Link by Email" if email_enabled else "Prepare Link" }}</button>
+                        </div>
+                      </div>
+                      <details class="email-details">
+                        <summary>Edit email message</summary>
+                        <label class="email-note">
+                          Email message
+                          <textarea name="email_message">{{ item.email_message or default_email_message(item, candidates[0]) }}</textarea>
+                        </label>
+                      </details>
                     </form>
                   {% else %}
-                    <p class="muted">No exact date match found. Confirm the request date or rename the recording file with the service date.</p>
+                    <p class="muted">No exact date match found. Confirm the request date or add that recording to the library.</p>
                   {% endif %}
                 {% endif %}
+                {% if item.notes %}
+                  <section class="note-strip">
+                    <div class="meta">Notes</div>
+                    <p>{{ item.notes }}</p>
+                  </section>
+                {% endif %}
+                {% if item.email_error %}
+                  <section class="note-strip">
+                    <div class="meta">Delivery Note</div>
+                    <p>{{ item.email_error }}</p>
+                  </section>
+                {% endif %}
+                <details class="more-details">
+                  <summary>More request details</summary>
+                  <div class="more-details-content">
+                    <section class="info-group">
+                      <h3>Requester</h3>
+                      <dl class="info-list">
+                        <div><dt>Name</dt><dd>{{ item.requester_name }}</dd></div>
+                        <div><dt>Email</dt><dd>{{ item.email }}</dd></div>
+                        {% if item.secondary_email %}<div><dt>Copy</dt><dd>{{ item.secondary_email }}</dd></div>{% endif %}
+                        {% if item.phone %}<div><dt>Phone</dt><dd>{{ item.phone }}</dd></div>{% endif %}
+                      </dl>
+                    </section>
+                    <section class="info-group">
+                      <h3>Request</h3>
+                      <dl class="info-list">
+                        <div><dt>Type</dt><dd>{{ item.recording_kind|title if item.recording_kind else "Message" }}</dd></div>
+                        <div><dt>Date</dt><dd>{{ format_date(item.requested_date) }}</dd></div>
+                        <div><dt>Selection</dt><dd>{{ item.recording_title or "Selected by date" }}</dd></div>
+                      </dl>
+                    </section>
+                    <section class="info-group">
+                      <h3>Timeline</h3>
+                      <dl class="info-list">
+                        <div><dt>Status</dt><dd>{{ "Archived" if item.archived_at else status_label(item.status) }}</dd></div>
+                        <div><dt>Submitted</dt><dd>{{ format_datetime(item.created_at) }}</dd></div>
+                        {% if item.sent_at %}<div><dt>Sent</dt><dd>{{ format_datetime(item.sent_at) }}</dd></div>{% endif %}
+                        {% if item.revoked_at %}<div><dt>Revoked</dt><dd>{{ format_datetime(item.revoked_at) }}</dd></div>{% endif %}
+                        {% if item.archived_at %}<div><dt>Archived</dt><dd>{{ format_datetime(item.archived_at) }}</dd></div>{% endif %}
+                      </dl>
+                    </section>
+                  </div>
+                </details>
               </div>
             </details>
           {% else %}
-            <p class="muted">{{ "No pending requests." if active_tab == "pending" else ("No completed requests yet." if active_tab == "completed" else "No archived requests yet.") }}</p>
+            <p class="muted">{{ empty_message }}</p>
           {% endfor %}
           </div>
         </section>
@@ -1802,6 +2165,7 @@ RECORDING_SHARE_TEMPLATE = """
       section { border:1px solid var(--line); border-radius:28px; background:var(--panel); padding:34px; text-align:center; box-shadow:0 24px 80px rgba(0,0,0,.36); }
       h1 { margin:0 0 .75rem; font-size:clamp(32px,5vw,54px); letter-spacing:-.05em; }
       p { color:var(--muted); line-height:1.5; }
+      ul { margin:1rem auto 0; max-width:32rem; padding-left:1.2rem; color:var(--muted); text-align:left; line-height:1.55; }
       a { display:inline-block; margin-top:1rem; border:1px solid var(--line); border-radius:16px; background:rgba(143,211,255,.14); color:var(--text); padding:.9rem 1.1rem; text-decoration:none; font-weight:900; }
     </style>
   </head>
@@ -1810,7 +2174,21 @@ RECORDING_SHARE_TEMPLATE = """
       <section>
         <h1>{{ title }}</h1>
         <p>Requested date: {{ format_date(request_row.requested_date) }}</p>
-        <a href="{{ download_url }}">Download Recording</a>
+        {% if is_folder %}
+          <p>This request is a collection folder.</p>
+          {% if folder_items %}
+            <ul>
+              {% for item in folder_items[:12] %}
+                <li>{{ item }}</li>
+              {% endfor %}
+              {% if folder_items|length > 12 %}
+                <li>{{ folder_items|length - 12 }} more file{{ "" if folder_items|length - 12 == 1 else "s" }}</li>
+              {% endif %}
+            </ul>
+          {% endif %}
+        {% else %}
+          <a href="{{ download_url }}">Download Recording</a>
+        {% endif %}
       </section>
     </main>
   </body>

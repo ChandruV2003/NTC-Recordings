@@ -18,7 +18,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.recording = self.root / "20260419 - Jesus Is Our Peace - Bro Blessen.mp3"
         self.recording.write_bytes(b"fake-mp3-audio")
         (self.root / "February 8, 2026 - Brother Paul's Testimony.mp3").write_bytes(b"fake-testimony-audio")
-        (self.worship_root / "20260419 - NTCWorship1030 LR.wav").write_bytes(b"fake-worship-audio")
+        self.worship_service = self.worship_root / "2026" / "April" / "April 19, 2026 - Sunday Service"
+        (self.worship_service / "LR").mkdir(parents=True)
+        (self.worship_service / "FULL").mkdir(parents=True)
+        (self.worship_service / "LR" / "April 19, 2026 - NTCWorship1030 - LR.mp3").write_bytes(b"fake-worship-lr")
+        (self.worship_service / "FULL" / "April 19, 2026 - NTCWorship1030 - FULL.mp3").write_bytes(b"fake-worship-full")
         self.db_path = Path(self.tempdir.name) / "recording-requests.db"
         self.app = create_app(
             {
@@ -47,6 +51,14 @@ class RecordingRequestPanelTests(unittest.TestCase):
         end = html.index('"', start)
         return html[start:end]
 
+    def _first_recording_date_for_kind(self, kind: str):
+        html = self.client.get("/").data.decode("utf-8")
+        marker = f'data-kinds="{kind}"'
+        marker_index = html.index(marker)
+        start = html.rfind('<option value="', 0, marker_index) + len('<option value="')
+        end = html.index('"', start)
+        return html[start:end]
+
     def _first_recording_id_from_admin_panel(self, html: str) -> str:
         marker = '<select name="recording_id" required>'
         start = html.index(marker) + len(marker)
@@ -63,7 +75,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Choose an available service date", response.data)
         self.assertIn(b"Service Date", response.data)
         self.assertIn(b"Recording Type", response.data)
-        self.assertIn(b"Worship recording", response.data)
+        self.assertIn(b"Worship recordings", response.data)
+        self.assertIn(b"Testimony recording", response.data)
         self.assertIn(b'data-kinds="message,worship"', response.data)
         self.assertIn(b"Send Copy To", response.data)
         self.assertNotIn(b"Search Recordings", response.data)
@@ -102,7 +115,27 @@ class RecordingRequestPanelTests(unittest.TestCase):
         panel = self.client.get("/admin/panel").data
         self.assertIn(b"Worship Person", panel)
         self.assertIn(b"Worship", panel)
-        self.assertIn(b"NTCWorship1030 LR", panel)
+        self.assertIn(b"April 19, 2026 - Sunday Service", panel)
+        self.assertIn(b"2 files", panel)
+
+    def test_testimony_request_matches_testimony_recording(self):
+        created = self.client.post(
+            "/request",
+            data={
+                "requester_name": "Testimony Person",
+                "email": "testimony@example.test",
+                "recording_kind": "testimony",
+                "requested_date": self._first_recording_date_for_kind("testimony"),
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(created.status_code, 200)
+        self._login()
+        panel = self.client.get("/admin/panel").data
+        self.assertIn(b"Testimony Person", panel)
+        self.assertIn(b"Testimony", panel)
+        self.assertIn(b"Brother Paul", panel)
 
     def test_admin_requires_password_and_can_prepare_share_link(self):
         self.client.post(
@@ -121,10 +154,14 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(logged_in.status_code, 200)
         self.assertIn(b"Recording Requests", logged_in.data)
         self.assertIn(b"Pending Requests", logged_in.data)
-        self.assertIn(b"Completed", logged_in.data)
+        self.assertIn(b"Active Links", logged_in.data)
+        self.assertIn(b"Closed", logged_in.data)
         self.assertIn(b"Archived", logged_in.data)
         self.assertIn(b"Prepare Link", logged_in.data)
         self.assertIn(b"Email message", logged_in.data)
+        self.assertIn(b"Edit email message", logged_in.data)
+        self.assertNotIn(b"Close Without Sending", logged_in.data)
+        self.assertNotIn(b'content:"Show"', logged_in.data)
         self.assertNotIn(b"Recent Library Files", logged_in.data)
         self.assertIn(b'data-ntc-branding="ntc-bg"', logged_in.data)
 
@@ -157,10 +194,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
         revoked = self.client.post("/admin/requests/1/revoke", follow_redirects=True)
         self.assertEqual(revoked.status_code, 200)
         self.assertIn(b"Recording access revoked", revoked.data)
+        self.assertIn(b"Closed Requests", revoked.data)
         self.assertIn(b"Revoked", revoked.data)
         self.assertEqual(self.client.get(f"/share/{token}").status_code, 404)
 
-    def test_completed_request_can_be_archived(self):
+    def test_closed_request_can_be_archived(self):
         self.client.post(
             "/request",
             data={
@@ -188,12 +226,39 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Request archived", archived.data)
         self.assertIn(b"Archived Requests", archived.data)
 
-    def test_old_completed_requests_auto_archive(self):
+    def test_active_request_must_be_revoked_before_archive(self):
         self.client.post(
             "/request",
             data={
-                "requester_name": "Old Completed Person",
-                "email": "old-completed@example.test",
+                "requester_name": "Active Person",
+                "email": "active@example.test",
+                "requested_date": self._first_recording_date_from_public_form(),
+            },
+        )
+        self._login()
+        panel = self.client.get("/admin/panel").data.decode("utf-8")
+        recording_id = self._first_recording_id_from_admin_panel(panel)
+
+        prepared = self.client.post(
+            "/admin/requests/1/send",
+            data={"recording_id": recording_id},
+            follow_redirects=True,
+        )
+        self.assertIn(b"Active Links", prepared.data)
+
+        archived = self.client.post("/admin/requests/1/archive", follow_redirects=True)
+
+        self.assertEqual(archived.status_code, 200)
+        self.assertIn(b"Revoke access before archiving a request", archived.data)
+        self.assertIn(b"Active Links", archived.data)
+        self.assertIn(b"Open prepared share link", archived.data)
+
+    def test_old_closed_requests_auto_archive(self):
+        self.client.post(
+            "/request",
+            data={
+                "requester_name": "Old Closed Person",
+                "email": "old-closed@example.test",
                 "requested_date": self._first_recording_date_from_public_form(),
             },
         )
@@ -213,11 +278,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 (old_timestamp,),
             )
 
-        completed = self.client.get("/admin/panel?tab=completed")
+        closed = self.client.get("/admin/panel?tab=closed")
         archived = self.client.get("/admin/panel?tab=archived")
 
-        self.assertNotIn(b"Old Completed Person", completed.data)
-        self.assertIn(b"Old Completed Person", archived.data)
+        self.assertNotIn(b"Old Closed Person", closed.data)
+        self.assertIn(b"Old Closed Person", archived.data)
         self.assertIn(b"Archived Requests", archived.data)
 
     def test_proxy_prefix_is_preserved_on_admin_redirects(self):
@@ -237,15 +302,16 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["recording_count"], 3)
-        self.assertEqual(payload["recording_counts_by_kind"]["message"], 2)
-        self.assertEqual(payload["recording_counts_by_kind"]["worship"], 1)
+        self.assertEqual(payload["recording_count"], 4)
+        self.assertEqual(payload["recording_counts_by_kind"]["message"], 1)
+        self.assertEqual(payload["recording_counts_by_kind"]["worship"], 2)
+        self.assertEqual(payload["recording_counts_by_kind"]["testimony"], 1)
         with sqlite3.connect(self.db_path) as connection:
             indexed_count = connection.execute("SELECT COUNT(*) FROM recording_library").fetchone()[0]
             refreshed_at = connection.execute(
                 "SELECT value FROM recording_library_meta WHERE key = 'last_refresh_finished'"
             ).fetchone()
-        self.assertEqual(indexed_count, 3)
+        self.assertEqual(indexed_count, 4)
         self.assertIsNotNone(refreshed_at)
 
     def test_nextcloud_share_provider_can_generate_public_link(self):
@@ -268,10 +334,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self._login()
         panel = self.client.get("/admin/panel").data.decode("utf-8")
         recording_id = self._first_recording_id_from_admin_panel(panel)
+        fake_get = Mock(status_code=200)
+        fake_get.json.return_value = {"ocs": {"data": []}}
         fake_response = Mock(status_code=200)
         fake_response.json.return_value = {"ocs": {"data": {"id": 2468, "url": "https://nextcloud.example.test/s/share-token"}}}
 
-        with patch("ntc_recordings_app.requests.post", return_value=fake_response) as post:
+        with patch("ntc_recordings_app.requests.get", return_value=fake_get) as get, patch("ntc_recordings_app.requests.post", return_value=fake_response) as post:
             prepared = self.client.post(
                 "/admin/requests/1/send",
                 data={"recording_id": recording_id},
@@ -281,6 +349,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(prepared.status_code, 200)
         self.assertIn(b"https://nextcloud.example.test/s/share-token", prepared.data)
         self.assertIn(b"Share provider: nextcloud", prepared.data)
+        self.assertIn(b"Active Links", prepared.data)
+        get.assert_called_once()
         post.assert_called_once()
         self.assertEqual(post.call_args.kwargs["data"]["path"], "/Recordings/MessageRecordings/20260419 - Jesus Is Our Peace - Bro Blessen.mp3")
 
@@ -292,6 +362,97 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Recording access revoked", revoked.data)
         delete.assert_called_once()
         self.assertIn("/shares/2468", delete.call_args.args[0])
+
+    def test_worship_nextcloud_share_uses_service_folder(self):
+        self.app.config.update(
+            NTC_RECORDINGS_SHARE_PROVIDER="nextcloud",
+            NTC_NEXTCLOUD_BASE_URL="https://nextcloud.example.test",
+            NTC_NEXTCLOUD_USERNAME="admin",
+            NTC_NEXTCLOUD_APP_PASSWORD="app-password",
+            NTC_NEXTCLOUD_LOCAL_PATH_PREFIX=str(self.worship_root),
+            NTC_NEXTCLOUD_PATH_PREFIX="Worship Recordings",
+            NTC_NEXTCLOUD_PATH_MAPPINGS=f"{self.worship_root}=Worship Recordings",
+        )
+        self.client.post(
+            "/request",
+            data={
+                "requester_name": "Worship Folder Person",
+                "email": "worship-folder@example.test",
+                "recording_kind": "worship",
+                "requested_date": self._first_recording_date_from_public_form(),
+            },
+        )
+        self._login()
+        panel = self.client.get("/admin/panel").data.decode("utf-8")
+        recording_id = self._first_recording_id_from_admin_panel(panel)
+        fake_get = Mock(status_code=200)
+        fake_get.json.return_value = {"ocs": {"data": []}}
+        fake_response = Mock(status_code=200)
+        fake_response.json.return_value = {"ocs": {"data": {"id": 1357, "url": "https://nextcloud.example.test/s/worship-folder"}}}
+
+        with patch("ntc_recordings_app.requests.get", return_value=fake_get), patch("ntc_recordings_app.requests.post", return_value=fake_response) as post:
+            prepared = self.client.post(
+                "/admin/requests/1/send",
+                data={"recording_id": recording_id},
+                follow_redirects=True,
+            )
+
+        self.assertEqual(prepared.status_code, 200)
+        self.assertIn(b"https://nextcloud.example.test/s/worship-folder", prepared.data)
+        self.assertEqual(
+            post.call_args.kwargs["data"]["path"],
+            "/Worship Recordings/2026/April/April 19, 2026 - Sunday Service",
+        )
+
+    def test_nextcloud_share_provider_reuses_existing_public_link(self):
+        self.app.config.update(
+            NTC_RECORDINGS_SHARE_PROVIDER="nextcloud",
+            NTC_NEXTCLOUD_BASE_URL="https://nextcloud.example.test",
+            NTC_NEXTCLOUD_USERNAME="admin",
+            NTC_NEXTCLOUD_APP_PASSWORD="app-password",
+            NTC_NEXTCLOUD_LOCAL_PATH_PREFIX=str(self.root),
+            NTC_NEXTCLOUD_PATH_PREFIX="Recordings/MessageRecordings",
+        )
+        self.client.post(
+            "/request",
+            data={
+                "requester_name": "Reuse Person",
+                "email": "reuse@example.test",
+                "requested_date": self._first_recording_date_from_public_form(),
+            },
+        )
+        self._login()
+        panel = self.client.get("/admin/panel").data.decode("utf-8")
+        recording_id = self._first_recording_id_from_admin_panel(panel)
+        fake_get = Mock(status_code=200)
+        fake_get.json.return_value = {
+            "ocs": {
+                "data": [
+                    {"id": 9753, "url": "https://nextcloud.example.test/s/existing-share"},
+                ]
+            }
+        }
+
+        with patch("ntc_recordings_app.requests.get", return_value=fake_get) as get, patch("ntc_recordings_app.requests.post") as post:
+            prepared = self.client.post(
+                "/admin/requests/1/send",
+                data={"recording_id": recording_id},
+                follow_redirects=True,
+            )
+
+        self.assertEqual(prepared.status_code, 200)
+        self.assertIn(b"https://nextcloud.example.test/s/existing-share", prepared.data)
+        get.assert_called_once()
+        post.assert_not_called()
+
+        fake_delete = Mock(status_code=200)
+        with patch("ntc_recordings_app.requests.delete", return_value=fake_delete) as delete:
+            revoked = self.client.post("/admin/requests/1/revoke", follow_redirects=True)
+
+        self.assertEqual(revoked.status_code, 200)
+        self.assertIn(b"Recording access revoked", revoked.data)
+        delete.assert_called_once()
+        self.assertIn("/shares/9753", delete.call_args.args[0])
 
 
 if __name__ == "__main__":
