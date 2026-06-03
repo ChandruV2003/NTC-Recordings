@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from ntc_recordings_app import create_app
+from ntc_recordings_app import _recording_id, create_app
 
 
 class RecordingRequestPanelTests(unittest.TestCase):
@@ -30,6 +30,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "SECRET_KEY": "test-secret",
                 "NTC_RECORDINGS_DB_PATH": str(self.db_path),
                 "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root}",
+                "NTC_RECORDINGS_DN300R_DIR": str(self.root / "DN300R"),
                 "NTC_RECORDINGS_PUBLIC_BASE_URL": "https://recordings.example.test",
                 "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
                 "NTC_RECORDINGS_EMAIL_ENABLED": "0",
@@ -477,6 +478,50 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Recording access revoked", revoked.data)
         delete.assert_called_once()
         self.assertIn("/shares/9753", delete.call_args.args[0])
+
+    def test_testimony_review_tracks_raw_dn300r_identification(self):
+        dn300r_root = self.root / "DN300R"
+        dn300r_root.mkdir()
+        raw_recording = dn300r_root / "REC00042.mp3"
+        raw_recording.write_bytes(b"raw-testimony-audio")
+        (dn300r_root / "20250413 - Sister Rachel's Testimony.mp3").write_bytes(b"named-testimony-audio")
+
+        denied = self.client.get("/admin/testimonies")
+        self.assertEqual(denied.status_code, 302)
+
+        self._login()
+        review = self.client.get("/admin/testimonies")
+
+        self.assertEqual(review.status_code, 200)
+        self.assertIn(b"Testimony Review", review.data)
+        self.assertIn(b"REC00042", review.data)
+        self.assertIn(b"Check Durations", review.data)
+        self.assertIn(b"Save Testimony Plan", review.data)
+        self.assertIn(b"Review-only for now", review.data)
+        self.assertNotIn(b"20250413 - Sister Rachel", review.data)
+
+        recording_id = _recording_id(raw_recording)
+        audio = self.client.get(f"/admin/testimonies/audio/{recording_id}")
+        self.assertEqual(audio.status_code, 200)
+        self.assertEqual(audio.data, b"raw-testimony-audio")
+
+        saved = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "status": "identified",
+                "service_date": "2026-04-19",
+                "speaker_name": "Sister Test",
+                "testimony_title": "Sister Test's Testimony",
+                "notes": "Recognized from review.",
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(saved.status_code, 200)
+        self.assertIn(b"Testimony review saved", saved.data)
+        self.assertIn(b"Sister Test", saved.data)
+        self.assertIn(b"20260419 - Sister Test&#39;s Testimony.mp3", saved.data)
+        self.assertIn(b"Sunday Testimonies", saved.data)
 
 
 if __name__ == "__main__":

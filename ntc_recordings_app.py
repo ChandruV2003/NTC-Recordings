@@ -14,6 +14,7 @@ import re
 import secrets
 import smtplib
 import sqlite3
+import subprocess
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -94,7 +95,12 @@ def create_app(test_config: dict | None = None) -> Flask:
         SECRET_KEY=os.getenv("NTC_RECORDINGS_SECRET_KEY") or os.getenv("NTC_SECRET_KEY") or "change-me",
         NTC_RECORDINGS_DB_PATH=os.getenv("NTC_RECORDINGS_DB_PATH", "data/recording-requests.db"),
         NTC_RECORDINGS_LIBRARY_DIRS=os.getenv("NTC_RECORDINGS_LIBRARY_DIRS", DEFAULT_RECORDING_DIRS),
+        NTC_RECORDINGS_DN300R_DIR=os.getenv(
+            "NTC_RECORDINGS_DN300R_DIR",
+            str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R"),
+        ),
         NTC_RECORDINGS_MAX_SCAN_FILES=int(os.getenv("NTC_RECORDINGS_MAX_SCAN_FILES", "4000")),
+        NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT", "80")),
         NTC_RECORDINGS_INDEX_REFRESH_SECONDS=float(
             os.getenv(
                 "NTC_RECORDINGS_INDEX_REFRESH_SECONDS",
@@ -325,6 +331,119 @@ def create_app(test_config: dict | None = None) -> Flask:
             format_datetime=_format_datetime,
         )
 
+    @app.get("/admin/testimonies")
+    def testimony_review():
+        guard = _require_admin()
+        if guard:
+            return guard
+        status_filter = (request.args.get("status") or "needs_review").strip().lower()
+        if status_filter not in {"needs_review", "identified", "not_testimony", "already_named", "all"}:
+            status_filter = "needs_review"
+        sort = (request.args.get("sort") or "shortest").strip().lower()
+        if sort not in {"shortest", "newest", "name"}:
+            sort = "shortest"
+        try:
+            limit = int(request.args.get("limit") or "100")
+        except ValueError:
+            limit = 100
+        limit = min(max(limit, 1), 500)
+        items = _testimony_review_items(app)
+        counts = _testimony_status_counts(items)
+        visible_items = items if status_filter == "all" else [item for item in items if item["status"] == status_filter]
+        _sort_testimony_items(visible_items, sort)
+        visible_items = visible_items[:limit]
+        root = _dn300r_root(app)
+        return render_template_string(
+            TESTIMONY_REVIEW_TEMPLATE,
+            title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
+            items=visible_items,
+            counts=counts,
+            status_filter=status_filter,
+            sort=sort,
+            limit=limit,
+            dn300r_root=str(root),
+            dn300r_exists=root.exists() and root.is_dir(),
+            probe_limit=int(app.config.get("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT") or 80),
+            message=request.args.get("message"),
+            error=request.args.get("error"),
+            status_label=_testimony_status_label,
+            format_date=_format_date,
+        )
+
+    @app.post("/admin/testimonies/probe")
+    def probe_testimony_durations():
+        guard = _require_admin()
+        if guard:
+            return guard
+        try:
+            limit = int(request.form.get("limit") or app.config.get("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT") or 80)
+        except ValueError:
+            limit = int(app.config.get("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT") or 80)
+        limit = min(max(limit, 1), 120)
+        probed, skipped = _probe_missing_testimony_durations(app, limit)
+        return redirect(
+            url_for(
+                "testimony_review",
+                status=request.form.get("status") or "needs_review",
+                sort=request.form.get("sort") or "shortest",
+                message=f"Checked {probed + skipped} DN300R file{'s' if probed + skipped != 1 else ''}; saved {probed} duration{'s' if probed != 1 else ''}.",
+            )
+        )
+
+    @app.post("/admin/testimonies/<recording_id>/review")
+    def update_testimony_review(recording_id: str):
+        guard = _require_admin()
+        if guard:
+            return guard
+        candidate = _dn300r_recording_by_id(app, recording_id)
+        if not candidate:
+            return redirect(url_for("testimony_review", error="DN300R recording was not found."))
+        status = (request.form.get("status") or "identified").strip().lower()
+        if status not in {"needs_review", "identified", "not_testimony"}:
+            status = "identified"
+        service_date = _normalize_date((request.form.get("service_date") or "").strip()) or ""
+        speaker_name = (request.form.get("speaker_name") or "").strip()
+        testimony_title = (request.form.get("testimony_title") or "").strip()
+        notes = (request.form.get("notes") or "").strip()
+        existing = _testimony_review_row(app, recording_id)
+        duration_seconds = _row_duration(existing) if existing else None
+        proposed_path = ""
+        if status == "identified":
+            proposed_path = _proposed_testimony_path(app, Path(candidate.path), service_date, speaker_name, testimony_title)
+        _save_testimony_review(
+            app,
+            recording_id=recording_id,
+            source_path=candidate.path,
+            status=status,
+            service_date=service_date,
+            speaker_name=speaker_name,
+            testimony_title=testimony_title,
+            notes=notes,
+            proposed_path=proposed_path,
+            duration_seconds=duration_seconds,
+        )
+        return redirect(
+            url_for(
+                "testimony_review",
+                status=status,
+                sort=request.form.get("sort") or "shortest",
+                message="Testimony review saved.",
+            )
+        )
+
+    @app.get("/admin/testimonies/audio/<recording_id>")
+    def testimony_audio(recording_id: str):
+        guard = _require_admin()
+        if guard:
+            return guard
+        candidate = _dn300r_recording_by_id(app, recording_id)
+        if not candidate:
+            return jsonify({"error": "recording was not found"}), 404
+        path = Path(candidate.path)
+        if not _path_allowed(app, path) or not path.exists() or not path.is_file():
+            return jsonify({"error": "recording is unavailable"}), 404
+        return send_file(path, as_attachment=False, conditional=True)
+
     @app.post("/admin/requests/<int:request_id>/send")
     def send_request_link(request_id: int):
         guard = _require_admin()
@@ -497,6 +616,24 @@ def _init_db(db_path: str) -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS testimony_reviews (
+                recording_id TEXT PRIMARY KEY,
+                source_path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'needs_review',
+                service_date TEXT NOT NULL DEFAULT '',
+                speaker_name TEXT NOT NULL DEFAULT '',
+                testimony_title TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                proposed_path TEXT NOT NULL DEFAULT '',
+                duration_seconds REAL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_status ON testimony_reviews(status)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_source_path ON testimony_reviews(source_path)")
 
 
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -1133,6 +1270,351 @@ def _request_group_label(kind: str) -> str:
         "unsure": "Not Sure Requests",
     }
     return labels.get(kind, "Recording Requests")
+
+
+def _dn300r_root(app: Flask) -> Path:
+    configured = Path(str(app.config.get("NTC_RECORDINGS_DN300R_DIR") or "")).expanduser()
+    if configured.exists():
+        return configured
+    message_root = _message_recording_root(app)
+    for folder_name in ("DN300R", "DM300R"):
+        candidate = message_root / folder_name
+        if candidate.exists():
+            return candidate
+    return configured
+
+
+def _message_recording_root(app: Flask) -> Path:
+    roots = _library_roots(app)
+    for kind, root in roots:
+        if kind == "message":
+            return root
+    for _, root in roots:
+        if "messagerecordings" in re.sub(r"[^a-z]+", "", str(root).lower()):
+            return root
+    return Path(DEFAULT_MESSAGE_RECORDING_DIR)
+
+
+def _dn300r_candidates(app: Flask) -> list[RecordingCandidate]:
+    root = _dn300r_root(app)
+    if not root.exists() or not root.is_dir():
+        return []
+    message_root = _message_recording_root(app)
+    candidates = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        if path.name.startswith("._") or any(part.startswith(".") for part in path.parts):
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        recording_date = _extract_recording_date(" ".join(path.parts)) or ""
+        try:
+            relative_path = str(path.relative_to(message_root))
+        except ValueError:
+            try:
+                relative_path = str(path.relative_to(root))
+            except ValueError:
+                relative_path = path.name
+        kind = "testimony" if _raw_testimony_name(path) else "message"
+        candidates.append(
+            RecordingCandidate(
+                id=_recording_id(path),
+                path=str(path),
+                title=_display_title(path),
+                recording_date=recording_date,
+                kind=kind,
+                size_bytes=stat.st_size,
+                modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                relative_path=relative_path,
+            )
+        )
+    candidates.sort(key=lambda item: (item.recording_date or "0000-00-00", item.modified_at, item.title), reverse=True)
+    return candidates
+
+
+def _dn300r_recording_by_id(app: Flask, recording_id: str) -> RecordingCandidate | None:
+    if not recording_id:
+        return None
+    return next((item for item in _dn300r_candidates(app) if item.id == recording_id), None)
+
+
+def _raw_testimony_name(path: Path) -> bool:
+    normalized = re.sub(r"[^a-z]+", "", str(path).lower())
+    return "testimony" in normalized or "testimonies" in normalized
+
+
+def _testimony_review_row(app: Flask, recording_id: str) -> sqlite3.Row | None:
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        return connection.execute("SELECT * FROM testimony_reviews WHERE recording_id = ?", (recording_id,)).fetchone()
+
+
+def _testimony_review_rows(app: Flask) -> dict[str, sqlite3.Row]:
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        rows = connection.execute("SELECT * FROM testimony_reviews").fetchall()
+    return {row["recording_id"]: row for row in rows}
+
+
+def _testimony_review_items(app: Flask) -> list[dict]:
+    rows = _testimony_review_rows(app)
+    items = []
+    for candidate in _dn300r_candidates(app):
+        row = rows.get(candidate.id)
+        duration_seconds = _row_duration(row) if row else None
+        status = str(row["status"] or "") if row else ""
+        if status not in {"needs_review", "identified", "not_testimony", "already_named"}:
+            status = "already_named" if _raw_testimony_name(Path(candidate.path)) else "needs_review"
+        service_date = str(row["service_date"] or "") if row else ""
+        speaker_name = str(row["speaker_name"] or "") if row else ""
+        testimony_title = str(row["testimony_title"] or "") if row else ""
+        notes = str(row["notes"] or "") if row else ""
+        proposed_path = str(row["proposed_path"] or "") if row else ""
+        if not service_date:
+            service_date = candidate.recording_date
+        if not proposed_path and status == "identified":
+            proposed_path = _proposed_testimony_path(
+                app,
+                Path(candidate.path),
+                service_date,
+                speaker_name,
+                testimony_title,
+            )
+        items.append(
+            {
+                "id": candidate.id,
+                "title": candidate.title,
+                "source_path": candidate.path,
+                "relative_path": candidate.relative_path,
+                "recording_date": candidate.recording_date,
+                "service_date": service_date,
+                "speaker_name": speaker_name,
+                "testimony_title": testimony_title,
+                "notes": notes,
+                "proposed_path": proposed_path,
+                "duration_seconds": duration_seconds,
+                "duration_label": _format_duration(duration_seconds),
+                "size_label": _human_size(candidate.size_bytes),
+                "modified_at": candidate.modified_at,
+                "modified_label": _format_datetime(candidate.modified_at),
+                "status": status,
+                "status_label": _testimony_status_label(status),
+                "audio_url": url_for("testimony_audio", recording_id=candidate.id),
+                "extension": Path(candidate.path).suffix.lower(),
+            }
+        )
+    return items
+
+
+def _row_duration(row: sqlite3.Row | None) -> float | None:
+    if not row or row["duration_seconds"] is None:
+        return None
+    try:
+        return float(row["duration_seconds"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _testimony_status_counts(items: Iterable[dict]) -> dict[str, int]:
+    counts = {"needs_review": 0, "identified": 0, "not_testimony": 0, "already_named": 0, "all": 0}
+    for item in items:
+        status = item.get("status") if item.get("status") in counts else "needs_review"
+        counts[status] += 1
+        counts["all"] += 1
+    return counts
+
+
+def _sort_testimony_items(items: list[dict], sort: str) -> None:
+    if sort == "newest":
+        items.sort(key=lambda item: (item.get("modified_at") or "", item.get("title") or ""), reverse=True)
+        return
+    if sort == "name":
+        items.sort(key=lambda item: (item.get("title") or "").lower())
+        return
+    items.sort(
+        key=lambda item: (
+            item.get("duration_seconds") is None,
+            item.get("duration_seconds") if item.get("duration_seconds") is not None else float("inf"),
+            item.get("recording_date") or "9999-99-99",
+            (item.get("title") or "").lower(),
+        )
+    )
+
+
+def _testimony_status_label(status: str) -> str:
+    labels = {
+        "needs_review": "Needs Review",
+        "identified": "Identified",
+        "not_testimony": "Not Testimony",
+        "already_named": "Already Named",
+        "all": "All",
+    }
+    return labels.get(status, status.replace("_", " ").title())
+
+
+def _save_testimony_review(
+    app: Flask,
+    *,
+    recording_id: str,
+    source_path: str,
+    status: str,
+    service_date: str,
+    speaker_name: str,
+    testimony_title: str,
+    notes: str,
+    proposed_path: str,
+    duration_seconds: float | None,
+) -> None:
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute(
+            """
+            INSERT INTO testimony_reviews (
+                recording_id,
+                source_path,
+                status,
+                service_date,
+                speaker_name,
+                testimony_title,
+                notes,
+                proposed_path,
+                duration_seconds,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(recording_id) DO UPDATE SET
+                source_path = excluded.source_path,
+                status = excluded.status,
+                service_date = excluded.service_date,
+                speaker_name = excluded.speaker_name,
+                testimony_title = excluded.testimony_title,
+                notes = excluded.notes,
+                proposed_path = excluded.proposed_path,
+                duration_seconds = excluded.duration_seconds,
+                updated_at = excluded.updated_at
+            """,
+            (
+                recording_id,
+                source_path,
+                status,
+                service_date,
+                speaker_name,
+                testimony_title,
+                notes,
+                proposed_path,
+                duration_seconds,
+                _utc_now(),
+            ),
+        )
+
+
+def _probe_missing_testimony_durations(app: Flask, limit: int) -> tuple[int, int]:
+    rows = _testimony_review_rows(app)
+    probed = 0
+    skipped = 0
+    for candidate in _dn300r_candidates(app):
+        if probed + skipped >= limit:
+            break
+        row = rows.get(candidate.id)
+        if _row_duration(row) is not None:
+            skipped += 1
+            continue
+        duration = _probe_audio_duration(Path(candidate.path))
+        if duration is None:
+            skipped += 1
+            continue
+        status = str(row["status"] or "") if row else ""
+        if status not in {"needs_review", "identified", "not_testimony", "already_named"}:
+            status = "already_named" if _raw_testimony_name(Path(candidate.path)) else "needs_review"
+        service_date = str(row["service_date"] or "") if row else candidate.recording_date
+        speaker_name = str(row["speaker_name"] or "") if row else ""
+        testimony_title = str(row["testimony_title"] or "") if row else ""
+        notes = str(row["notes"] or "") if row else ""
+        proposed_path = str(row["proposed_path"] or "") if row else ""
+        _save_testimony_review(
+            app,
+            recording_id=candidate.id,
+            source_path=candidate.path,
+            status=status,
+            service_date=service_date,
+            speaker_name=speaker_name,
+            testimony_title=testimony_title,
+            notes=notes,
+            proposed_path=proposed_path,
+            duration_seconds=duration,
+        )
+        probed += 1
+    return probed, skipped
+
+
+def _probe_audio_duration(path: Path) -> float | None:
+    try:
+        completed = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        duration = float((completed.stdout or "").strip())
+    except ValueError:
+        return None
+    return duration if duration > 0 else None
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "Unknown"
+    total = max(0, int(round(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _proposed_testimony_path(
+    app: Flask,
+    source_path: Path,
+    service_date: str,
+    speaker_name: str,
+    testimony_title: str,
+) -> str:
+    normalized_date = _normalize_date(service_date or "") or ""
+    if normalized_date:
+        year = normalized_date[:4]
+        date_prefix = normalized_date.replace("-", "")
+    else:
+        year = "Unsorted"
+        date_prefix = _sanitize_filename_part(source_path.stem) or "Undated"
+    title = testimony_title.strip()
+    speaker = speaker_name.strip()
+    if not title and speaker:
+        title = f"{speaker}'s Testimony"
+    if not title:
+        title = "Testimony"
+    filename = _sanitize_filename_part(f"{date_prefix} - {title}") + source_path.suffix.lower()
+    return str(_message_recording_root(app) / year / "Sunday Testimonies" / filename)
+
+
+def _sanitize_filename_part(value: str) -> str:
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "-", str(value or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .-")
+    return cleaned or "Untitled"
 
 
 def _candidate_option_label(candidate: RecordingCandidate) -> str:
@@ -2197,6 +2679,7 @@ RECORDING_ADMIN_TEMPLATE = """
           <p class="muted">Approve message, worship, and testimony recording requests from one queue.</p>
         </div>
         <div class="actions">
+          <a href="{{ url_for('testimony_review') }}">Testimony Review</a>
           <a href="{{ url_for('public_form') }}">Public Form</a>
           <form method="post" action="{{ url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
         </div>
@@ -2378,6 +2861,483 @@ RECORDING_ADMIN_TEMPLATE = """
 	          {% endif %}
         </section>
       </div>
+    </main>
+  </body>
+</html>
+"""
+
+
+TESTIMONY_REVIEW_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }} Testimony Review</title>
+    <style>
+      :root {
+        color-scheme:dark;
+        --bg:#07121e;
+        --surface:rgba(10,21,36,.92);
+        --surface-2:rgba(18,34,53,.9);
+        --surface-3:rgba(6,13,24,.62);
+        --line:rgba(143,211,255,.2);
+        --line-strong:rgba(143,211,255,.34);
+        --text:#edf7ff;
+        --muted:#9fb2c6;
+        --accent:#8fd3ff;
+        --good:#74ddb4;
+        --good-soft:rgba(116,221,180,.1);
+        --warn:#ffc875;
+        --warn-soft:rgba(255,200,117,.1);
+        --bad:#ffaaa8;
+        --bad-soft:rgba(255,170,168,.1);
+        --ink:#06101d;
+        --shadow:0 22px 70px rgba(0,0,0,.34);
+        --mono:ui-monospace,"SFMono-Regular",Consolas,monospace;
+      }
+      * { box-sizing:border-box; }
+      body {
+        margin:0;
+        min-height:100vh;
+        color:var(--text);
+        background:
+          radial-gradient(circle at 10% 0%, rgba(143,211,255,.2), transparent 28rem),
+          linear-gradient(145deg,#050913,var(--bg)),
+          var(--bg);
+        font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      }
+      body::before {
+        content:"";
+        position:fixed;
+        inset:0;
+        z-index:-1;
+        pointer-events:none;
+        background:url("{{ url_for('ntc_brand_background') }}") center / min(1120px,118vw) auto no-repeat;
+        opacity:.24;
+        filter:saturate(1.08) contrast(1.04);
+      }
+      main { width:min(1400px, calc(100vw - 32px)); margin:0 auto; padding:30px 0 44px; }
+      header { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:1rem; margin-bottom:1rem; align-items:start; }
+      h1, h2, h3, p { margin:0; }
+      h1 { font-size:clamp(34px,5.2vw,64px); line-height:.95; letter-spacing:-.055em; }
+      h2 { font-size:1.15rem; letter-spacing:-.02em; }
+      h3 { font-size:1.02rem; letter-spacing:-.01em; }
+      .eyebrow, .meta {
+        color:var(--accent);
+        font:800 .72rem var(--mono);
+        letter-spacing:.12em;
+        text-transform:uppercase;
+      }
+      .muted { color:var(--muted); line-height:1.45; }
+      .actions { display:flex; gap:.5rem; flex-wrap:wrap; justify-content:flex-end; }
+      a, button, input, textarea, select {
+        border:1px solid var(--line);
+        border-radius:14px;
+        background:var(--surface-2);
+        color:var(--text);
+        padding:.72rem .9rem;
+        text-decoration:none;
+        font:inherit;
+      }
+      a, button { font-weight:850; }
+      button { cursor:pointer; }
+      button:hover, a:hover, input:hover, textarea:hover, select:hover { border-color:var(--line-strong); }
+      input, textarea, select { width:100%; background:var(--surface-3); }
+      textarea { min-height:5.8rem; resize:vertical; line-height:1.45; }
+      label { display:grid; gap:.35rem; color:var(--muted); font-weight:850; }
+      label span { font:800 .64rem var(--mono); letter-spacing:.12em; text-transform:uppercase; }
+      audio { width:100%; min-height:44px; }
+      .banner {
+        margin-bottom:1rem;
+        border:1px solid rgba(116,221,180,.35);
+        background:var(--good-soft);
+        color:var(--good);
+        border-radius:16px;
+        padding:.85rem;
+        font-weight:850;
+      }
+      .banner.error { border-color:rgba(255,154,154,.4); background:var(--bad-soft); color:#ffaaaa; }
+      .metrics {
+        display:grid;
+        grid-template-columns:repeat(5,minmax(0,1fr));
+        gap:.65rem;
+        margin:.65rem 0 1rem;
+      }
+      .metric {
+        border:1px solid var(--line);
+        border-radius:18px;
+        background:rgba(5,13,24,.58);
+        padding:.78rem .85rem;
+        min-width:0;
+      }
+      .metric span {
+        display:block;
+        color:var(--muted);
+        font:800 .64rem var(--mono);
+        letter-spacing:.12em;
+        text-transform:uppercase;
+      }
+      .metric strong { display:block; margin-top:.24rem; font-size:1.42rem; line-height:1; letter-spacing:-.04em; }
+      .metric small { display:block; margin-top:.32rem; color:var(--muted); line-height:1.35; }
+      .toolbar {
+        display:grid;
+        grid-template-columns:minmax(0,1fr) auto;
+        gap:.8rem;
+        align-items:center;
+        margin:.85rem 0 1rem;
+      }
+      .tabs {
+        display:flex;
+        flex-wrap:wrap;
+        gap:.35rem;
+        padding:.28rem;
+        border:1px solid var(--line);
+        border-radius:999px;
+        background:rgba(5,13,24,.58);
+        width:max-content;
+        max-width:100%;
+      }
+      .tab {
+        display:flex;
+        align-items:center;
+        gap:.44rem;
+        border-color:transparent;
+        border-radius:999px;
+        background:transparent;
+        color:var(--muted);
+        padding:.5rem .72rem;
+        font-size:.84rem;
+        line-height:1;
+      }
+      .tab.active {
+        color:var(--text);
+        background:linear-gradient(135deg,rgba(143,211,255,.18),rgba(143,245,200,.12));
+        border-color:rgba(143,211,255,.42);
+      }
+      .tab strong {
+        display:inline-grid;
+        place-items:center;
+        min-width:1.45rem;
+        min-height:1.45rem;
+        padding:0 .34rem;
+        border-radius:999px;
+        background:rgba(143,211,255,.1);
+        color:inherit;
+        font-size:.76rem;
+      }
+      .tab.active strong { background:linear-gradient(135deg,#8fd3ff,#8ff5c8); color:var(--ink); }
+      .probe-form {
+        display:flex;
+        justify-content:flex-end;
+        align-items:center;
+        gap:.45rem;
+        flex-wrap:wrap;
+      }
+      .probe-form input { width:5.8rem; }
+      .panel {
+        border:1px solid var(--line);
+        border-radius:24px;
+        background:var(--surface);
+        padding:1rem;
+        box-shadow:var(--shadow);
+      }
+      .panel-head {
+        display:flex;
+        align-items:end;
+        justify-content:space-between;
+        gap:1rem;
+        flex-wrap:wrap;
+        margin-bottom:.8rem;
+      }
+      .panel-head p { margin-top:.25rem; }
+      .review-list { display:grid; gap:.62rem; }
+      .review-card {
+        border:1px solid rgba(143,211,255,.16);
+        border-radius:18px;
+        background:linear-gradient(135deg,rgba(255,255,255,.045),rgba(143,211,255,.02));
+        overflow:hidden;
+      }
+      .review-card[open] { border-color:var(--line-strong); }
+      .review-card summary { list-style:none; cursor:pointer; padding:.85rem .9rem; }
+      .review-card summary::-webkit-details-marker { display:none; }
+      .review-card[open] summary { border-bottom:1px solid var(--line); background:rgba(143,211,255,.035); }
+      .review-row {
+        display:grid;
+        grid-template-columns:minmax(16rem,1.3fr) minmax(7rem,.42fr) minmax(7rem,.42fr) minmax(10rem,.6fr) minmax(8rem,.42fr);
+        align-items:center;
+        gap:.78rem;
+      }
+      .cell { min-width:0; }
+      .cell-label {
+        display:block;
+        margin-bottom:.18rem;
+        color:var(--muted);
+        font:800 .62rem var(--mono);
+        letter-spacing:.12em;
+        text-transform:uppercase;
+      }
+      .cell-value {
+        display:block;
+        color:var(--text);
+        font-weight:850;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+      .cell-subvalue {
+        display:block;
+        margin-top:.12rem;
+        color:var(--muted);
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+      .pill {
+        display:inline-flex;
+        justify-content:center;
+        width:max-content;
+        border:1px solid var(--line);
+        border-radius:999px;
+        padding:.35rem .58rem;
+        color:var(--muted);
+        font:800 .68rem var(--mono);
+        letter-spacing:.08em;
+        text-transform:uppercase;
+      }
+      .pill.needs_review { color:var(--warn); border-color:rgba(255,200,117,.35); background:var(--warn-soft); }
+      .pill.identified, .pill.already_named { color:var(--good); border-color:rgba(116,221,180,.34); background:var(--good-soft); }
+      .pill.not_testimony { color:var(--bad); border-color:rgba(255,170,168,.35); background:var(--bad-soft); }
+      .review-body {
+        display:grid;
+        grid-template-columns:minmax(16rem,.8fr) minmax(0,1.2fr);
+        gap:.95rem;
+        padding:1rem;
+        background:linear-gradient(180deg,rgba(143,211,255,.028),rgba(4,11,20,.12));
+      }
+      .listen-panel, .edit-panel, .path-panel {
+        border:1px solid rgba(143,211,255,.16);
+        border-radius:18px;
+        background:rgba(5,13,24,.45);
+        padding:.9rem;
+      }
+      .listen-panel { display:grid; gap:.75rem; align-content:start; }
+      .file-facts {
+        display:grid;
+        grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:.55rem;
+      }
+      .fact {
+        border:1px solid rgba(143,211,255,.12);
+        border-radius:14px;
+        background:rgba(255,255,255,.035);
+        padding:.65rem;
+      }
+      .fact span {
+        display:block;
+        color:var(--muted);
+        font:800 .62rem var(--mono);
+        letter-spacing:.12em;
+        text-transform:uppercase;
+      }
+      .fact strong { display:block; margin-top:.18rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .review-form { display:grid; gap:.75rem; }
+      .form-grid {
+        display:grid;
+        grid-template-columns:minmax(0,.72fr) minmax(0,1fr);
+        gap:.72rem;
+      }
+      .wide { grid-column:1 / -1; }
+      .path-panel {
+        grid-column:1 / -1;
+        display:grid;
+        gap:.35rem;
+      }
+      .path-panel code {
+        display:block;
+        overflow-wrap:anywhere;
+        border:1px solid rgba(143,211,255,.14);
+        border-radius:14px;
+        background:rgba(4,11,20,.62);
+        padding:.72rem;
+        color:#dbeaff;
+        font-family:var(--mono);
+        font-size:.82rem;
+        line-height:1.45;
+      }
+      .button-row { display:flex; gap:.55rem; flex-wrap:wrap; justify-content:flex-end; }
+      .button-row button { width:auto; }
+      .save { color:#dcfff0; background:rgba(116,221,180,.15); border-color:rgba(116,221,180,.45); }
+      .danger { color:#ffd7d7; border-color:rgba(255,170,168,.35); background:var(--bad-soft); }
+      .secondary { color:var(--muted); background:rgba(143,211,255,.06); }
+      .empty {
+        border:1px dashed rgba(143,211,255,.25);
+        border-radius:18px;
+        padding:1.2rem;
+        color:var(--muted);
+        text-align:center;
+      }
+      @media (max-width:1100px) {
+        .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .toolbar, .review-body { grid-template-columns:1fr; }
+        .probe-form { justify-content:flex-start; }
+        .review-row { grid-template-columns:minmax(0,1fr) minmax(0,1fr); align-items:start; }
+      }
+      @media (max-width:760px) {
+        main { width:min(100vw - 24px, 1120px); padding-top:18px; }
+        header, .panel-head { display:flex; flex-direction:column; align-items:flex-start; }
+        .actions, .actions > a, .actions > form, .actions > form > button { width:100%; }
+        .tabs { width:100%; border-radius:22px; }
+        .tab { width:100%; justify-content:space-between; }
+        .metrics, .review-row, .file-facts, .form-grid { grid-template-columns:1fr; }
+        .wide { grid-column:auto; }
+        .button-row, .button-row button, .probe-form, .probe-form input, .probe-form button { width:100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <div class="eyebrow">NTC Newark</div>
+          <h1>Testimony Review</h1>
+          <p class="muted">Listen through raw DN300R recordings, identify testimonies, and prepare their final names.</p>
+        </div>
+        <div class="actions">
+          <a href="{{ url_for('admin_panel') }}">Requests</a>
+          <a href="{{ url_for('public_form') }}">Public Form</a>
+          <form method="post" action="{{ url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
+        </div>
+      </header>
+      {% if message %}<div class="banner">{{ message }}</div>{% endif %}
+      {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+      <section class="metrics" aria-label="Testimony review status">
+        <div class="metric"><span>Needs Review</span><strong>{{ counts.needs_review }}</strong><small>Raw DN300R files</small></div>
+        <div class="metric"><span>Identified</span><strong>{{ counts.identified }}</strong><small>Ready for rename plan</small></div>
+        <div class="metric"><span>Not Testimony</span><strong>{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
+        <div class="metric"><span>Already Named</span><strong>{{ counts.already_named }}</strong><small>Testimony is in the filename</small></div>
+        <div class="metric"><span>DN300R Files</span><strong>{{ counts.all }}</strong><small>{{ dn300r_root }}</small></div>
+      </section>
+      <div class="toolbar">
+        <nav class="tabs" aria-label="Testimony review filters">
+          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("not_testimony", "Not Testimony"), ("already_named", "Already Named"), ("all", "All")] %}
+            <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong>{{ counts[key] }}</strong></a>
+          {% endfor %}
+        </nav>
+        <form class="probe-form" method="post" action="{{ url_for('probe_testimony_durations') }}">
+          <input type="hidden" name="status" value="{{ status_filter }}">
+          <input type="hidden" name="sort" value="{{ sort }}">
+          <label>
+            <span>Probe</span>
+            <input name="limit" type="number" min="1" max="120" value="{{ probe_limit }}">
+          </label>
+          <button type="submit">Check Durations</button>
+        </form>
+      </div>
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>{{ status_label(status_filter) }}</h2>
+            <p class="muted">Review-only for now: this saves identity and destination plans, but does not move or rename NAS files.</p>
+          </div>
+          <form class="probe-form" method="get" action="{{ url_for('testimony_review') }}">
+            <input type="hidden" name="status" value="{{ status_filter }}">
+            <label>
+              <span>Sort</span>
+              <select name="sort">
+                <option value="shortest" {% if sort == "shortest" %}selected{% endif %}>Shortest first</option>
+                <option value="newest" {% if sort == "newest" %}selected{% endif %}>Newest first</option>
+                <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
+              </select>
+            </label>
+            <label>
+              <span>Limit</span>
+              <input name="limit" type="number" min="1" max="500" value="{{ limit }}">
+            </label>
+            <button type="submit">Apply</button>
+          </form>
+        </div>
+        {% if not dn300r_exists %}
+          <div class="empty">DN300R folder was not found at {{ dn300r_root }}.</div>
+        {% elif items %}
+          <div class="review-list">
+            {% for item in items %}
+              <details class="review-card {{ item.status }}">
+                <summary>
+                  <div class="review-row">
+                    <div class="cell">
+                      <span class="cell-label">Recording</span>
+                      <span class="cell-value">{{ item.title }}</span>
+                      <span class="cell-subvalue">{{ item.relative_path }}</span>
+                    </div>
+                    <div class="cell">
+                      <span class="cell-label">Duration</span>
+                      <span class="cell-value">{{ item.duration_label }}</span>
+                    </div>
+                    <div class="cell">
+                      <span class="cell-label">Date</span>
+                      <span class="cell-value">{{ format_date(item.service_date or item.recording_date) }}</span>
+                    </div>
+                    <div class="cell">
+                      <span class="cell-label">Speaker</span>
+                      <span class="cell-value">{{ item.speaker_name or "Not set" }}</span>
+                    </div>
+                    <span class="pill {{ item.status }}">{{ item.status_label }}</span>
+                  </div>
+                </summary>
+                <div class="review-body">
+                  <section class="listen-panel">
+                    <div>
+                      <div class="meta">Listen</div>
+                      <h3>{{ item.title }}</h3>
+                    </div>
+                    <audio controls preload="metadata" src="{{ item.audio_url }}"></audio>
+                    <div class="file-facts">
+                      <div class="fact"><span>Size</span><strong>{{ item.size_label }}</strong></div>
+                      <div class="fact"><span>Modified</span><strong>{{ item.modified_label }}</strong></div>
+                      <div class="fact wide"><span>Source</span><strong>{{ item.relative_path }}</strong></div>
+                    </div>
+                  </section>
+                  <form class="review-form" method="post" action="{{ url_for('update_testimony_review', recording_id=item.id) }}">
+                    <input type="hidden" name="sort" value="{{ sort }}">
+                    <section class="edit-panel">
+                      <div class="form-grid">
+                        <label>
+                          <span>Service Date</span>
+                          <input name="service_date" type="date" value="{{ item.service_date }}">
+                        </label>
+                        <label>
+                          <span>Speaker / Person</span>
+                          <input name="speaker_name" value="{{ item.speaker_name }}" placeholder="Sister Rachel">
+                        </label>
+                        <label class="wide">
+                          <span>Final Title</span>
+                          <input name="testimony_title" value="{{ item.testimony_title }}" placeholder="Sister Rachel's Testimony">
+                        </label>
+                        <label class="wide">
+                          <span>Voice / ID Notes</span>
+                          <textarea name="notes" placeholder="Optional identification notes">{{ item.notes }}</textarea>
+                        </label>
+                      </div>
+                    </section>
+                    <section class="path-panel">
+                      <div class="meta">Proposed Destination</div>
+                      <code>{{ item.proposed_path or "Save as identified to generate a testimony path." }}</code>
+                    </section>
+                    <div class="button-row">
+                      <button class="secondary" type="submit" name="status" value="needs_review">Needs Review</button>
+                      <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Testimony</button>
+                      <button class="save" type="submit" name="status" value="identified">Save Testimony Plan</button>
+                    </div>
+                  </form>
+                </div>
+              </details>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty">No recordings match this filter.</div>
+        {% endif %}
+      </section>
     </main>
   </body>
 </html>
