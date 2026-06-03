@@ -45,7 +45,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
     def _first_recording_date_from_public_form(self):
         html = self.client.get("/").data.decode("utf-8")
-        marker = '<option value="">Choose an available service date</option>'
+        marker = '<option value="">Choose service date</option>'
         start = html.index(marker) + len(marker)
         start = html.index('<option value="', start) + len('<option value="')
         end = html.index('"', start)
@@ -72,7 +72,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Recording Requests", response.data)
         self.assertIn(b"How Requests Work", response.data)
-        self.assertIn(b"Choose an available service date", response.data)
+        self.assertIn(b"Choose service date", response.data)
         self.assertIn(b"Service Date", response.data)
         self.assertIn(b"Recording Type", response.data)
         self.assertIn(b"Worship recordings", response.data)
