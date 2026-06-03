@@ -2660,9 +2660,10 @@ RECORDING_ADMIN_TEMPLATE = """
         header h1 { font-size:clamp(1.65rem, 8vw, 2.9rem); }
         header .muted { font-size:.86rem; }
         .section-head, .approval-head { display:flex; align-items:flex-start; flex-direction:column; }
-        .actions { width:auto; justify-content:flex-end; }
-        .actions > a, .actions > form, .actions > form > button { width:auto; }
-        header .actions a, header .actions button { padding:.56rem .68rem; font-size:.82rem; border-radius:12px; }
+        .actions { width:auto; max-width:min(62vw, 14rem); justify-content:flex-end; flex-wrap:nowrap; gap:.35rem; }
+        .actions > a, .actions > form, .actions > form > button { width:auto; min-width:0; }
+        .actions > form { flex:0 1 auto; }
+        header .actions a, header .actions button { max-width:5.1rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.56rem .68rem; font-size:.82rem; border-radius:12px; }
         .tabs { display:grid; grid-template-columns:1fr; border-radius:24px; width:100%; }
         .tab { justify-content:space-between; }
         .metrics, .request-head { grid-template-columns:1fr; }
@@ -3196,9 +3197,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
         header h1 { font-size:clamp(1.65rem, 8vw, 2.9rem); }
         header .muted { font-size:.86rem; }
         .panel-head { display:flex; flex-direction:column; align-items:flex-start; }
-        .actions { width:auto; justify-content:flex-end; }
-        .actions > a, .actions > form, .actions > form > button { width:auto; }
-        header .actions a, header .actions button { padding:.56rem .68rem; font-size:.82rem; border-radius:12px; }
+        .actions { width:auto; max-width:min(62vw, 14rem); justify-content:flex-end; flex-wrap:nowrap; gap:.35rem; }
+        .actions > a, .actions > form, .actions > form > button { width:auto; min-width:0; }
+        .actions > form { flex:0 1 auto; }
+        header .actions a, header .actions button { max-width:5.1rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.56rem .68rem; font-size:.82rem; border-radius:12px; }
         .tabs { width:100%; border-radius:22px; }
         .tab { width:100%; justify-content:space-between; }
         .metrics, .review-row, .file-facts, .form-grid { grid-template-columns:1fr; }
