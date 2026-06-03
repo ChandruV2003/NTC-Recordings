@@ -3216,7 +3216,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div class="metric"><span>Identified</span><strong>{{ counts.identified }}</strong><small>Ready for rename plan</small></div>
         <div class="metric"><span>Not Testimony</span><strong>{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
         <div class="metric"><span>Already Named</span><strong>{{ counts.already_named }}</strong><small>Testimony is in the filename</small></div>
-        <div class="metric"><span>DN300R Files</span><strong>{{ counts.all }}</strong><small>{{ dn300r_root }}</small></div>
+        <div class="metric"><span>DN300R Files</span><strong>{{ counts.all }}</strong><small>Source folder connected</small></div>
       </section>
       <div class="toolbar">
         <nav class="tabs" aria-label="Testimony review filters">
