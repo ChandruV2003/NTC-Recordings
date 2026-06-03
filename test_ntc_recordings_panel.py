@@ -78,6 +78,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Worship recordings", response.data)
         self.assertIn(b"Testimony recording", response.data)
         self.assertIn(b'data-kinds="message,worship"', response.data)
+        self.assertIn(b"dateSelect.replaceChildren", response.data)
         self.assertIn(b"Send Copy To", response.data)
         self.assertNotIn(b"Search Recordings", response.data)
         self.assertNotIn(b"Jesus Is Our Peace - Bro Blessen", response.data)
@@ -117,6 +118,28 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Worship", panel)
         self.assertIn(b"April 19, 2026 - Sunday Service", panel)
         self.assertIn(b"2 files", panel)
+
+    def test_admin_panel_groups_requests_and_omits_redundant_details(self):
+        self.client.post(
+            "/request",
+            data={
+                "requester_name": "Test Person",
+                "email": "person@example.test",
+                "recording_kind": "message",
+                "requested_date": self._first_recording_date_from_public_form(),
+                "notes": "Please send the message.",
+            },
+        )
+
+        self._login()
+        panel = self.client.get("/admin/panel").data
+
+        self.assertIn(b"Message Requests", panel)
+        self.assertIn(b"Additional instructions:", panel)
+        self.assertIn(b"submitted-cell", panel)
+        self.assertNotIn(b"No extra contact", panel)
+        self.assertNotIn(b"More request details", panel)
+        self.assertNotIn(b">Notes<", panel)
 
     def test_testimony_request_matches_testimony_recording(self):
         created = self.client.post(
@@ -348,7 +371,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(prepared.status_code, 200)
         self.assertIn(b"https://nextcloud.example.test/s/share-token", prepared.data)
-        self.assertIn(b"Share provider: nextcloud", prepared.data)
+        self.assertIn(b"Link ready", prepared.data)
+        self.assertNotIn(b"Share provider: nextcloud", prepared.data)
         self.assertIn(b"Active Links", prepared.data)
         get.assert_called_once()
         post.assert_called_once()

@@ -300,6 +300,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             RECORDING_ADMIN_TEMPLATE,
             title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
             requests=visible_requests,
+            request_groups=_request_groups(visible_requests),
             pending_count=len(pending_requests),
             active_count=len(active_requests),
             closed_count=len(closed_requests),
@@ -1108,6 +1109,32 @@ def _candidate_groups(candidates: Iterable[RecordingCandidate]) -> list[dict]:
     ]
 
 
+def _request_groups(requests: Iterable[sqlite3.Row]) -> list[dict]:
+    order = {"message": 0, "worship": 1, "testimony": 2, "unsure": 3}
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    for row in requests:
+        kind = _normalize_recording_kind(row["recording_kind"] if "recording_kind" in row.keys() else "")
+        grouped.setdefault(kind, []).append(row)
+    return [
+        {
+            "kind": kind,
+            "label": _request_group_label(kind),
+            "requests": grouped[kind],
+        }
+        for kind in sorted(grouped, key=lambda item: order.get(item, 99))
+    ]
+
+
+def _request_group_label(kind: str) -> str:
+    labels = {
+        "message": "Message Requests",
+        "worship": "Worship Requests",
+        "testimony": "Testimony Requests",
+        "unsure": "Not Sure Requests",
+    }
+    return labels.get(kind, "Recording Requests")
+
+
 def _candidate_option_label(candidate: RecordingCandidate) -> str:
     if candidate.target_type == "folder":
         return f"{candidate.title} · {candidate.file_count} files · {candidate.relative_path}"
@@ -1749,21 +1776,30 @@ RECORDING_PUBLIC_TEMPLATE = """
         const kindSelect = document.querySelector('select[name="recording_kind"]');
         const dateSelect = document.querySelector('select[name="requested_date"]');
         if (!kindSelect || !dateSelect) return;
-        const dateOptions = Array.from(dateSelect.options).filter((option) => option.value);
+        const placeholder = dateSelect.querySelector('option[value=""]');
+        const dateOptions = Array.from(dateSelect.options)
+          .filter((option) => option.value)
+          .map((option) => ({
+            value: option.value,
+            label: option.textContent.trim(),
+            kinds: (option.dataset.kinds || "").split(",").filter(Boolean),
+          }));
         const filterDates = () => {
           const kind = kindSelect.value;
-          let visibleCount = 0;
-          for (const option of dateOptions) {
-            const kinds = (option.dataset.kinds || "").split(",").filter(Boolean);
-            const visible = kind === "unsure" || kinds.includes(kind);
-            option.hidden = !visible;
-            option.disabled = !visible;
-            if (!visible && dateSelect.value === option.value) {
-              dateSelect.value = "";
-            }
-            if (visible) visibleCount += 1;
+          const previousValue = dateSelect.value;
+          const visibleOptions = dateOptions.filter((option) => kind === "unsure" || option.kinds.includes(kind));
+          dateSelect.replaceChildren(placeholder.cloneNode(true));
+          for (const optionData of visibleOptions) {
+            const option = document.createElement("option");
+            option.value = optionData.value;
+            option.textContent = optionData.label;
+            option.dataset.kinds = optionData.kinds.join(",");
+            dateSelect.appendChild(option);
           }
-          dateSelect.disabled = visibleCount === 0;
+          dateSelect.disabled = visibleOptions.length === 0;
+          if (visibleOptions.some((option) => option.value === previousValue)) {
+            dateSelect.value = previousValue;
+          }
         };
         kindSelect.addEventListener("change", filterDates);
         filterDates();
@@ -1940,10 +1976,21 @@ RECORDING_ADMIN_TEMPLATE = """
       }
       .section-head { display:flex; justify-content:space-between; align-items:flex-start; gap:1rem; margin-bottom:.9rem; flex-wrap:wrap; }
       .section-head p { max-width:46rem; margin-top:.28rem; color:var(--muted); line-height:1.45; }
+      .request-groups { display:grid; gap:1rem; }
+      .request-group { display:grid; gap:.55rem; }
+      .request-group-head {
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:1rem;
+        padding:.2rem .15rem;
+      }
+      .request-group-head h3 { margin:0; font-size:1rem; letter-spacing:0; }
+      .request-group-count { color:var(--muted); font-weight:800; }
       .request-list { display:grid; gap:.55rem; }
       .request-table-head {
         display:grid;
-        grid-template-columns:minmax(12rem,1.05fr) minmax(8rem,.62fr) minmax(16rem,1.3fr) minmax(8rem,.62fr) minmax(6rem,.34fr) minmax(5.3rem,.36fr);
+        grid-template-columns:minmax(12rem,1.05fr) minmax(8rem,.58fr) minmax(16rem,1.3fr) minmax(12rem,.86fr) minmax(5.3rem,.36fr);
         gap:.78rem;
         padding:0 .85rem .25rem;
         color:var(--muted);
@@ -1968,7 +2015,7 @@ RECORDING_ADMIN_TEMPLATE = """
       .request[open] summary { border-bottom:1px solid var(--line); background:var(--surface-2); }
       .request-head {
         display:grid;
-        grid-template-columns:minmax(12rem,1.05fr) minmax(8rem,.62fr) minmax(16rem,1.3fr) minmax(8rem,.62fr) minmax(6rem,.34fr) minmax(5.3rem,.36fr);
+        grid-template-columns:minmax(12rem,1.05fr) minmax(8rem,.58fr) minmax(16rem,1.3fr) minmax(12rem,.86fr) minmax(5.3rem,.36fr);
         align-items:center;
         gap:.78rem;
       }
@@ -1985,6 +2032,7 @@ RECORDING_ADMIN_TEMPLATE = """
       }
       .queue-value { display:block; color:var(--text); font-weight:850; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .queue-subvalue { display:block; margin-top:.12rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .submitted-cell .queue-value { overflow:visible; text-overflow:clip; white-space:normal; line-height:1.25; }
       .open-hint {
         display:inline-flex;
         align-items:center;
@@ -2013,8 +2061,6 @@ RECORDING_ADMIN_TEMPLATE = """
       .pill.revoked { color:var(--bad); border-color:rgba(255,155,155,.34); background:var(--bad-soft); }
       .pill.archived { color:var(--muted); border-color:rgba(153,168,184,.28); }
       .request-body { display:grid; gap:.82rem; padding:.95rem; background:var(--surface); }
-      .more-details { border-top:1px solid var(--line-soft); padding-top:.75rem; }
-      .more-details summary,
       .email-details summary {
         display:inline-flex;
         align-items:center;
@@ -2033,7 +2079,6 @@ RECORDING_ADMIN_TEMPLATE = """
         text-transform:uppercase;
         cursor:pointer;
       }
-      .more-details summary::after,
       .email-details summary::after {
         content:"";
         width:.42rem;
@@ -2042,18 +2087,8 @@ RECORDING_ADMIN_TEMPLATE = """
         border-bottom:2px solid currentColor;
         transform:rotate(45deg) translateY(-.08rem);
       }
-      .more-details[open] summary,
       .email-details[open] summary { margin-bottom:.7rem; }
-      .more-details[open] summary::after,
       .email-details[open] summary::after { transform:rotate(225deg) translateY(-.08rem); }
-      .more-details-content { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1rem; align-items:start; }
-      .info-group { min-width:0; }
-      .info-group h3 { margin:0 0 .55rem; font-size:.98rem; letter-spacing:0; }
-      .info-list { display:grid; gap:0; margin:0; }
-      .info-list div { display:grid; grid-template-columns:minmax(6.5rem,.38fr) minmax(0,1fr); gap:.7rem; align-items:start; border-top:1px solid var(--line-soft); padding:.56rem 0; }
-      .info-list div:first-child { border-top:0; padding-top:0; }
-      .info-list dt { color:var(--muted); font:800 .72rem var(--mono); letter-spacing:.08em; text-transform:uppercase; }
-      .info-list dd { margin:0; color:var(--text); font-weight:800; overflow-wrap:anywhere; }
       .note-strip {
         border:1px solid var(--line);
         border-radius:10px;
@@ -2061,6 +2096,14 @@ RECORDING_ADMIN_TEMPLATE = """
         padding:.78rem .85rem;
       }
       .note-strip p { margin-top:.22rem; color:var(--muted); line-height:1.5; }
+      .request-note {
+        margin:0;
+        border-top:1px solid var(--line);
+        padding-top:.72rem;
+        color:var(--muted);
+        line-height:1.45;
+      }
+      .request-note strong { color:var(--text); }
       .action-panel {
         display:flex;
         justify-content:space-between;
@@ -2114,7 +2157,7 @@ RECORDING_ADMIN_TEMPLATE = """
       @media (max-width:1100px) {
         .request-table-head { display:none; }
         .request-head { grid-template-columns:minmax(0,1fr) minmax(0,1fr); align-items:start; }
-        .more-details-content, .approve-grid { grid-template-columns:1fr; }
+        .approve-grid { grid-template-columns:1fr; }
         .approve-submit { justify-content:flex-start; }
         .pill, .open-hint { justify-self:start; }
       }
@@ -2124,9 +2167,7 @@ RECORDING_ADMIN_TEMPLATE = """
         .actions, .actions > a, .actions > form, .actions > form > button { width:100%; }
         .tabs, .metrics, .request-head { grid-template-columns:1fr; }
         .request-body { padding:.78rem; }
-        .info-list div { grid-template-columns:1fr; gap:.16rem; }
         .action-panel, .approve-form { padding:.78rem; }
-        .approval-head .pill { order:2; }
         .approve-form select { font-size:.88rem; }
         .email-note textarea { min-height:6.5rem; font-size:.9rem; }
         .action-panel { align-items:flex-start; }
@@ -2155,7 +2196,7 @@ RECORDING_ADMIN_TEMPLATE = """
         <div class="metric"><span>Active Links</span><strong>{{ active_count }}</strong><small>Sent or prepared</small></div>
         <div class="metric"><span>Closed</span><strong>{{ closed_count }}</strong><small>Revoked access</small></div>
         <div class="metric"><span>Library</span><strong>{{ recording_count }}</strong><small>{{ recording_counts_by_kind.get("message", 0) }} messages · {{ recording_counts_by_kind.get("worship", 0) }} worship · {{ recording_counts_by_kind.get("testimony", 0) }} testimonies</small></div>
-        <div class="metric"><span>Delivery</span><strong>{{ "Email" if email_enabled else "Link" }}</strong><small>{{ share_provider|title }} sharing</small></div>
+        <div class="metric"><span>Delivery</span><strong>{{ "Email" if email_enabled else "Link" }}</strong><small>{{ "Email delivery enabled" if email_enabled else "Manual approval" }}</small></div>
       </section>
       <nav class="tabs" aria-label="Request list">
         <a class="tab {{ 'active' if active_tab == 'pending' else '' }}" {% if active_tab == "pending" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='pending') }}">Pending <strong>{{ pending_count }}</strong></a>
@@ -2175,186 +2216,154 @@ RECORDING_ADMIN_TEMPLATE = """
             </div>
             <span class="pill">{{ requests|length }} request{{ "" if requests|length == 1 else "s" }}</span>
           </div>
-          <div class="request-list">
-          {% if requests %}
-            <div class="request-table-head" aria-hidden="true">
-              <span>{{ "Recipient" if active_tab in ["active", "closed"] else "Requester" }}</span>
-              <span>Recording</span>
-              <span>{{ "Access" if active_tab == "active" else ("Closed Access" if active_tab == "closed" else "Selection") }}</span>
-              <span>{{ "Sent / Prepared" if active_tab == "active" else ("Revoked" if active_tab == "closed" else ("Archived" if active_tab == "archived" else "Submitted")) }}</span>
-              <span>Status</span>
-              <span>Action</span>
-            </div>
-          {% endif %}
-          {% for item in requests %}
-            <details class="request {{ 'archived' if item.archived_at else item.status }}">
-              <summary>
-                <div class="request-head">
-                  <div class="request-title queue-cell">
-                    <span class="queue-label">{{ "Recipient" if active_tab in ["active", "closed"] else "Requester" }}</span>
-                    <strong class="queue-value">{{ item.requester_name }}</strong>
-                    <span class="queue-subvalue">{{ item.email }}</span>
-                  </div>
-                  <div class="queue-cell">
-                    <span class="queue-label">Recording</span>
-                    <span class="queue-value">{{ format_date(item.requested_date) }}</span>
-                    <span class="queue-subvalue">{{ item.recording_kind|title if item.recording_kind else "Message" }}</span>
-                  </div>
-                  <div class="queue-cell">
-                    <span class="queue-label">{{ "Access" if active_tab == "active" else ("Closed Access" if active_tab == "closed" else "Selection") }}</span>
-                    <span class="queue-value">
-                      {% if active_tab == "active" %}
-                        {{ item.share_provider|title if item.share_provider else share_provider|title }} link
-                      {% elif active_tab == "closed" %}
-                        Access revoked
-                      {% else %}
-                        {{ item.recording_title or "Selected by date" }}
-                      {% endif %}
-                    </span>
-                    <span class="queue-subvalue">
-                      {% if active_tab == "active" %}
-                        {{ "Emailed" if item.status == "sent" else "Prepared" }} · {{ item.recording_title or "Selected by date" }}
-                      {% elif active_tab == "closed" %}
-                        {{ item.recording_title or "Selected by date" }}
-                      {% elif item.secondary_email %}
-                        CC {{ item.secondary_email }}
-                      {% elif item.phone %}
-                        {{ item.phone }}
-                      {% else %}
-                        No extra contact
-                      {% endif %}
-                    </span>
-                  </div>
-                  <div class="queue-cell">
-                    <span class="queue-label">{{ "Sent / Prepared" if active_tab == "active" else ("Revoked" if active_tab == "closed" else ("Archived" if active_tab == "archived" else "Submitted")) }}</span>
-                    <span class="queue-value">{{ format_datetime(item.sent_at or item.created_at) if active_tab == "active" else (format_datetime(item.revoked_at) if active_tab == "closed" else (format_datetime(item.archived_at) if active_tab == "archived" else format_datetime(item.created_at))) }}</span>
-                  </div>
-                  <span class="pill {{ 'archived' if item.archived_at else item.status }}">{{ "Archived" if item.archived_at else status_label(item.status) }}</span>
-                  <span class="open-hint">{{ "Manage" if active_tab == "active" else ("Archive" if active_tab == "closed" else ("View" if active_tab == "archived" else "Review")) }}</span>
-                </div>
-              </summary>
-              <div class="request-body">
-                {% if item.share_token and item.status != "revoked" %}
-                  <section class="action-panel">
-                    <div>
-                      <div class="meta">Active Share</div>
-                      <strong>{{ "Emailed link" if item.status == "sent" else "Prepared link" }}</strong>
-                      <p>This link stays active until access is revoked.</p>
-                      {% if item.share_provider %}<p class="meta">Share provider: {{ item.share_provider }}</p>{% endif %}
-                    </div>
-                    <div class="request-actions">
-                      <a href="{{ item.share_url or url_for('share_recording', token=item.share_token) }}">Open prepared share link</a>
-                      <form method="post" action="{{ url_for('revoke_request_link', request_id=item.id) }}">
-                        <input type="hidden" name="tab" value="{{ active_tab }}">
-                        <button class="danger" type="submit">Revoke Access</button>
-                      </form>
-                    </div>
-                  </section>
-                {% elif active_tab == "closed" and item.status == "revoked" %}
-                  <section class="action-panel">
-                    <div>
-                      <div class="meta">Closed Access</div>
-                      <strong>Access is revoked</strong>
-                      <p>Archive when no more follow-up is needed.</p>
-                    </div>
-                    <div class="request-actions">
-                      <form method="post" action="{{ url_for('archive_request', request_id=item.id) }}">
-                        <button type="submit">Archive</button>
-                      </form>
-                    </div>
-                  </section>
-                {% endif %}
-                {% if item.status in ["pending", "ready"] %}
-                  {% set candidates = candidates_by_request.get(item.id, []) %}
-                  {% if candidates %}
-                    <form class="approve-form" method="post" action="{{ url_for('send_request_link', request_id=item.id) }}">
-                      <div class="approval-head">
-                        <div>
-                          <div class="meta">{{ "Delivery Retry" if item.status == "ready" else "Approval" }}</div>
-                          <strong>{{ "Send prepared link by email" if item.status == "ready" else "Confirm selection and send access" }}</strong>
-                        </div>
-                        <span class="pill {{ 'ready' if item.status == 'ready' else 'pending' }}">{{ status_label(item.status) }}</span>
-                      </div>
-                      <div class="approve-grid">
-                        <label>
-                          Recording or folder
-                          <select name="recording_id" required>
-                            {% for group in candidate_groups_by_request.get(item.id, []) %}
-                              <optgroup label="{{ group.label }}">
-                                {% for candidate in group.options %}
-                                  <option value="{{ candidate.id }}" data-title="{{ candidate.title }}" {% if candidate.id == item.recording_id %}selected{% endif %}>
-                                    {{ candidate_option_label(candidate) }}
-                                  </option>
-                                {% endfor %}
-                              </optgroup>
-                            {% endfor %}
-                          </select>
-                        </label>
-                        <div class="approve-submit">
-                          <button type="submit">{{ "Send Link by Email" if email_enabled else "Prepare Link" }}</button>
-                        </div>
-                      </div>
-                      <details class="email-details">
-                        <summary>Edit email message</summary>
-                        <label class="email-note">
-                          Email message
-                          <textarea name="email_message">{{ item.email_message or default_email_message(item, candidates[0]) }}</textarea>
-                        </label>
-                      </details>
-                    </form>
-                  {% else %}
-                    <p class="muted">No exact date match found. Confirm the request date or add that recording to the library.</p>
-                  {% endif %}
-                {% endif %}
-                {% if item.notes %}
-                  <section class="note-strip">
-                    <div class="meta">Notes</div>
-                    <p>{{ item.notes }}</p>
-                  </section>
-                {% endif %}
-                {% if item.email_error %}
-                  <section class="note-strip">
-                    <div class="meta">Delivery Note</div>
-                    <p>{{ item.email_error }}</p>
-                  </section>
-                {% endif %}
-                <details class="more-details">
-                  <summary>More request details</summary>
-                  <div class="more-details-content">
-                    <section class="info-group">
-                      <h3>Requester</h3>
-                      <dl class="info-list">
-                        <div><dt>Name</dt><dd>{{ item.requester_name }}</dd></div>
-                        <div><dt>Email</dt><dd>{{ item.email }}</dd></div>
-                        {% if item.secondary_email %}<div><dt>Copy</dt><dd>{{ item.secondary_email }}</dd></div>{% endif %}
-                        {% if item.phone %}<div><dt>Phone</dt><dd>{{ item.phone }}</dd></div>{% endif %}
-                      </dl>
-                    </section>
-                    <section class="info-group">
-                      <h3>Request</h3>
-	                      <dl class="info-list">
-	                        <div><dt>Type</dt><dd>{{ item.recording_kind|title if item.recording_kind else "Message" }}</dd></div>
-	                        <div><dt>Date</dt><dd>{{ format_date(item.requested_date) }}</dd></div>
-	                      </dl>
-                    </section>
-                    <section class="info-group">
-                      <h3>Timeline</h3>
-                      <dl class="info-list">
-                        <div><dt>Status</dt><dd>{{ "Archived" if item.archived_at else status_label(item.status) }}</dd></div>
-                        <div><dt>Submitted</dt><dd>{{ format_datetime(item.created_at) }}</dd></div>
-                        {% if item.sent_at %}<div><dt>Sent</dt><dd>{{ format_datetime(item.sent_at) }}</dd></div>{% endif %}
-                        {% if item.revoked_at %}<div><dt>Revoked</dt><dd>{{ format_datetime(item.revoked_at) }}</dd></div>{% endif %}
-                        {% if item.archived_at %}<div><dt>Archived</dt><dd>{{ format_datetime(item.archived_at) }}</dd></div>{% endif %}
-                      </dl>
-                    </section>
-                  </div>
-                </details>
-              </div>
-            </details>
-          {% else %}
-            <p class="muted">{{ empty_message }}</p>
-          {% endfor %}
-          </div>
+	          {% if request_groups %}
+	            <div class="request-groups">
+	              {% for group in request_groups %}
+	                <section class="request-group">
+	                  <div class="request-group-head">
+	                    <h3>{{ group.label }}</h3>
+	                    <span class="request-group-count">{{ group.requests|length }} request{{ "" if group.requests|length == 1 else "s" }}</span>
+	                  </div>
+	                  <div class="request-table-head" aria-hidden="true">
+	                    <span>{{ "Recipient" if active_tab in ["active", "closed"] else "Requester" }}</span>
+	                    <span>Date</span>
+	                    <span>{{ "Access" if active_tab == "active" else ("Closed Access" if active_tab == "closed" else "Selection") }}</span>
+	                    <span>{{ "Sent / Prepared" if active_tab == "active" else ("Revoked" if active_tab == "closed" else ("Archived" if active_tab == "archived" else "Submitted")) }}</span>
+	                    <span>Action</span>
+	                  </div>
+	                  <div class="request-list">
+	                    {% for item in group.requests %}
+	                      <details class="request {{ 'archived' if item.archived_at else item.status }}">
+	                        <summary>
+	                          <div class="request-head">
+	                            <div class="request-title queue-cell">
+	                              <span class="queue-label">{{ "Recipient" if active_tab in ["active", "closed"] else "Requester" }}</span>
+	                              <strong class="queue-value">{{ item.requester_name }}</strong>
+	                              <span class="queue-subvalue">{{ item.email }}</span>
+	                              {% if item.secondary_email %}
+	                                <span class="queue-subvalue">CC {{ item.secondary_email }}</span>
+	                              {% elif item.phone %}
+	                                <span class="queue-subvalue">{{ item.phone }}</span>
+	                              {% endif %}
+	                            </div>
+	                            <div class="queue-cell">
+	                              <span class="queue-label">Date</span>
+	                              <span class="queue-value">{{ format_date(item.requested_date) }}</span>
+	                            </div>
+	                            <div class="queue-cell">
+	                              <span class="queue-label">{{ "Access" if active_tab == "active" else ("Closed Access" if active_tab == "closed" else "Selection") }}</span>
+	                              <span class="queue-value">
+	                                {% if active_tab == "active" %}
+	                                  Link ready
+	                                {% elif active_tab == "closed" %}
+	                                  Access revoked
+	                                {% else %}
+	                                  {{ item.recording_title or "Selected by date" }}
+	                                {% endif %}
+	                              </span>
+	                              {% if active_tab in ["active", "closed"] %}
+	                                <span class="queue-subvalue">{{ item.recording_title or "Selected by date" }}</span>
+	                              {% endif %}
+	                            </div>
+	                            <div class="queue-cell submitted-cell">
+	                              <span class="queue-label">{{ "Sent / Prepared" if active_tab == "active" else ("Revoked" if active_tab == "closed" else ("Archived" if active_tab == "archived" else "Submitted")) }}</span>
+	                              <span class="queue-value">{{ format_datetime(item.sent_at or item.created_at) if active_tab == "active" else (format_datetime(item.revoked_at) if active_tab == "closed" else (format_datetime(item.archived_at) if active_tab == "archived" else format_datetime(item.created_at))) }}</span>
+	                            </div>
+	                            <span class="open-hint">{{ "Manage" if active_tab == "active" else ("Archive" if active_tab == "closed" else ("View" if active_tab == "archived" else "Review")) }}</span>
+	                          </div>
+	                        </summary>
+	                        <div class="request-body">
+	                          {% if item.share_token and item.status != "revoked" %}
+	                            <section class="action-panel">
+	                              <div>
+	                                <div class="meta">Active Share</div>
+	                                <strong>{{ "Emailed link" if item.status == "sent" else "Prepared link" }}</strong>
+	                                <p>This link stays active until access is revoked.</p>
+	                              </div>
+	                              <div class="request-actions">
+	                                <a href="{{ item.share_url or url_for('share_recording', token=item.share_token) }}">Open prepared share link</a>
+	                                <form method="post" action="{{ url_for('revoke_request_link', request_id=item.id) }}">
+	                                  <input type="hidden" name="tab" value="{{ active_tab }}">
+	                                  <button class="danger" type="submit">Revoke Access</button>
+	                                </form>
+	                              </div>
+	                            </section>
+	                          {% elif active_tab == "closed" and item.status == "revoked" %}
+	                            <section class="action-panel">
+	                              <div>
+	                                <div class="meta">Closed Access</div>
+	                                <strong>Access is revoked</strong>
+	                                <p>Archive when no more follow-up is needed.</p>
+	                              </div>
+	                              <div class="request-actions">
+	                                <form method="post" action="{{ url_for('archive_request', request_id=item.id) }}">
+	                                  <button type="submit">Archive</button>
+	                                </form>
+	                              </div>
+	                            </section>
+	                          {% endif %}
+	                          {% if item.status in ["pending", "ready"] %}
+	                            {% set candidates = candidates_by_request.get(item.id, []) %}
+	                            {% if candidates %}
+	                              <form class="approve-form" method="post" action="{{ url_for('send_request_link', request_id=item.id) }}">
+	                                <div class="approval-head">
+	                                  <div>
+	                                    <div class="meta">{{ "Delivery Retry" if item.status == "ready" else "Approval" }}</div>
+	                                    <strong>{{ "Send prepared link by email" if item.status == "ready" else "Confirm selection and send access" }}</strong>
+	                                  </div>
+	                                </div>
+	                                {% if item.notes %}
+	                                  <p class="request-note"><strong>Additional instructions:</strong> {{ item.notes }}</p>
+	                                {% endif %}
+	                                <div class="approve-grid">
+	                                  <label>
+	                                    Recording or folder
+	                                    <select name="recording_id" required>
+	                                      {% for group in candidate_groups_by_request.get(item.id, []) %}
+	                                        <optgroup label="{{ group.label }}">
+	                                          {% for candidate in group.options %}
+	                                            <option value="{{ candidate.id }}" data-title="{{ candidate.title }}" {% if candidate.id == item.recording_id %}selected{% endif %}>
+	                                              {{ candidate_option_label(candidate) }}
+	                                            </option>
+	                                          {% endfor %}
+	                                        </optgroup>
+	                                      {% endfor %}
+	                                    </select>
+	                                  </label>
+	                                  <div class="approve-submit">
+	                                    <button type="submit">{{ "Send Link by Email" if email_enabled else "Prepare Link" }}</button>
+	                                  </div>
+	                                </div>
+	                                <details class="email-details">
+	                                  <summary>Edit email message</summary>
+	                                  <label class="email-note">
+	                                    Email message
+	                                    <textarea name="email_message">{{ item.email_message or default_email_message(item, candidates[0]) }}</textarea>
+	                                  </label>
+	                                </details>
+	                              </form>
+	                            {% else %}
+	                              <p class="muted">No exact date match found. Confirm the request date or add that recording to the library.</p>
+	                            {% endif %}
+	                          {% elif item.notes %}
+	                            <p class="request-note"><strong>Additional instructions:</strong> {{ item.notes }}</p>
+	                          {% endif %}
+	                          {% if item.email_error %}
+	                            <section class="note-strip">
+	                              <div class="meta">Delivery Note</div>
+	                              <p>{{ item.email_error }}</p>
+	                            </section>
+	                          {% endif %}
+	                        </div>
+	                      </details>
+	                    {% endfor %}
+	                  </div>
+	                </section>
+	              {% endfor %}
+	            </div>
+	          {% else %}
+	            <p class="muted">{{ empty_message }}</p>
+	          {% endif %}
         </section>
       </div>
     </main>
