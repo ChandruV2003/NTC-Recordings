@@ -178,9 +178,10 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(logged_in.status_code, 200)
         self.assertIn(b"Recording Requests", logged_in.data)
         self.assertIn(b"Pending Requests", logged_in.data)
-        self.assertIn(b"Active Links", logged_in.data)
-        self.assertIn(b"Closed", logged_in.data)
-        self.assertIn(b"Archived", logged_in.data)
+        self.assertIn(b"Completed", logged_in.data)
+        self.assertNotIn(b"Active Links", logged_in.data)
+        self.assertNotIn(b"Closed Requests", logged_in.data)
+        self.assertNotIn(b"Archived Requests", logged_in.data)
         self.assertIn(b"Prepare Link", logged_in.data)
         self.assertIn(b"Email message", logged_in.data)
         self.assertIn(b"Edit email message", logged_in.data)
@@ -218,8 +219,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         revoked = self.client.post("/admin/requests/1/revoke", follow_redirects=True)
         self.assertEqual(revoked.status_code, 200)
         self.assertIn(b"Recording access revoked", revoked.data)
-        self.assertIn(b"Closed Requests", revoked.data)
-        self.assertIn(b"Revoked", revoked.data)
+        self.assertIn(b"Completed Requests", revoked.data)
+        self.assertIn(b"Access revoked", revoked.data)
         self.assertEqual(self.client.get(f"/share/{token}").status_code, 404)
 
     def test_closed_request_can_be_archived(self):
@@ -248,7 +249,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(archived.status_code, 200)
         self.assertIn(b"Request archived", archived.data)
-        self.assertIn(b"Archived Requests", archived.data)
+        self.assertIn(b"Completed Requests", archived.data)
+        self.assertIn(b"Archived", archived.data)
 
     def test_active_request_must_be_revoked_before_archive(self):
         self.client.post(
@@ -268,13 +270,14 @@ class RecordingRequestPanelTests(unittest.TestCase):
             data={"recording_id": recording_id},
             follow_redirects=True,
         )
-        self.assertIn(b"Active Links", prepared.data)
+        self.assertIn(b"Completed Requests", prepared.data)
+        self.assertIn(b"completed-row", prepared.data)
 
         archived = self.client.post("/admin/requests/1/archive", follow_redirects=True)
 
         self.assertEqual(archived.status_code, 200)
         self.assertIn(b"Revoke access before archiving a request", archived.data)
-        self.assertIn(b"Active Links", archived.data)
+        self.assertIn(b"Completed Requests", archived.data)
         self.assertIn(b"Open prepared share link", archived.data)
 
     def test_old_closed_requests_auto_archive(self):
@@ -305,9 +308,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
         closed = self.client.get("/admin/panel?tab=closed")
         archived = self.client.get("/admin/panel?tab=archived")
 
-        self.assertNotIn(b"Old Closed Person", closed.data)
+        self.assertIn(b"Completed Requests", closed.data)
+        self.assertIn(b"Old Closed Person", closed.data)
+        self.assertIn(b"Completed Requests", archived.data)
         self.assertIn(b"Old Closed Person", archived.data)
-        self.assertIn(b"Archived Requests", archived.data)
+        self.assertIn(b"Archived", archived.data)
 
     def test_proxy_prefix_is_preserved_on_admin_redirects(self):
         response = self.client.post(
@@ -372,9 +377,9 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(prepared.status_code, 200)
         self.assertIn(b"https://nextcloud.example.test/s/share-token", prepared.data)
-        self.assertIn(b"Link ready", prepared.data)
+        self.assertIn(b"Link prepared", prepared.data)
         self.assertNotIn(b"Share provider: nextcloud", prepared.data)
-        self.assertIn(b"Active Links", prepared.data)
+        self.assertIn(b"Completed Requests", prepared.data)
         get.assert_called_once()
         post.assert_called_once()
         self.assertEqual(post.call_args.kwargs["data"]["path"], "/Recordings/MessageRecordings/20260419 - Jesus Is Our Peace - Bro Blessen.mp3")

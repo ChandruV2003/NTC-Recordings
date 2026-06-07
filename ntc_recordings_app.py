@@ -256,22 +256,16 @@ def create_app(test_config: dict | None = None) -> Flask:
         recordings = _get_recordings(app)
         requests = _list_requests(app)
         active_tab = (request.args.get("tab") or "pending").strip().lower()
-        if active_tab == "completed":
-            active_tab = "active"
-        if active_tab not in {"pending", "active", "closed", "archived"}:
+        if active_tab in {"active", "closed", "archived"}:
+            active_tab = "completed"
+        if active_tab not in {"pending", "completed"}:
             active_tab = "pending"
         pending_requests = [item for item in requests if not item["archived_at"] and item["status"] == "pending"]
         active_requests = [item for item in requests if not item["archived_at"] and item["status"] in {"ready", "sent"}]
         closed_requests = [item for item in requests if not item["archived_at"] and item["status"] == "revoked"]
         archived_requests = [item for item in requests if item["archived_at"]]
-        if active_tab == "pending":
-            visible_requests = pending_requests
-        elif active_tab == "active":
-            visible_requests = active_requests
-        elif active_tab == "closed":
-            visible_requests = closed_requests
-        else:
-            visible_requests = archived_requests
+        completed_requests = active_requests + closed_requests + archived_requests
+        visible_requests = pending_requests if active_tab == "pending" else completed_requests
         candidates_by_request = {}
         for item in visible_requests:
             candidates_by_request[item["id"]] = _candidate_options_for_request(app, recordings, item)
@@ -285,20 +279,10 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "New requests. Open a row, confirm the selection, then send the link.",
                 "No pending requests.",
             ),
-            "active": (
-                "Active Links",
-                "Sent and prepared links stay visible here until access is revoked.",
-                "No active links.",
-            ),
-            "closed": (
-                "Closed Requests",
-                "Revoked requests can be reviewed and archived after access is closed.",
-                "No closed requests.",
-            ),
-            "archived": (
-                "Archived Requests",
-                "Archived requests are kept for history. Active links should be revoked before archiving.",
-                "No archived requests.",
+            "completed": (
+                "Completed Requests",
+                "Prepared, sent, revoked, and archived requests live here as compact history rows.",
+                "No completed requests.",
             ),
         }
         tab_title, tab_description, empty_message = tab_copy[active_tab]
@@ -311,6 +295,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             active_count=len(active_requests),
             closed_count=len(closed_requests),
             archived_count=len(archived_requests),
+            completed_count=len(completed_requests),
             recording_count=len(recordings),
             recording_counts_by_kind=_recording_counts_by_kind(recordings),
             active_tab=active_tab,
@@ -477,8 +462,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             email_message=email_message,
         )
         if email_sent:
-            return redirect(url_for("admin_panel", tab="active", message=f"Recording link emailed to {row['email']}."))
-        return redirect(url_for("admin_panel", tab="active", message="Share link is ready."))
+            return redirect(url_for("admin_panel", tab="completed", message=f"Recording link emailed to {row['email']}."))
+        return redirect(url_for("admin_panel", tab="completed", message="Share link is ready."))
 
     @app.post("/admin/requests/<int:request_id>/revoke")
     def revoke_request_link(request_id: int):
@@ -489,15 +474,15 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not row:
             return redirect(url_for("admin_panel", tab="pending", error="Request was not found."))
         target_tab = (request.form.get("tab") or "").strip().lower()
-        if target_tab == "completed":
-            target_tab = "active"
-        if target_tab not in {"pending", "active", "closed", "archived"}:
-            target_tab = "closed"
+        if target_tab in {"active", "closed", "archived"}:
+            target_tab = "completed"
+        if target_tab not in {"pending", "completed"}:
+            target_tab = "completed"
         revoke_error = _revoke_share_link(app, row)
         _mark_request_revoked(app, request_id, revoke_error=revoke_error)
         if revoke_error:
-            return redirect(url_for("admin_panel", tab="closed", error=f"Request closed locally. Revoke warning: {revoke_error}"))
-        return redirect(url_for("admin_panel", tab="closed", message="Recording access revoked."))
+            return redirect(url_for("admin_panel", tab="completed", error=f"Request closed locally. Revoke warning: {revoke_error}"))
+        return redirect(url_for("admin_panel", tab="completed", message="Recording access revoked."))
 
     @app.post("/admin/requests/<int:request_id>/archive")
     def archive_request(request_id: int):
@@ -506,11 +491,11 @@ def create_app(test_config: dict | None = None) -> Flask:
             return guard
         row = _get_request(app, request_id)
         if not row:
-            return redirect(url_for("admin_panel", tab="closed", error="Request was not found."))
+            return redirect(url_for("admin_panel", tab="completed", error="Request was not found."))
         if row["status"] != "revoked":
-            return redirect(url_for("admin_panel", tab="active", error="Revoke access before archiving a request."))
+            return redirect(url_for("admin_panel", tab="completed", error="Revoke access before archiving a request."))
         _archive_request(app, request_id)
-        return redirect(url_for("admin_panel", tab="archived", message="Request archived."))
+        return redirect(url_for("admin_panel", tab="completed", message="Request archived."))
 
     @app.get("/share/<token>")
     def share_recording(token: str):
@@ -2395,7 +2380,7 @@ RECORDING_ADMIN_TEMPLATE = """
       button:hover, a:hover, select:hover { border-color:var(--line-strong); }
       .tabs {
         display:inline-grid;
-        grid-template-columns:repeat(4,minmax(0,auto));
+        grid-template-columns:repeat(2,minmax(0,auto));
         gap:.28rem;
         margin:.9rem 0;
         padding:.28rem;
@@ -2438,7 +2423,7 @@ RECORDING_ADMIN_TEMPLATE = """
       .tab.active strong { background:linear-gradient(135deg,#8fd3ff,#8ff5c8); color:var(--ink); }
       .metrics {
         display:grid;
-        grid-template-columns:repeat(5,minmax(0,1fr));
+        grid-template-columns:repeat(4,minmax(0,1fr));
         gap:.65rem;
         margin:.65rem 0 1rem;
       }
@@ -2506,6 +2491,15 @@ RECORDING_ADMIN_TEMPLATE = """
       .request summary { list-style:none; cursor:pointer; padding:.78rem .86rem; }
       .request summary::-webkit-details-marker { display:none; }
       .request[open] summary { border-bottom:1px solid var(--line); background:rgba(143,211,255,.035); }
+      .request.completed-row summary { padding:.58rem .72rem; }
+      .request.completed-row .request-head {
+        grid-template-columns:minmax(11rem,1.05fr) minmax(7rem,.52fr) minmax(11rem,.78fr) minmax(9.5rem,.66fr) minmax(5.1rem,.32fr);
+        gap:.55rem;
+      }
+      .request.completed-row .request-title strong { font-size:1rem; }
+      .request.completed-row .queue-label { margin-bottom:.12rem; font-size:.56rem; }
+      .request.completed-row .queue-subvalue { font-size:.82rem; }
+      .request.completed-row .open-hint { padding:.34rem .5rem; font-size:.62rem; }
       .request-head {
         display:grid;
         grid-template-columns:minmax(12rem,1.05fr) minmax(8rem,.58fr) minmax(16rem,1.3fr) minmax(12rem,.86fr) minmax(5.3rem,.36fr);
@@ -2664,7 +2658,7 @@ RECORDING_ADMIN_TEMPLATE = """
         .actions > a, .actions > form { flex:1 1 0; min-width:0; }
         .actions > form > button, header .actions a { width:100%; min-width:0; }
         header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.54rem .52rem; font-size:.78rem; border-radius:12px; }
-        .tabs { display:grid; grid-template-columns:1fr; border-radius:24px; width:100%; }
+        .tabs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); border-radius:999px; width:100%; }
         .tab { justify-content:space-between; }
         .metrics, .request-head { grid-template-columns:1fr; }
         .request-body { padding:.78rem; }
@@ -2695,16 +2689,13 @@ RECORDING_ADMIN_TEMPLATE = """
       {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
       <section class="metrics" aria-label="Recording request status">
         <div class="metric"><span>Pending</span><strong>{{ pending_count }}</strong><small>Needs review</small></div>
-        <div class="metric"><span>Active Links</span><strong>{{ active_count }}</strong><small>Sent or prepared</small></div>
-        <div class="metric"><span>Closed</span><strong>{{ closed_count }}</strong><small>Revoked access</small></div>
+        <div class="metric"><span>Completed</span><strong>{{ completed_count }}</strong><small>{{ active_count }} active · {{ closed_count + archived_count }} closed</small></div>
         <div class="metric"><span>Library</span><strong>{{ recording_count }}</strong><small>{{ recording_counts_by_kind.get("message", 0) }} messages · {{ recording_counts_by_kind.get("worship", 0) }} worship · {{ recording_counts_by_kind.get("testimony", 0) }} testimonies</small></div>
         <div class="metric"><span>Delivery</span><strong>{{ "Email" if email_enabled else "Link" }}</strong><small>{{ "Email delivery enabled" if email_enabled else "Manual approval" }}</small></div>
       </section>
       <nav class="tabs" aria-label="Request list">
         <a class="tab {{ 'active' if active_tab == 'pending' else '' }}" {% if active_tab == "pending" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='pending') }}">Pending <strong>{{ pending_count }}</strong></a>
-        <a class="tab {{ 'active' if active_tab == 'active' else '' }}" {% if active_tab == "active" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='active') }}">Active Links <strong>{{ active_count }}</strong></a>
-        <a class="tab {{ 'active' if active_tab == 'closed' else '' }}" {% if active_tab == "closed" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='closed') }}">Closed <strong>{{ closed_count }}</strong></a>
-        <a class="tab {{ 'active' if active_tab == 'archived' else '' }}" {% if active_tab == "archived" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='archived') }}">Archived <strong>{{ archived_count }}</strong></a>
+        <a class="tab {{ 'active' if active_tab == 'completed' else '' }}" {% if active_tab == "completed" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='completed') }}">Completed <strong>{{ completed_count }}</strong></a>
       </nav>
       <div class="grid">
         <section class="card">
@@ -2712,8 +2703,8 @@ RECORDING_ADMIN_TEMPLATE = """
             <div>
               <h2>{{ tab_title }}</h2>
               <p class="muted">{{ tab_description }}</p>
-              {% if active_tab == "closed" and auto_archive_days > 0 %}
-                <p class="muted">Auto-archive is on: closed requests move to Archived after {{ auto_archive_days }} days.</p>
+              {% if active_tab == "completed" and auto_archive_days > 0 %}
+                <p class="muted">Auto-archive is on: older revoked requests are marked archived but stay in Completed.</p>
               {% endif %}
             </div>
             <span class="pill">{{ requests|length }} request{{ "" if requests|length == 1 else "s" }}</span>
@@ -2727,19 +2718,19 @@ RECORDING_ADMIN_TEMPLATE = """
 	                    <span class="request-group-count">{{ group.requests|length }} request{{ "" if group.requests|length == 1 else "s" }}</span>
 	                  </div>
 	                  <div class="request-table-head" aria-hidden="true">
-	                    <span>{{ "Recipient" if active_tab in ["active", "closed"] else "Requester" }}</span>
+	                    <span>{{ "Recipient" if active_tab == "completed" else "Requester" }}</span>
 	                    <span>Date</span>
-	                    <span>{{ "Access" if active_tab == "active" else ("Closed Access" if active_tab == "closed" else "Selection") }}</span>
-	                    <span>{{ "Sent / Prepared" if active_tab == "active" else ("Revoked" if active_tab == "closed" else ("Archived" if active_tab == "archived" else "Submitted")) }}</span>
+	                    <span>{{ "Status" if active_tab == "completed" else "Selection" }}</span>
+	                    <span>{{ "Last Update" if active_tab == "completed" else "Submitted" }}</span>
 	                    <span>Action</span>
 	                  </div>
 	                  <div class="request-list">
 	                    {% for item in group.requests %}
-	                      <details class="request {{ 'archived' if item.archived_at else item.status }}">
+	                      <details class="request {{ 'archived' if item.archived_at else item.status }} {{ 'completed-row' if active_tab == 'completed' else '' }}">
 	                        <summary>
 	                          <div class="request-head">
 	                            <div class="request-title queue-cell">
-	                              <span class="queue-label">{{ "Recipient" if active_tab in ["active", "closed"] else "Requester" }}</span>
+	                              <span class="queue-label">{{ "Recipient" if active_tab == "completed" else "Requester" }}</span>
 	                              <strong class="queue-value">{{ item.requester_name }}</strong>
 	                              <span class="queue-subvalue">{{ item.email }}</span>
 	                              {% if item.secondary_email %}
@@ -2753,25 +2744,31 @@ RECORDING_ADMIN_TEMPLATE = """
 	                              <span class="queue-value">{{ format_date(item.requested_date) }}</span>
 	                            </div>
 	                            <div class="queue-cell">
-	                              <span class="queue-label">{{ "Access" if active_tab == "active" else ("Closed Access" if active_tab == "closed" else "Selection") }}</span>
+	                              <span class="queue-label">{{ "Status" if active_tab == "completed" else "Selection" }}</span>
 	                              <span class="queue-value">
-	                                {% if active_tab == "active" %}
-	                                  Link ready
-	                                {% elif active_tab == "closed" %}
-	                                  Access revoked
+	                                {% if active_tab == "completed" %}
+	                                  {% if item.archived_at %}
+	                                    Archived
+	                                  {% elif item.status == "revoked" %}
+	                                    Access revoked
+	                                  {% elif item.status == "sent" %}
+	                                    Link sent
+	                                  {% else %}
+	                                    Link prepared
+	                                  {% endif %}
 	                                {% else %}
 	                                  {{ item.recording_title or "Selected by date" }}
 	                                {% endif %}
 	                              </span>
-	                              {% if active_tab in ["active", "closed"] %}
+	                              {% if active_tab == "completed" %}
 	                                <span class="queue-subvalue">{{ item.recording_title or "Selected by date" }}</span>
 	                              {% endif %}
 	                            </div>
 	                            <div class="queue-cell submitted-cell">
-	                              <span class="queue-label">{{ "Sent / Prepared" if active_tab == "active" else ("Revoked" if active_tab == "closed" else ("Archived" if active_tab == "archived" else "Submitted")) }}</span>
-	                              <span class="queue-value">{{ format_datetime(item.sent_at or item.created_at) if active_tab == "active" else (format_datetime(item.revoked_at) if active_tab == "closed" else (format_datetime(item.archived_at) if active_tab == "archived" else format_datetime(item.created_at))) }}</span>
+	                              <span class="queue-label">{{ "Last Update" if active_tab == "completed" else "Submitted" }}</span>
+	                              <span class="queue-value">{{ format_datetime(item.archived_at or item.revoked_at or item.sent_at or item.created_at) if active_tab == "completed" else format_datetime(item.created_at) }}</span>
 	                            </div>
-	                            <span class="open-hint">{{ "Manage" if active_tab == "active" else ("Archive" if active_tab == "closed" else ("View" if active_tab == "archived" else "Review")) }}</span>
+	                            <span class="open-hint">{{ "Manage" if active_tab == "completed" else "Review" }}</span>
 	                          </div>
 	                        </summary>
 	                        <div class="request-body">
@@ -2790,12 +2787,12 @@ RECORDING_ADMIN_TEMPLATE = """
 	                                </form>
 	                              </div>
 	                            </section>
-	                          {% elif active_tab == "closed" and item.status == "revoked" %}
+	                          {% elif active_tab == "completed" and item.status == "revoked" %}
 	                            <section class="action-panel">
 	                              <div>
 	                                <div class="meta">Closed Access</div>
 	                                <strong>Access is revoked</strong>
-	                                <p>Archive when no more follow-up is needed.</p>
+	                                <p>This request is complete. Mark it archived only if you want the internal history flag.</p>
 	                              </div>
 	                              <div class="request-actions">
 	                                <form method="post" action="{{ url_for('archive_request', request_id=item.id) }}">
