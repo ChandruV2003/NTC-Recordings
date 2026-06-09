@@ -505,7 +505,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"REC00042", review.data)
         self.assertIn(b"Check Durations", review.data)
         self.assertIn(b"Save Speaker", review.data)
-        self.assertIn(b"Naming and destination are handled internally", review.data)
+        self.assertIn(b"Listen, confirm the service date", review.data)
         self.assertNotIn(b"Final Title", review.data)
         self.assertNotIn(b"Voice / ID Notes", review.data)
         self.assertNotIn(b"Proposed Destination", review.data)

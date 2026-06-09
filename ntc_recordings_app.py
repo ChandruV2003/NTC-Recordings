@@ -1375,6 +1375,7 @@ def _testimony_review_items(app: Flask) -> list[dict]:
                 "id": candidate.id,
                 "title": candidate.title,
                 "source_path": candidate.path,
+                "source_label": Path(candidate.path).name,
                 "relative_path": candidate.relative_path,
                 "recording_date": candidate.recording_date,
                 "service_date": service_date,
@@ -3163,6 +3164,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         gap:.95rem;
         padding:1rem;
         background:linear-gradient(180deg,rgba(143,211,255,.028),rgba(4,11,20,.12));
+        align-items:start;
       }
       .listen-panel, .edit-panel, .path-panel {
         border:1px solid rgba(143,211,255,.16);
@@ -3190,7 +3192,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         text-transform:uppercase;
       }
       .fact strong { display:block; margin-top:.18rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-      .review-form { display:grid; gap:.75rem; }
+      .review-form { display:grid; gap:.75rem; align-self:start; }
       .form-grid {
         display:grid;
         grid-template-columns:minmax(0,.72fr) minmax(0,1fr);
@@ -3214,8 +3216,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         font-size:.82rem;
         line-height:1.45;
       }
-      .button-row { display:flex; gap:.55rem; flex-wrap:wrap; justify-content:flex-end; }
-      .button-row button { width:auto; }
+      .button-row { display:flex; gap:.55rem; flex-wrap:wrap; justify-content:flex-end; align-items:center; padding-top:.1rem; }
+      .button-row button { width:auto; min-height:2.7rem; padding:.62rem .82rem; line-height:1.1; border-radius:13px; }
       .save { color:#dcfff0; background:rgba(116,221,180,.15); border-color:rgba(116,221,180,.45); }
       .danger { color:#ffd7d7; border-color:rgba(255,170,168,.35); background:var(--bad-soft); }
       .secondary { color:var(--muted); background:rgba(143,211,255,.06); }
@@ -3272,7 +3274,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div class="metric"><span>Identified</span><strong>{{ counts.identified }}</strong><small>Speaker confirmed</small></div>
         <div class="metric"><span>Not Testimony</span><strong>{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
         <div class="metric"><span>Already Named</span><strong>{{ counts.already_named }}</strong><small>Testimony is in the filename</small></div>
-        <div class="metric"><span>Source Files</span><strong>{{ counts.all }}</strong><small>Folder connected</small></div>
+        <div class="metric"><span>Files Found</span><strong>{{ counts.all }}</strong><small>Folder connected</small></div>
       </section>
       <div class="toolbar">
         <nav class="tabs" aria-label="Testimony review filters">
@@ -3294,7 +3296,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div class="panel-head">
           <div>
             <h2>{{ status_label(status_filter) }}</h2>
-            <p class="muted">Review-only for now: this saves speaker and service date. Naming and destination are handled internally.</p>
+            <p class="muted">Listen, confirm the service date, then save the speaker or mark clips that are not testimonies.</p>
           </div>
           <form class="probe-form" method="get" action="{{ url_for('testimony_review') }}">
             <input type="hidden" name="status" value="{{ status_filter }}">
@@ -3314,7 +3316,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           </form>
         </div>
         {% if not dn300r_exists %}
-          <div class="empty">DN300R folder was not found at {{ dn300r_root }}.</div>
+          <div class="empty">DN300R folder is not connected.</div>
         {% elif items %}
           <div class="review-list">
             {% for item in items %}
@@ -3324,7 +3326,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                     <div class="cell">
                       <span class="cell-label">Recording</span>
                       <span class="cell-value">{{ item.title }}</span>
-                      <span class="cell-subvalue">{{ item.relative_path }}</span>
+                      <span class="cell-subvalue">{{ item.source_label }}</span>
                     </div>
                     <div class="cell">
                       <span class="cell-label">Duration</span>
@@ -3351,7 +3353,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                     <div class="file-facts">
                       <div class="fact"><span>Size</span><strong>{{ item.size_label }}</strong></div>
                       <div class="fact"><span>Modified</span><strong>{{ item.modified_label }}</strong></div>
-                      <div class="fact wide"><span>Source</span><strong>{{ item.relative_path }}</strong></div>
+                      <div class="fact wide"><span>File</span><strong>{{ item.source_label }}</strong></div>
                     </div>
                   </section>
                   <form class="review-form" method="post" action="{{ url_for('update_testimony_review', recording_id=item.id) }}">
