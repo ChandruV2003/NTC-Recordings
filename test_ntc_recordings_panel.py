@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 import sqlite3
@@ -484,11 +485,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
         delete.assert_called_once()
         self.assertIn("/shares/9753", delete.call_args.args[0])
 
-    def test_testimony_review_tracks_raw_dn300r_identification(self):
+    def test_testimony_review_tracks_dn300r_speaker_identification(self):
         dn300r_root = self.root / "DN300R"
         dn300r_root.mkdir()
         raw_recording = dn300r_root / "REC00042.mp3"
         raw_recording.write_bytes(b"raw-testimony-audio")
+        service_timestamp = datetime(2026, 4, 19, tzinfo=timezone.utc).timestamp()
+        os.utime(raw_recording, (service_timestamp, service_timestamp))
         (dn300r_root / "20250413 - Sister Rachel's Testimony.mp3").write_bytes(b"named-testimony-audio")
 
         denied = self.client.get("/admin/testimonies")
@@ -501,8 +504,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Testimony Review", review.data)
         self.assertIn(b"REC00042", review.data)
         self.assertIn(b"Check Durations", review.data)
-        self.assertIn(b"Save Testimony Plan", review.data)
-        self.assertIn(b"Review-only for now", review.data)
+        self.assertIn(b"Save Speaker", review.data)
+        self.assertIn(b"Naming and destination are handled internally", review.data)
+        self.assertNotIn(b"Final Title", review.data)
+        self.assertNotIn(b"Voice / ID Notes", review.data)
+        self.assertNotIn(b"Proposed Destination", review.data)
         self.assertNotIn(b"20250413 - Sister Rachel", review.data)
 
         recording_id = _recording_id(raw_recording)
@@ -514,10 +520,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             f"/admin/testimonies/{recording_id}/review",
             data={
                 "status": "identified",
-                "service_date": "2026-04-19",
                 "speaker_name": "Sister Test",
-                "testimony_title": "Sister Test's Testimony",
-                "notes": "Recognized from review.",
             },
             follow_redirects=True,
         )
@@ -525,8 +528,19 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(saved.status_code, 200)
         self.assertIn(b"Testimony review saved", saved.data)
         self.assertIn(b"Sister Test", saved.data)
-        self.assertIn(b"20260419 - Sister Test&#39;s Testimony.mp3", saved.data)
-        self.assertIn(b"Sunday Testimonies", saved.data)
+        self.assertNotIn(b"20260419 - Sister Test&#39;s Testimony.mp3", saved.data)
+        self.assertNotIn(b"Sunday Testimonies", saved.data)
+
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT service_date, testimony_title, proposed_path FROM testimony_reviews WHERE recording_id = ?",
+                (recording_id,),
+            ).fetchone()
+
+        self.assertEqual(row[0], "2026-04-19")
+        self.assertEqual(row[1], "Sister Test's Testimony")
+        self.assertIn("Sunday Testimonies", row[2])
+        self.assertTrue(row[2].endswith("20260419 - Sister Test's Testimony.mp3"))
 
 
 if __name__ == "__main__":

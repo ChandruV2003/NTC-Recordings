@@ -101,6 +101,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         ),
         NTC_RECORDINGS_MAX_SCAN_FILES=int(os.getenv("NTC_RECORDINGS_MAX_SCAN_FILES", "4000")),
         NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT", "80")),
+        NTC_RECORDINGS_TESTIMONY_MIN_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_MIN_SECONDS", "45")),
         NTC_RECORDINGS_INDEX_REFRESH_SECONDS=float(
             os.getenv(
                 "NTC_RECORDINGS_INDEX_REFRESH_SECONDS",
@@ -386,11 +387,16 @@ def create_app(test_config: dict | None = None) -> Flask:
         status = (request.form.get("status") or "identified").strip().lower()
         if status not in {"needs_review", "identified", "not_testimony"}:
             status = "identified"
-        service_date = _normalize_date((request.form.get("service_date") or "").strip()) or ""
-        speaker_name = (request.form.get("speaker_name") or "").strip()
-        testimony_title = (request.form.get("testimony_title") or "").strip()
-        notes = (request.form.get("notes") or "").strip()
         existing = _testimony_review_row(app, recording_id)
+        service_date = (
+            _normalize_date((request.form.get("service_date") or "").strip())
+            or (str(existing["service_date"] or "") if existing else "")
+            or candidate.recording_date
+            or ""
+        )
+        speaker_name = (request.form.get("speaker_name") or "").strip()
+        testimony_title = _testimony_title_for_speaker(speaker_name)
+        notes = str(existing["notes"] or "") if existing else ""
         duration_seconds = _row_duration(existing) if existing else None
         proposed_path = ""
         if status == "identified":
@@ -1295,7 +1301,7 @@ def _dn300r_candidates(app: Flask) -> list[RecordingCandidate]:
             stat = path.stat()
         except OSError:
             continue
-        recording_date = _extract_recording_date(" ".join(path.parts)) or ""
+        recording_date = _extract_recording_date(" ".join(path.parts)) or _date_from_file_metadata(stat) or ""
         try:
             relative_path = str(path.relative_to(message_root))
         except ValueError:
@@ -1348,9 +1354,7 @@ def _testimony_review_items(app: Flask) -> list[dict]:
     for candidate in _dn300r_candidates(app):
         row = rows.get(candidate.id)
         duration_seconds = _row_duration(row) if row else None
-        status = str(row["status"] or "") if row else ""
-        if status not in {"needs_review", "identified", "not_testimony", "already_named"}:
-            status = "already_named" if _raw_testimony_name(Path(candidate.path)) else "needs_review"
+        status = _testimony_status_for_candidate(app, candidate, row, duration_seconds)
         service_date = str(row["service_date"] or "") if row else ""
         speaker_name = str(row["speaker_name"] or "") if row else ""
         testimony_title = str(row["testimony_title"] or "") if row else ""
@@ -1508,9 +1512,7 @@ def _probe_missing_testimony_durations(app: Flask, limit: int) -> tuple[int, int
         if duration is None:
             skipped += 1
             continue
-        status = str(row["status"] or "") if row else ""
-        if status not in {"needs_review", "identified", "not_testimony", "already_named"}:
-            status = "already_named" if _raw_testimony_name(Path(candidate.path)) else "needs_review"
+        status = _testimony_status_for_candidate(app, candidate, row, duration)
         service_date = str(row["service_date"] or "") if row else candidate.recording_date
         speaker_name = str(row["speaker_name"] or "") if row else ""
         testimony_title = str(row["testimony_title"] or "") if row else ""
@@ -1561,6 +1563,39 @@ def _probe_audio_duration(path: Path) -> float | None:
     return duration if duration > 0 else None
 
 
+def _testimony_status_for_candidate(
+    app: Flask,
+    candidate: RecordingCandidate,
+    row: sqlite3.Row | None,
+    duration_seconds: float | None,
+) -> str:
+    status = str(row["status"] or "") if row else ""
+    if status in {"identified", "not_testimony", "already_named"}:
+        return status
+    if status not in {"needs_review", "identified", "not_testimony", "already_named"}:
+        status = "already_named" if _raw_testimony_name(Path(candidate.path)) else "needs_review"
+    if status == "needs_review" and _duration_is_too_short_for_testimony(app, duration_seconds):
+        return "not_testimony"
+    return status
+
+
+def _duration_is_too_short_for_testimony(app: Flask, duration_seconds: float | None) -> bool:
+    if duration_seconds is None:
+        return False
+    try:
+        minimum = int(app.config.get("NTC_RECORDINGS_TESTIMONY_MIN_SECONDS") or 45)
+    except (TypeError, ValueError):
+        minimum = 45
+    return 0 < duration_seconds < max(1, minimum)
+
+
+def _testimony_title_for_speaker(speaker_name: str) -> str:
+    speaker = speaker_name.strip()
+    if speaker:
+        return f"{speaker}'s Testimony"
+    return ""
+
+
 def _format_duration(seconds: float | None) -> str:
     if seconds is None:
         return "Unknown"
@@ -1594,6 +1629,13 @@ def _proposed_testimony_path(
         title = "Testimony"
     filename = _sanitize_filename_part(f"{date_prefix} - {title}") + source_path.suffix.lower()
     return str(_message_recording_root(app) / year / "Sunday Testimonies" / filename)
+
+
+def _date_from_file_metadata(stat_result: os.stat_result) -> str | None:
+    try:
+        return datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).date().isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
 
 
 def _sanitize_filename_part(value: str) -> str:
@@ -2285,7 +2327,8 @@ RECORDING_ADMIN_LOGIN_TEMPLATE = """
     <style>
       :root { color-scheme: dark; --bg:#08111d; --surface:#101d30; --surface-2:#14243a; --line:rgba(144,202,255,.22); --text:#eef7ff; --muted:#a8b6c8; --accent:#8fd3ff; --bad:#ffaaaa; --bad-soft:rgba(255,154,154,.1); }
       * { box-sizing: border-box; }
-      body { margin:0; min-height:100vh; display:grid; place-items:center; background:radial-gradient(circle at top left, rgba(143,211,255,.2), transparent 26rem), linear-gradient(145deg,#050913,var(--bg)); color:var(--text); font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+      html { min-height:100%; background:#050913; }
+      body { margin:0; min-height:100vh; min-height:100svh; display:grid; place-items:center; padding:16px; background:radial-gradient(circle at top left, rgba(143,211,255,.2), transparent 26rem), linear-gradient(145deg,#050913,var(--bg)); color:var(--text); font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
       main { width:min(520px, calc(100vw - 32px)); }
       section { border:1px solid var(--line); border-radius:28px; background:var(--surface); padding:30px; box-shadow:0 24px 80px rgba(0,0,0,.38); }
       h1 { margin:0 0 .5rem; font-size:clamp(32px,5vw,52px); line-height:1; letter-spacing:-.05em; }
@@ -2365,6 +2408,7 @@ RECORDING_ADMIN_TEMPLATE = """
         letter-spacing:.12em;
         text-transform:uppercase;
       }
+      .eyebrow + h1 { margin-top:.38rem; }
       .actions { display:flex; gap:.5rem; flex-wrap:wrap; justify-content:flex-end; }
       a, button, select {
         border:1px solid var(--line);
@@ -2677,7 +2721,7 @@ RECORDING_ADMIN_TEMPLATE = """
         <div>
           <div class="eyebrow">NTC Newark</div>
           <h1>Recording Requests</h1>
-          <p class="muted">Approve message, worship, and testimony recording requests from one queue.</p>
+          <p class="muted">Approve message, worship, and testimony recording requests.</p>
         </div>
         <div class="actions">
           <a href="{{ url_for('testimony_review') }}">Testimony Review</a>
@@ -2933,6 +2977,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         letter-spacing:.12em;
         text-transform:uppercase;
       }
+      .eyebrow + h1 { margin-top:.38rem; }
       .muted { color:var(--muted); line-height:1.45; }
       .actions { display:flex; gap:.5rem; flex-wrap:wrap; justify-content:flex-end; }
       a, button, input, textarea, select {
@@ -3212,7 +3257,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div>
           <div class="eyebrow">NTC Newark</div>
           <h1>Testimony Review</h1>
-          <p class="muted">Listen through raw DN300R recordings, identify testimonies, and prepare their final names.</p>
+          <p class="muted">Listen through service recordings and identify testimony speakers.</p>
         </div>
         <div class="actions">
           <a href="{{ url_for('admin_panel') }}">Requests</a>
@@ -3223,11 +3268,11 @@ TESTIMONY_REVIEW_TEMPLATE = """
       {% if message %}<div class="banner">{{ message }}</div>{% endif %}
       {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
       <section class="metrics" aria-label="Testimony review status">
-        <div class="metric"><span>Needs Review</span><strong>{{ counts.needs_review }}</strong><small>Raw DN300R files</small></div>
-        <div class="metric"><span>Identified</span><strong>{{ counts.identified }}</strong><small>Ready for rename plan</small></div>
+        <div class="metric"><span>Needs Review</span><strong>{{ counts.needs_review }}</strong><small>Awaiting identification</small></div>
+        <div class="metric"><span>Identified</span><strong>{{ counts.identified }}</strong><small>Speaker confirmed</small></div>
         <div class="metric"><span>Not Testimony</span><strong>{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
         <div class="metric"><span>Already Named</span><strong>{{ counts.already_named }}</strong><small>Testimony is in the filename</small></div>
-        <div class="metric"><span>DN300R Files</span><strong>{{ counts.all }}</strong><small>Source folder connected</small></div>
+        <div class="metric"><span>Source Files</span><strong>{{ counts.all }}</strong><small>Folder connected</small></div>
       </section>
       <div class="toolbar">
         <nav class="tabs" aria-label="Testimony review filters">
@@ -3249,7 +3294,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div class="panel-head">
           <div>
             <h2>{{ status_label(status_filter) }}</h2>
-            <p class="muted">Review-only for now: this saves identity and destination plans, but does not move or rename NAS files.</p>
+            <p class="muted">Review-only for now: this saves speaker and service date. Naming and destination are handled internally.</p>
           </div>
           <form class="probe-form" method="get" action="{{ url_for('testimony_review') }}">
             <input type="hidden" name="status" value="{{ status_filter }}">
@@ -3318,27 +3363,15 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           <input name="service_date" type="date" value="{{ item.service_date }}">
                         </label>
                         <label>
-                          <span>Speaker / Person</span>
+                          <span>Speaker</span>
                           <input name="speaker_name" value="{{ item.speaker_name }}" placeholder="Sister Rachel">
                         </label>
-                        <label class="wide">
-                          <span>Final Title</span>
-                          <input name="testimony_title" value="{{ item.testimony_title }}" placeholder="Sister Rachel's Testimony">
-                        </label>
-                        <label class="wide">
-                          <span>Voice / ID Notes</span>
-                          <textarea name="notes" placeholder="Optional identification notes">{{ item.notes }}</textarea>
-                        </label>
                       </div>
-                    </section>
-                    <section class="path-panel">
-                      <div class="meta">Proposed Destination</div>
-                      <code>{{ item.proposed_path or "Save as identified to generate a testimony path." }}</code>
                     </section>
                     <div class="button-row">
                       <button class="secondary" type="submit" name="status" value="needs_review">Needs Review</button>
                       <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Testimony</button>
-                      <button class="save" type="submit" name="status" value="identified">Save Testimony Plan</button>
+                      <button class="save" type="submit" name="status" value="identified">Save Speaker</button>
                     </div>
                   </form>
                 </div>
