@@ -95,9 +95,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         SECRET_KEY=os.getenv("NTC_RECORDINGS_SECRET_KEY") or os.getenv("NTC_SECRET_KEY") or "change-me",
         NTC_RECORDINGS_DB_PATH=os.getenv("NTC_RECORDINGS_DB_PATH", "data/recording-requests.db"),
         NTC_RECORDINGS_LIBRARY_DIRS=os.getenv("NTC_RECORDINGS_LIBRARY_DIRS", DEFAULT_RECORDING_DIRS),
-        NTC_RECORDINGS_DN300R_DIR=os.getenv(
-            "NTC_RECORDINGS_DN300R_DIR",
-            str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R"),
+        NTC_RECORDINGS_TESTIMONY_SOURCE_DIR=(
+            os.getenv("NTC_RECORDINGS_TESTIMONY_SOURCE_DIR")
+            or os.getenv("NTC_RECORDINGS_DN300R_DIR")
+            or str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R")
         ),
         NTC_RECORDINGS_MAX_SCAN_FILES=int(os.getenv("NTC_RECORDINGS_MAX_SCAN_FILES", "4000")),
         NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT", "80")),
@@ -338,7 +339,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         visible_items = items if status_filter == "all" else [item for item in items if item["status"] == status_filter]
         _sort_testimony_items(visible_items, sort)
         visible_items = visible_items[:limit]
-        root = _dn300r_root(app)
+        root = _testimony_source_root(app)
         return render_template_string(
             TESTIMONY_REVIEW_TEMPLATE,
             title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
@@ -347,8 +348,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             status_filter=status_filter,
             sort=sort,
             limit=limit,
-            dn300r_root=str(root),
-            dn300r_exists=root.exists() and root.is_dir(),
+            testimony_source_root=str(root),
+            testimony_source_exists=root.exists() and root.is_dir(),
             probe_limit=int(app.config.get("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT") or 80),
             message=request.args.get("message"),
             error=request.args.get("error"),
@@ -372,7 +373,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 "testimony_review",
                 status=request.form.get("status") or "needs_review",
                 sort=request.form.get("sort") or "shortest",
-                message=f"Checked {probed + skipped} DN300R file{'s' if probed + skipped != 1 else ''}; saved {probed} duration{'s' if probed != 1 else ''}.",
+                message=f"Checked {probed + skipped} testimony source file{'s' if probed + skipped != 1 else ''}; saved {probed} duration{'s' if probed != 1 else ''}.",
             )
         )
 
@@ -381,9 +382,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         guard = _require_admin()
         if guard:
             return guard
-        candidate = _dn300r_recording_by_id(app, recording_id)
+        candidate = _testimony_source_recording_by_id(app, recording_id)
         if not candidate:
-            return redirect(url_for("testimony_review", error="DN300R recording was not found."))
+            return redirect(url_for("testimony_review", error="Testimony source recording was not found."))
         status = (request.form.get("status") or "identified").strip().lower()
         if status not in {"needs_review", "identified", "not_testimony"}:
             status = "identified"
@@ -427,7 +428,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         guard = _require_admin()
         if guard:
             return guard
-        candidate = _dn300r_recording_by_id(app, recording_id)
+        candidate = _testimony_source_recording_by_id(app, recording_id)
         if not candidate:
             return jsonify({"error": "recording was not found"}), 404
         path = Path(candidate.path)
@@ -1263,8 +1264,13 @@ def _request_group_label(kind: str) -> str:
     return labels.get(kind, "Recording Requests")
 
 
-def _dn300r_root(app: Flask) -> Path:
-    configured = Path(str(app.config.get("NTC_RECORDINGS_DN300R_DIR") or "")).expanduser()
+def _testimony_source_root(app: Flask) -> Path:
+    default_source = str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R")
+    configured_value = app.config.get("NTC_RECORDINGS_TESTIMONY_SOURCE_DIR") or ""
+    legacy_value = app.config.get("NTC_RECORDINGS_DN300R_DIR") or ""
+    if legacy_value and (not configured_value or configured_value == default_source):
+        configured_value = legacy_value
+    configured = Path(str(configured_value)).expanduser()
     if configured.exists():
         return configured
     message_root = _message_recording_root(app)
@@ -1286,8 +1292,8 @@ def _message_recording_root(app: Flask) -> Path:
     return Path(DEFAULT_MESSAGE_RECORDING_DIR)
 
 
-def _dn300r_candidates(app: Flask) -> list[RecordingCandidate]:
-    root = _dn300r_root(app)
+def _testimony_source_candidates(app: Flask) -> list[RecordingCandidate]:
+    root = _testimony_source_root(app)
     if not root.exists() or not root.is_dir():
         return []
     message_root = _message_recording_root(app)
@@ -1326,10 +1332,10 @@ def _dn300r_candidates(app: Flask) -> list[RecordingCandidate]:
     return candidates
 
 
-def _dn300r_recording_by_id(app: Flask, recording_id: str) -> RecordingCandidate | None:
+def _testimony_source_recording_by_id(app: Flask, recording_id: str) -> RecordingCandidate | None:
     if not recording_id:
         return None
-    return next((item for item in _dn300r_candidates(app) if item.id == recording_id), None)
+    return next((item for item in _testimony_source_candidates(app) if item.id == recording_id), None)
 
 
 def _raw_testimony_name(path: Path) -> bool:
@@ -1351,7 +1357,7 @@ def _testimony_review_rows(app: Flask) -> dict[str, sqlite3.Row]:
 def _testimony_review_items(app: Flask) -> list[dict]:
     rows = _testimony_review_rows(app)
     items = []
-    for candidate in _dn300r_candidates(app):
+    for candidate in _testimony_source_candidates(app):
         row = rows.get(candidate.id)
         duration_seconds = _row_duration(row) if row else None
         status = _testimony_status_for_candidate(app, candidate, row, duration_seconds)
@@ -1502,7 +1508,7 @@ def _probe_missing_testimony_durations(app: Flask, limit: int) -> tuple[int, int
     rows = _testimony_review_rows(app)
     probed = 0
     skipped = 0
-    for candidate in _dn300r_candidates(app):
+    for candidate in _testimony_source_candidates(app):
         if probed + skipped >= limit:
             break
         row = rows.get(candidate.id)
@@ -3315,8 +3321,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
             <button type="submit">Apply</button>
           </form>
         </div>
-        {% if not dn300r_exists %}
-          <div class="empty">DN300R folder is not connected.</div>
+        {% if not testimony_source_exists %}
+          <div class="empty">Testimony source folder is not connected.</div>
         {% elif items %}
           <div class="review-list">
             {% for item in items %}

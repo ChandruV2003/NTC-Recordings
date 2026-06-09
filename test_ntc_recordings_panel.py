@@ -31,7 +31,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "SECRET_KEY": "test-secret",
                 "NTC_RECORDINGS_DB_PATH": str(self.db_path),
                 "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root}",
-                "NTC_RECORDINGS_DN300R_DIR": str(self.root / "DN300R"),
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(self.root / "DN300R"),
                 "NTC_RECORDINGS_PUBLIC_BASE_URL": "https://recordings.example.test",
                 "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
                 "NTC_RECORDINGS_EMAIL_ENABLED": "0",
@@ -485,14 +485,14 @@ class RecordingRequestPanelTests(unittest.TestCase):
         delete.assert_called_once()
         self.assertIn("/shares/9753", delete.call_args.args[0])
 
-    def test_testimony_review_tracks_dn300r_speaker_identification(self):
-        dn300r_root = self.root / "DN300R"
-        dn300r_root.mkdir()
-        raw_recording = dn300r_root / "REC00042.mp3"
+    def test_testimony_review_tracks_source_speaker_identification(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "REC00042.mp3"
         raw_recording.write_bytes(b"raw-testimony-audio")
         service_timestamp = datetime(2026, 4, 19, tzinfo=timezone.utc).timestamp()
         os.utime(raw_recording, (service_timestamp, service_timestamp))
-        (dn300r_root / "20250413 - Sister Rachel's Testimony.mp3").write_bytes(b"named-testimony-audio")
+        (testimony_source_root / "20250413 - Sister Rachel's Testimony.mp3").write_bytes(b"named-testimony-audio")
 
         denied = self.client.get("/admin/testimonies")
         self.assertEqual(denied.status_code, 302)
@@ -506,6 +506,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Check Durations", review.data)
         self.assertIn(b"Save Speaker", review.data)
         self.assertIn(b"Listen, confirm the service date", review.data)
+        self.assertNotIn(b"DN300R folder", review.data)
         self.assertNotIn(b"Final Title", review.data)
         self.assertNotIn(b"Voice / ID Notes", review.data)
         self.assertNotIn(b"Proposed Destination", review.data)
@@ -541,6 +542,31 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(row[1], "Sister Test's Testimony")
         self.assertIn("Sunday Testimonies", row[2])
         self.assertTrue(row[2].endswith("20260419 - Sister Test's Testimony.mp3"))
+
+    def test_legacy_testimony_source_config_still_works(self):
+        legacy_root = self.root / "LegacyRecorder"
+        legacy_root.mkdir()
+        raw_recording = legacy_root / "REC00099.mp3"
+        raw_recording.write_bytes(b"legacy-source-audio")
+
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "legacy-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(Path(self.tempdir.name) / "legacy-recording-requests.db"),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root}",
+                "NTC_RECORDINGS_DN300R_DIR": str(legacy_root),
+                "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
+            }
+        )
+        client = app.test_client()
+        client.post("/admin/login", data={"password": "admin-password"})
+
+        review = client.get("/admin/testimonies")
+
+        self.assertEqual(review.status_code, 200)
+        self.assertIn(b"REC00099", review.data)
+        self.assertIn(b"Testimony Review", review.data)
 
 
 if __name__ == "__main__":
