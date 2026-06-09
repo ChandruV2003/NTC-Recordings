@@ -2207,12 +2207,114 @@ RECORDING_PUBLIC_TEMPLATE = """
       .decision-row {
         grid-column: 1 / -1;
         display: grid;
-        grid-template-columns: minmax(0, .82fr) minmax(0, 1.18fr);
+        grid-template-columns: minmax(0, 1fr);
         gap: .9rem;
         padding-bottom: .25rem;
       }
+      .calendar-field { display:grid; gap:.42rem; }
+      .calendar-picker {
+        border:1px solid var(--line);
+        border-radius:20px;
+        background:rgba(5,13,24,.52);
+        padding:.78rem;
+        box-shadow:inset 0 1px 0 rgba(255,255,255,.04);
+      }
+      .calendar-top {
+        display:grid;
+        grid-template-columns:2.45rem minmax(0,1fr) 2.45rem;
+        align-items:center;
+        gap:.55rem;
+        margin-bottom:.68rem;
+      }
+      .calendar-nav {
+        display:grid;
+        place-items:center;
+        width:2.45rem;
+        height:2.45rem;
+        padding:0;
+        border-radius:999px;
+        font-size:1.2rem;
+        line-height:1;
+      }
+      .calendar-heading { min-width:0; text-align:center; }
+      .calendar-month { display:block; color:var(--text); font-weight:900; }
+      .calendar-selected { display:block; margin-top:.1rem; color:var(--muted); font-size:.86rem; line-height:1.3; }
+      .calendar-weekdays,
+      .calendar-grid {
+        display:grid;
+        grid-template-columns:repeat(7,minmax(0,1fr));
+        gap:.34rem;
+      }
+      .calendar-weekdays {
+        margin-bottom:.34rem;
+        color:var(--muted);
+        font:800 .58rem var(--mono);
+        letter-spacing:.08em;
+        text-align:center;
+        text-transform:uppercase;
+      }
+      .calendar-day {
+        min-height:3.05rem;
+        aspect-ratio:1 / 1;
+        display:grid;
+        align-content:center;
+        justify-items:center;
+        gap:.08rem;
+        padding:.28rem;
+        border-radius:13px;
+        background:rgba(255,255,255,.035);
+        color:var(--muted);
+        font-weight:900;
+        line-height:1;
+      }
+      .calendar-day small {
+        display:block;
+        max-width:100%;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+        color:inherit;
+        font-size:.54rem;
+        font-weight:800;
+      }
+      .calendar-day.is-empty {
+        visibility:hidden;
+        pointer-events:none;
+      }
+      .calendar-day.is-unavailable,
+      .calendar-day:disabled {
+        opacity:.42;
+        cursor:not-allowed;
+        color:#65788f;
+        border-color:rgba(144,202,255,.12);
+        background:rgba(255,255,255,.018);
+      }
+      .calendar-day.is-available {
+        color:var(--text);
+        border-color:rgba(143,211,255,.36);
+        background:linear-gradient(135deg,rgba(143,211,255,.18),rgba(123,228,187,.1));
+      }
+      .calendar-day.is-selected {
+        color:#06101d;
+        border-color:rgba(143,245,200,.9);
+        background:linear-gradient(135deg,#8fd3ff,#8ff5c8);
+        box-shadow:0 10px 24px rgba(0,0,0,.22);
+      }
+      .calendar-empty {
+        grid-column:1 / -1;
+        border:1px dashed rgba(143,211,255,.24);
+        border-radius:14px;
+        padding:1rem;
+        color:var(--muted);
+        text-align:center;
+      }
       @media (max-width: 840px) { .grid, .form-grid { grid-template-columns: 1fr; } .wide { grid-column:auto; } }
-      @media (max-width: 840px) { .decision-row { grid-template-columns: 1fr; } }
+      @media (max-width: 840px) {
+        .decision-row { grid-template-columns: 1fr; }
+        .calendar-picker { padding:.65rem; }
+        .calendar-day { min-height:2.65rem; border-radius:11px; }
+        .calendar-day small { display:none; }
+      }
     </style>
   </head>
   <body>
@@ -2239,17 +2341,26 @@ RECORDING_PUBLIC_TEMPLATE = """
                     <option value="unsure">Not sure</option>
                   </select>
                 </label>
-                <label>
-                  Service Date
-                  <select name="requested_date" required {% if not recording_dates %}disabled{% endif %}>
-                    <option value="">Choose service date</option>
-                    {% for recording in recording_dates %}
-                      <option value="{{ recording.date }}" data-kinds="{{ recording.kinds|join(',') }}">{{ recording.label }}</option>
-                    {% endfor %}
-                  </select>
-                </label>
+                <div class="calendar-field">
+                  <label for="requested-date-value">Service Date</label>
+                  <input id="requested-date-value" name="requested_date" type="hidden">
+                  <div class="calendar-picker" data-calendar>
+                    <div class="calendar-top">
+                      <button class="calendar-nav" type="button" data-calendar-prev aria-label="Previous month">&lsaquo;</button>
+                      <div class="calendar-heading">
+                        <span class="calendar-month" data-calendar-month>Choose service date</span>
+                        <span class="calendar-selected" data-calendar-selected>Available days are highlighted.</span>
+                      </div>
+                      <button class="calendar-nav" type="button" data-calendar-next aria-label="Next month">&rsaquo;</button>
+                    </div>
+                    <div class="calendar-weekdays" aria-hidden="true">
+                      <span>Sun</span><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span>
+                    </div>
+                    <div class="calendar-grid" data-calendar-grid role="group" aria-label="Available service dates"></div>
+                  </div>
+                </div>
               </div>
-              <p class="hint wide">Only dates already in the recording library are shown.</p>
+              <p class="hint wide">Greyed-out days are not available for the selected recording type.</p>
               <label>First and Last Name <input name="requester_name" autocomplete="name" required></label>
               <label>Email <input name="email" type="email" autocomplete="email" required></label>
               <label>Send Copy To <span class="optional">Optional</span><input name="secondary_email" type="email" autocomplete="email" placeholder="Optional"></label>
@@ -2285,38 +2396,126 @@ RECORDING_PUBLIC_TEMPLATE = """
         </section>
       </div>
     </main>
+    <script type="application/json" id="recording-date-data">{{ recording_dates|tojson }}</script>
     <script>
       (() => {
+        const form = document.querySelector('form[action="{{ url_for('create_request') }}"]');
         const kindSelect = document.querySelector('select[name="recording_kind"]');
-        const dateSelect = document.querySelector('select[name="requested_date"]');
-        if (!kindSelect || !dateSelect) return;
-        const placeholder = dateSelect.querySelector('option[value=""]');
-        const dateOptions = Array.from(dateSelect.options)
-          .filter((option) => option.value)
-          .map((option) => ({
-            value: option.value,
-            label: option.textContent.trim(),
-            kinds: (option.dataset.kinds || "").split(",").filter(Boolean),
-          }));
-        const filterDates = () => {
+        const dateInput = document.querySelector('input[name="requested_date"]');
+        const dataScript = document.getElementById("recording-date-data");
+        const monthLabel = document.querySelector("[data-calendar-month]");
+        const selectedLabel = document.querySelector("[data-calendar-selected]");
+        const grid = document.querySelector("[data-calendar-grid]");
+        const prevButton = document.querySelector("[data-calendar-prev]");
+        const nextButton = document.querySelector("[data-calendar-next]");
+        if (!form || !kindSelect || !dateInput || !dataScript || !monthLabel || !selectedLabel || !grid || !prevButton || !nextButton) return;
+
+        let dateOptions = [];
+        try {
+          dateOptions = JSON.parse(dataScript.textContent || "[]");
+        } catch {
+          dateOptions = [];
+        }
+        const optionByDate = new Map(dateOptions.map((option) => [option.date, option]));
+        const monthFormatter = new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" });
+        const parseDate = (value) => {
+          const [year, month, day] = String(value || "").split("-").map(Number);
+          return new Date(year || 1970, (month || 1) - 1, day || 1);
+        };
+        const toDateKey = (date) => {
+          const year = date.getFullYear();
+          const month = String(date.getMonth() + 1).padStart(2, "0");
+          const day = String(date.getDate()).padStart(2, "0");
+          return `${year}-${month}-${day}`;
+        };
+        const relevantOptions = () => {
           const kind = kindSelect.value;
-          const previousValue = dateSelect.value;
-          const visibleOptions = dateOptions.filter((option) => kind === "unsure" || option.kinds.includes(kind));
-          dateSelect.replaceChildren(placeholder.cloneNode(true));
-          for (const optionData of visibleOptions) {
-            const option = document.createElement("option");
-            option.value = optionData.value;
-            option.textContent = optionData.label;
-            option.dataset.kinds = optionData.kinds.join(",");
-            dateSelect.appendChild(option);
+          return dateOptions.filter((option) => kind === "unsure" || (option.kinds || []).includes(kind));
+        };
+        const firstMonthForKind = () => {
+          const first = relevantOptions()[0] || dateOptions[0];
+          const date = first ? parseDate(first.date) : new Date();
+          return new Date(date.getFullYear(), date.getMonth(), 1);
+        };
+        let selectedDate = "";
+        let currentMonth = firstMonthForKind();
+
+        const setSelectedDate = (dateKey) => {
+          const option = optionByDate.get(dateKey);
+          selectedDate = option ? dateKey : "";
+          dateInput.value = selectedDate;
+          selectedLabel.textContent = option ? option.label : "Available days are highlighted.";
+        };
+
+        const renderCalendar = () => {
+          const available = relevantOptions();
+          const availableDates = new Set(available.map((option) => option.date));
+          if (selectedDate && !availableDates.has(selectedDate)) {
+            setSelectedDate("");
           }
-          dateSelect.disabled = visibleOptions.length === 0;
-          if (visibleOptions.some((option) => option.value === previousValue)) {
-            dateSelect.value = previousValue;
+          if (!availableDates.size) {
+            grid.replaceChildren();
+            const empty = document.createElement("div");
+            empty.className = "calendar-empty";
+            empty.textContent = "No service dates are available for this recording type.";
+            grid.appendChild(empty);
+            monthLabel.textContent = "No available dates";
+            selectedLabel.textContent = "Choose another recording type.";
+            return;
+          }
+
+          monthLabel.textContent = monthFormatter.format(currentMonth);
+          grid.replaceChildren();
+          const year = currentMonth.getFullYear();
+          const month = currentMonth.getMonth();
+          const firstDay = new Date(year, month, 1).getDay();
+          const daysInMonth = new Date(year, month + 1, 0).getDate();
+          for (let index = 0; index < firstDay; index += 1) {
+            const spacer = document.createElement("button");
+            spacer.type = "button";
+            spacer.className = "calendar-day is-empty";
+            spacer.tabIndex = -1;
+            grid.appendChild(spacer);
+          }
+          for (let day = 1; day <= daysInMonth; day += 1) {
+            const dateKey = toDateKey(new Date(year, month, day));
+            const option = optionByDate.get(dateKey);
+            const availableForKind = availableDates.has(dateKey);
+            const dayButton = document.createElement("button");
+            dayButton.type = "button";
+            dayButton.className = `calendar-day ${availableForKind ? "is-available" : "is-unavailable"} ${dateKey === selectedDate ? "is-selected" : ""}`;
+            dayButton.disabled = !availableForKind;
+            dayButton.setAttribute("aria-label", option ? option.label : `${month + 1}/${day}/${year} unavailable`);
+            dayButton.innerHTML = `<span>${day}</span>${option ? `<small>${option.count} file${option.count === 1 ? "" : "s"}</small>` : ""}`;
+            if (availableForKind) {
+              dayButton.addEventListener("click", () => {
+                setSelectedDate(dateKey);
+                renderCalendar();
+              });
+            }
+            grid.appendChild(dayButton);
           }
         };
-        kindSelect.addEventListener("change", filterDates);
-        filterDates();
+
+        prevButton.addEventListener("click", () => {
+          currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 1, 1);
+          renderCalendar();
+        });
+        nextButton.addEventListener("click", () => {
+          currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 1);
+          renderCalendar();
+        });
+        kindSelect.addEventListener("change", () => {
+          currentMonth = firstMonthForKind();
+          renderCalendar();
+        });
+        form.addEventListener("submit", (event) => {
+          if (!dateInput.value) {
+            event.preventDefault();
+            selectedLabel.textContent = "Choose a highlighted service date before sending.";
+          }
+        });
+        renderCalendar();
       })();
     </script>
   </body>

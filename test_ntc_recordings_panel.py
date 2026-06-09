@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -46,20 +47,20 @@ class RecordingRequestPanelTests(unittest.TestCase):
         return self.client.post("/admin/login", data={"password": "admin-password"}, follow_redirects=True)
 
     def _first_recording_date_from_public_form(self):
-        html = self.client.get("/").data.decode("utf-8")
-        marker = '<option value="">Choose service date</option>'
-        start = html.index(marker) + len(marker)
-        start = html.index('<option value="', start) + len('<option value="')
-        end = html.index('"', start)
-        return html[start:end]
+        return self._recording_date_options_from_public_form()[0]["date"]
 
     def _first_recording_date_for_kind(self, kind: str):
+        for option in self._recording_date_options_from_public_form():
+            if kind in option["kinds"]:
+                return option["date"]
+        raise AssertionError(f"No public recording date found for kind {kind!r}")
+
+    def _recording_date_options_from_public_form(self):
         html = self.client.get("/").data.decode("utf-8")
-        marker = f'data-kinds="{kind}"'
-        marker_index = html.index(marker)
-        start = html.rfind('<option value="', 0, marker_index) + len('<option value="')
-        end = html.index('"', start)
-        return html[start:end]
+        marker = '<script type="application/json" id="recording-date-data">'
+        start = html.index(marker) + len(marker)
+        end = html.index("</script>", start)
+        return json.loads(html[start:end])
 
     def _first_recording_id_from_admin_panel(self, html: str) -> str:
         marker = '<select name="recording_id" required>'
@@ -79,11 +80,18 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Recording Type", response.data)
         self.assertIn(b"Worship recordings", response.data)
         self.assertIn(b"Testimony recording", response.data)
-        self.assertIn(b'data-kinds="message,worship"', response.data)
-        self.assertIn(b"dateSelect.replaceChildren", response.data)
+        self.assertIn(b'id="recording-date-data"', response.data)
+        self.assertIn(b"calendar-picker", response.data)
+        self.assertIn(b"data-calendar-grid", response.data)
+        self.assertIn(b"is-unavailable", response.data)
+        self.assertIn(b"Greyed-out days", response.data)
+        self.assertIn(b"renderCalendar", response.data)
+        self.assertNotIn(b'<select name="requested_date"', response.data)
         self.assertIn(b"Send Copy To", response.data)
         self.assertNotIn(b"Search Recordings", response.data)
         self.assertNotIn(b"Jesus Is Our Peace - Bro Blessen", response.data)
+        date_options = self._recording_date_options_from_public_form()
+        self.assertTrue(any(option["date"] == "2026-04-19" and option["kinds"] == ["message", "worship"] for option in date_options))
 
         created = self.client.post(
             "/request",
