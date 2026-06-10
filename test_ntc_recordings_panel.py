@@ -527,6 +527,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Check Durations", review.data)
         self.assertIn(b"Save Speaker", review.data)
         self.assertIn(b"Listen, confirm the service date", review.data)
+        self.assertIn(b"Suggest Speaker", review.data)
+        self.assertIn(b'id="speaker-name-options"', review.data)
         self.assertNotIn(b"DN300R folder", review.data)
         self.assertNotIn(b"Final Title", review.data)
         self.assertNotIn(b"Voice / ID Notes", review.data)
@@ -542,6 +544,40 @@ class RecordingRequestPanelTests(unittest.TestCase):
         audio = self.client.get(f"/admin/testimonies/audio/{recording_id}")
         self.assertEqual(audio.status_code, 200)
         self.assertEqual(audio.data, b"raw-testimony-audio")
+
+        with patch(
+            "ntc_recordings_app._transcribe_testimony_intro",
+            return_value=("For those of you who do not know me, my name is Kevin. I want to thank the Lord.", ""),
+        ):
+            suggested = self.client.post(
+                f"/admin/testimonies/{recording_id}/suggest",
+                data={
+                    "status_filter": "needs_review",
+                    "sort": "shortest",
+                    "source_path": str(raw_recording),
+                    "service_date": "2026-04-19",
+                },
+                follow_redirects=True,
+            )
+
+        self.assertEqual(suggested.status_code, 200)
+        self.assertIn(b"Suggested speaker: Kevin.", suggested.data)
+        self.assertIn(b"Suggested Speaker", suggested.data)
+        self.assertIn(b"Kevin", suggested.data)
+        self.assertIn(b"from intro transcript", suggested.data)
+        self.assertIn(b"Use Suggestion", suggested.data)
+
+        with sqlite3.connect(self.db_path) as connection:
+            suggestion_row = connection.execute(
+                "SELECT status, suggested_speaker, suggestion_source, suggestion_text FROM testimony_reviews WHERE recording_id = ?",
+                (recording_id,),
+            ).fetchone()
+
+        self.assertIsNotNone(suggestion_row)
+        self.assertEqual(suggestion_row[0], "needs_review")
+        self.assertEqual(suggestion_row[1], "Kevin")
+        self.assertEqual(suggestion_row[2], "transcript_intro")
+        self.assertIn("my name is Kevin", suggestion_row[3])
 
         saved = self.client.post(
             f"/admin/testimonies/{recording_id}/review",
