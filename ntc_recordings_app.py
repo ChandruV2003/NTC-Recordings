@@ -2247,7 +2247,9 @@ RECORDING_PUBLIC_TEMPLATE = """
         background:transparent;
         padding:.08rem .5rem;
         color:var(--text);
+        font-size:1.22rem;
         font-weight:900;
+        letter-spacing:0;
         line-height:1.2;
       }
       .calendar-month:hover,
@@ -2354,6 +2356,7 @@ RECORDING_PUBLIC_TEMPLATE = """
       @media (max-width: 840px) {
         .decision-row { grid-template-columns: 1fr; }
         .calendar-picker { padding:.65rem; }
+        .calendar-month { font-size:1.08rem; padding:.08rem .6rem; }
         .calendar-day { min-height:2.65rem; border-radius:11px; }
         .calendar-day small { display:none; }
         .calendar-jump label { font-size:.64rem; }
