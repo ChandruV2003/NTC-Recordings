@@ -4241,7 +4241,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                       <div class="meta">Listen</div>
                       <h3>{{ item.title }}</h3>
                     </div>
-                    <audio controls preload="metadata" src="{{ item.audio_url }}"></audio>
+                    <audio controls preload="none" data-src="{{ item.audio_url }}"></audio>
                     <div class="file-facts">
                       <div class="fact"><span>Size</span><strong>{{ item.size_label }}</strong></div>
                       <div class="fact"><span>Modified</span><strong>{{ item.modified_label }}</strong></div>
@@ -4309,6 +4309,19 @@ TESTIMONY_REVIEW_TEMPLATE = """
         input.value = button.dataset.speaker || "";
         input.focus();
       });
+      function hydrateReviewAudio(card) {
+        const audio = card.querySelector("audio[data-src]");
+        if (!audio || audio.src) return;
+        audio.src = audio.dataset.src || "";
+        audio.preload = "metadata";
+      }
+      document.addEventListener("toggle", (event) => {
+        const card = event.target;
+        if (card.matches && card.matches(".review-card") && card.open) {
+          hydrateReviewAudio(card);
+        }
+      }, true);
+      document.querySelectorAll(".review-card[open]").forEach(hydrateReviewAudio);
     </script>
   </body>
 </html>

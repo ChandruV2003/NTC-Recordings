@@ -527,6 +527,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Check Durations", review.data)
         self.assertIn(b"Save Speaker", review.data)
         self.assertIn(b"Listen, confirm the service date", review.data)
+        self.assertIn(b'preload="none" data-src="/admin/testimonies/audio/', review.data)
+        self.assertNotIn(b'preload="metadata" src="/admin/testimonies/audio/', review.data)
         self.assertIn(b"Suggest Speaker", review.data)
         self.assertIn(b'id="speaker-name-options"', review.data)
         self.assertNotIn(b"DN300R folder", review.data)
