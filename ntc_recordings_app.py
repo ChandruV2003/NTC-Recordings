@@ -2237,8 +2237,49 @@ RECORDING_PUBLIC_TEMPLATE = """
         line-height:1;
       }
       .calendar-heading { min-width:0; text-align:center; }
-      .calendar-month { display:block; color:var(--text); font-weight:900; }
+      .calendar-month {
+        display:inline-flex;
+        justify-content:center;
+        max-width:100%;
+        min-height:auto;
+        border:0;
+        border-radius:999px;
+        background:transparent;
+        padding:.08rem .5rem;
+        color:var(--text);
+        font-weight:900;
+        line-height:1.2;
+      }
+      .calendar-month:hover,
+      .calendar-month:focus-visible {
+        background:rgba(143,211,255,.12);
+        outline:1px solid rgba(143,211,255,.34);
+      }
       .calendar-selected { display:block; margin-top:.1rem; color:var(--muted); font-size:.86rem; line-height:1.3; }
+      .calendar-jump {
+        display:grid;
+        grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:.45rem;
+        margin-top:.58rem;
+        text-align:left;
+      }
+      .calendar-jump[hidden] { display:none; }
+      .calendar-jump label {
+        display:grid;
+        gap:.22rem;
+        color:var(--muted);
+        font:800 .58rem var(--mono);
+        letter-spacing:.08em;
+        text-transform:uppercase;
+      }
+      .calendar-jump select {
+        min-height:2.4rem;
+        border-radius:12px;
+        padding:.45rem .55rem;
+        font:800 .82rem var(--sans);
+        letter-spacing:0;
+        text-transform:none;
+      }
       .calendar-weekdays,
       .calendar-grid {
         display:grid;
@@ -2348,8 +2389,12 @@ RECORDING_PUBLIC_TEMPLATE = """
                     <div class="calendar-top">
                       <button class="calendar-nav" type="button" data-calendar-prev aria-label="Previous month">&lsaquo;</button>
                       <div class="calendar-heading">
-                        <span class="calendar-month" data-calendar-month>Choose service date</span>
+                        <button class="calendar-month" type="button" data-calendar-jump-toggle aria-expanded="false" aria-controls="calendar-jump-controls" data-calendar-month>Choose service date</button>
                         <span class="calendar-selected" data-calendar-selected>Available days are highlighted.</span>
+                        <div class="calendar-jump" id="calendar-jump-controls" data-calendar-jump hidden>
+                          <label>Month <select data-calendar-month-select aria-label="Jump to month"></select></label>
+                          <label>Year <select data-calendar-year-select aria-label="Jump to year"></select></label>
+                        </div>
                       </div>
                       <button class="calendar-nav" type="button" data-calendar-next aria-label="Next month">&rsaquo;</button>
                     </div>
@@ -2408,7 +2453,11 @@ RECORDING_PUBLIC_TEMPLATE = """
         const grid = document.querySelector("[data-calendar-grid]");
         const prevButton = document.querySelector("[data-calendar-prev]");
         const nextButton = document.querySelector("[data-calendar-next]");
-        if (!form || !kindSelect || !dateInput || !dataScript || !monthLabel || !selectedLabel || !grid || !prevButton || !nextButton) return;
+        const jumpToggle = document.querySelector("[data-calendar-jump-toggle]");
+        const jumpPanel = document.querySelector("[data-calendar-jump]");
+        const monthSelect = document.querySelector("[data-calendar-month-select]");
+        const yearSelect = document.querySelector("[data-calendar-year-select]");
+        if (!form || !kindSelect || !dateInput || !dataScript || !monthLabel || !selectedLabel || !grid || !prevButton || !nextButton || !jumpToggle || !jumpPanel || !monthSelect || !yearSelect) return;
 
         let dateOptions = [];
         try {
@@ -2418,6 +2467,8 @@ RECORDING_PUBLIC_TEMPLATE = """
         }
         const optionByDate = new Map(dateOptions.map((option) => [option.date, option]));
         const monthFormatter = new Intl.DateTimeFormat(undefined, { month: "long", year: "numeric" });
+        const monthNameFormatter = new Intl.DateTimeFormat(undefined, { month: "long" });
+        const monthNames = Array.from({ length: 12 }, (_, month) => monthNameFormatter.format(new Date(2024, month, 1)));
         const parseDate = (value) => {
           const [year, month, day] = String(value || "").split("-").map(Number);
           return new Date(year || 1970, (month || 1) - 1, day || 1);
@@ -2447,6 +2498,46 @@ RECORDING_PUBLIC_TEMPLATE = """
           selectedLabel.textContent = option ? option.label : "Available days are highlighted.";
         };
 
+        const setJumpOpen = (isOpen) => {
+          jumpPanel.hidden = !isOpen;
+          jumpToggle.setAttribute("aria-expanded", String(isOpen));
+        };
+
+        const syncJumpControls = (available) => {
+          const currentYear = currentMonth.getFullYear();
+          const years = Array.from(new Set(available.map((option) => parseDate(option.date).getFullYear())))
+            .sort((a, b) => b - a);
+          if (!years.includes(currentYear)) {
+            years.unshift(currentYear);
+          }
+
+          monthSelect.replaceChildren(...monthNames.map((name, month) => {
+            const option = document.createElement("option");
+            option.value = String(month);
+            option.textContent = name;
+            return option;
+          }));
+          yearSelect.replaceChildren(...years.map((year) => {
+            const option = document.createElement("option");
+            option.value = String(year);
+            option.textContent = String(year);
+            return option;
+          }));
+          monthSelect.value = String(currentMonth.getMonth());
+          yearSelect.value = String(currentYear);
+          const disabled = !available.length;
+          monthSelect.disabled = disabled;
+          yearSelect.disabled = disabled;
+          jumpToggle.disabled = disabled;
+        };
+
+        const jumpToSelectedMonth = () => {
+          const year = Number(yearSelect.value) || currentMonth.getFullYear();
+          const month = Number(monthSelect.value);
+          currentMonth = new Date(year, Number.isFinite(month) ? month : currentMonth.getMonth(), 1);
+          renderCalendar();
+        };
+
         const renderCalendar = () => {
           const available = relevantOptions();
           const availableDates = new Set(available.map((option) => option.date));
@@ -2461,10 +2552,12 @@ RECORDING_PUBLIC_TEMPLATE = """
             grid.appendChild(empty);
             monthLabel.textContent = "No available dates";
             selectedLabel.textContent = "Choose another recording type.";
+            syncJumpControls(available);
             return;
           }
 
           monthLabel.textContent = monthFormatter.format(currentMonth);
+          syncJumpControls(available);
           grid.replaceChildren();
           const year = currentMonth.getFullYear();
           const month = currentMonth.getMonth();
@@ -2505,6 +2598,9 @@ RECORDING_PUBLIC_TEMPLATE = """
           currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 1);
           renderCalendar();
         });
+        jumpToggle.addEventListener("click", () => setJumpOpen(jumpPanel.hidden));
+        monthSelect.addEventListener("change", jumpToSelectedMonth);
+        yearSelect.addEventListener("change", jumpToSelectedMonth);
         kindSelect.addEventListener("change", () => {
           currentMonth = firstMonthForKind();
           renderCalendar();
