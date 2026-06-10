@@ -324,7 +324,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         if guard:
             return guard
         status_filter = (request.args.get("status") or "needs_review").strip().lower()
-        if status_filter not in {"needs_review", "identified", "not_testimony", "already_named", "all"}:
+        if status_filter == "already_named":
+            status_filter = "identified"
+        if status_filter not in {"needs_review", "identified", "not_testimony", "all"}:
             status_filter = "needs_review"
         sort = (request.args.get("sort") or "shortest").strip().lower()
         if sort not in {"shortest", "newest", "name"}:
@@ -336,7 +338,12 @@ def create_app(test_config: dict | None = None) -> Flask:
         limit = min(max(limit, 1), 500)
         items = _testimony_review_items(app)
         counts = _testimony_status_counts(items)
-        visible_items = items if status_filter == "all" else [item for item in items if item["status"] == status_filter]
+        if status_filter == "all":
+            visible_items = items
+        elif status_filter == "identified":
+            visible_items = [item for item in items if item["status"] in {"identified", "already_named"}]
+        else:
+            visible_items = [item for item in items if item["status"] == status_filter]
         _sort_testimony_items(visible_items, sort)
         visible_items = visible_items[:limit]
         root = _testimony_source_root(app)
@@ -368,10 +375,15 @@ def create_app(test_config: dict | None = None) -> Flask:
             limit = int(app.config.get("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT") or 80)
         limit = min(max(limit, 1), 120)
         probed, skipped = _probe_missing_testimony_durations(app, limit)
+        current_filter = (request.form.get("status") or "needs_review").strip().lower()
+        if current_filter == "already_named":
+            current_filter = "identified"
+        if current_filter not in {"needs_review", "identified", "not_testimony", "all"}:
+            current_filter = "needs_review"
         return redirect(
             url_for(
                 "testimony_review",
-                status=request.form.get("status") or "needs_review",
+                status=current_filter,
                 sort=request.form.get("sort") or "shortest",
                 message=f"Checked {probed + skipped} testimony source file{'s' if probed + skipped != 1 else ''}; saved {probed} duration{'s' if probed != 1 else ''}.",
             )
@@ -382,9 +394,14 @@ def create_app(test_config: dict | None = None) -> Flask:
         guard = _require_admin()
         if guard:
             return guard
-        candidate = _testimony_source_recording_by_id(app, recording_id)
+        current_filter = (request.form.get("status_filter") or "needs_review").strip().lower()
+        if current_filter == "already_named":
+            current_filter = "identified"
+        if current_filter not in {"needs_review", "identified", "not_testimony", "all"}:
+            current_filter = "needs_review"
+        candidate = _testimony_source_recording_from_form(app, recording_id)
         if not candidate:
-            return redirect(url_for("testimony_review", error="Testimony source recording was not found."))
+            return redirect(url_for("testimony_review", status=current_filter, error="Testimony source recording was not found."))
         status = (request.form.get("status") or "identified").strip().lower()
         if status not in {"needs_review", "identified", "not_testimony"}:
             status = "identified"
@@ -400,8 +417,26 @@ def create_app(test_config: dict | None = None) -> Flask:
         notes = str(existing["notes"] or "") if existing else ""
         duration_seconds = _row_duration(existing) if existing else None
         proposed_path = ""
+        save_message = "Testimony review saved."
         if status == "identified":
             proposed_path = _proposed_testimony_path(app, Path(candidate.path), service_date, speaker_name, testimony_title)
+            renamed_candidate, proposed_path, rename_error = _rename_testimony_recording(
+                app,
+                candidate,
+                service_date=service_date,
+                speaker_name=speaker_name,
+                testimony_title=testimony_title,
+            )
+            if renamed_candidate.id != recording_id:
+                _delete_testimony_review(app, recording_id)
+            candidate = renamed_candidate
+            if not rename_error:
+                _replace_indexed_recording(app, recording_id, candidate)
+            recording_id = candidate.id
+            if rename_error:
+                save_message = f"Testimony review saved. {rename_error}"
+            else:
+                save_message = f"Testimony review saved and renamed to {Path(proposed_path).name}."
         _save_testimony_review(
             app,
             recording_id=recording_id,
@@ -417,9 +452,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         return redirect(
             url_for(
                 "testimony_review",
-                status=status,
+                status=current_filter,
                 sort=request.form.get("sort") or "shortest",
-                message="Testimony review saved.",
+                message=save_message,
             )
         )
 
@@ -441,13 +476,14 @@ def create_app(test_config: dict | None = None) -> Flask:
         guard = _require_admin()
         if guard:
             return guard
+        target_tab = _request_return_tab()
         row = _get_request(app, request_id)
         if not row:
-            return redirect(url_for("admin_panel", tab="pending", error="Request was not found."))
+            return redirect(url_for("admin_panel", tab=target_tab, error="Request was not found."))
         recording_id = (request.form.get("recording_id") or "").strip()
         candidate = _recording_target_by_id(app, recording_id)
         if not candidate:
-            return redirect(url_for("admin_panel", tab="pending", error="Selected recording was not found."))
+            return redirect(url_for("admin_panel", tab=target_tab, error="Selected recording was not found."))
         email_message = (request.form.get("email_message") or "").strip()
         if not email_message:
             email_message = _default_recording_email_message(row, candidate)
@@ -469,8 +505,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             email_message=email_message,
         )
         if email_sent:
-            return redirect(url_for("admin_panel", tab="completed", message=f"Recording link emailed to {row['email']}."))
-        return redirect(url_for("admin_panel", tab="completed", message="Share link is ready."))
+            return redirect(url_for("admin_panel", tab=target_tab, message=f"Recording link emailed to {row['email']}."))
+        return redirect(url_for("admin_panel", tab=target_tab, message="Share link is ready."))
 
     @app.post("/admin/requests/<int:request_id>/revoke")
     def revoke_request_link(request_id: int):
@@ -480,16 +516,12 @@ def create_app(test_config: dict | None = None) -> Flask:
         row = _get_request(app, request_id)
         if not row:
             return redirect(url_for("admin_panel", tab="pending", error="Request was not found."))
-        target_tab = (request.form.get("tab") or "").strip().lower()
-        if target_tab in {"active", "closed", "archived"}:
-            target_tab = "completed"
-        if target_tab not in {"pending", "completed"}:
-            target_tab = "completed"
+        target_tab = _request_return_tab(default="completed")
         revoke_error = _revoke_share_link(app, row)
         _mark_request_revoked(app, request_id, revoke_error=revoke_error)
         if revoke_error:
-            return redirect(url_for("admin_panel", tab="completed", error=f"Request closed locally. Revoke warning: {revoke_error}"))
-        return redirect(url_for("admin_panel", tab="completed", message="Recording access revoked."))
+            return redirect(url_for("admin_panel", tab=target_tab, error=f"Request closed locally. Revoke warning: {revoke_error}"))
+        return redirect(url_for("admin_panel", tab=target_tab, message="Recording access revoked."))
 
     @app.post("/admin/requests/<int:request_id>/archive")
     def archive_request(request_id: int):
@@ -497,12 +529,13 @@ def create_app(test_config: dict | None = None) -> Flask:
         if guard:
             return guard
         row = _get_request(app, request_id)
+        target_tab = _request_return_tab(default="completed")
         if not row:
-            return redirect(url_for("admin_panel", tab="completed", error="Request was not found."))
+            return redirect(url_for("admin_panel", tab=target_tab, error="Request was not found."))
         if row["status"] != "revoked":
-            return redirect(url_for("admin_panel", tab="completed", error="Revoke access before archiving a request."))
+            return redirect(url_for("admin_panel", tab=target_tab, error="Revoke access before archiving a request."))
         _archive_request(app, request_id)
-        return redirect(url_for("admin_panel", tab="completed", message="Request archived."))
+        return redirect(url_for("admin_panel", tab=target_tab, message="Request archived."))
 
     @app.get("/share/<token>")
     def share_recording(token: str):
@@ -860,6 +893,14 @@ def _path_allowed(app: Flask, path: Path) -> bool:
     return False
 
 
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (FileNotFoundError, ValueError):
+        return False
+
+
 def _folder_audio_items(app: Flask, path: Path) -> list[str]:
     if not _path_allowed(app, path) or not path.exists() or not path.is_dir():
         return []
@@ -1041,6 +1082,52 @@ def _load_indexed_recordings(app: Flask) -> list[RecordingCandidate]:
             """
         ).fetchall()
     return [_recording_candidate_from_row(row) for row in rows]
+
+
+def _replace_indexed_recording(app: Flask, old_recording_id: str, recording: RecordingCandidate) -> None:
+    indexed_at = _utc_now()
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        if old_recording_id and old_recording_id != recording.id:
+            connection.execute("DELETE FROM recording_library WHERE id = ?", (old_recording_id,))
+        connection.execute(
+            """
+            INSERT INTO recording_library (
+                id,
+                path,
+                title,
+                recording_date,
+                kind,
+                size_bytes,
+                modified_at,
+                relative_path,
+                root_path,
+                indexed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                path = excluded.path,
+                title = excluded.title,
+                recording_date = excluded.recording_date,
+                kind = excluded.kind,
+                size_bytes = excluded.size_bytes,
+                modified_at = excluded.modified_at,
+                relative_path = excluded.relative_path,
+                root_path = excluded.root_path,
+                indexed_at = excluded.indexed_at
+            """,
+            (
+                recording.id,
+                recording.path,
+                recording.title,
+                recording.recording_date,
+                recording.kind,
+                recording.size_bytes,
+                recording.modified_at,
+                recording.relative_path,
+                _matched_library_root(app, Path(recording.path)),
+                indexed_at,
+            ),
+        )
 
 
 def _recording_candidate_from_row(row: sqlite3.Row) -> RecordingCandidate:
@@ -1264,6 +1351,15 @@ def _request_group_label(kind: str) -> str:
     return labels.get(kind, "Recording Requests")
 
 
+def _request_return_tab(default: str = "pending") -> str:
+    target_tab = (request.form.get("tab") or default).strip().lower()
+    if target_tab in {"active", "closed", "archived"}:
+        return "completed"
+    if target_tab not in {"pending", "completed"}:
+        return default if default in {"pending", "completed"} else "pending"
+    return target_tab
+
+
 def _testimony_source_root(app: Flask) -> Path:
     default_source = str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R")
     configured_value = app.config.get("NTC_RECORDINGS_TESTIMONY_SOURCE_DIR") or ""
@@ -1332,10 +1428,53 @@ def _testimony_source_candidates(app: Flask) -> list[RecordingCandidate]:
     return candidates
 
 
+def _testimony_source_candidate_from_path(app: Flask, path: Path) -> RecordingCandidate | None:
+    root = _testimony_source_root(app)
+    message_root = _message_recording_root(app)
+    if not _path_within(path, root) and not _path_within(path, message_root):
+        return None
+    if not path.exists() or not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+        return None
+    if path.name.startswith("._") or any(part.startswith(".") for part in path.parts):
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    recording_date = _extract_recording_date(" ".join(path.parts)) or _date_from_file_metadata(stat) or ""
+    try:
+        relative_path = str(path.relative_to(message_root))
+    except ValueError:
+        try:
+            relative_path = str(path.relative_to(root))
+        except ValueError:
+            relative_path = path.name
+    kind = "testimony" if _raw_testimony_name(path) else "message"
+    return RecordingCandidate(
+        id=_recording_id(path),
+        path=str(path),
+        title=_display_title(path),
+        recording_date=recording_date,
+        kind=kind,
+        size_bytes=stat.st_size,
+        modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+        relative_path=relative_path,
+    )
+
+
 def _testimony_source_recording_by_id(app: Flask, recording_id: str) -> RecordingCandidate | None:
     if not recording_id:
         return None
     return next((item for item in _testimony_source_candidates(app) if item.id == recording_id), None)
+
+
+def _testimony_source_recording_from_form(app: Flask, recording_id: str) -> RecordingCandidate | None:
+    form_path = (request.form.get("source_path") or "").strip()
+    if form_path:
+        candidate = _testimony_source_candidate_from_path(app, Path(form_path))
+        if candidate and candidate.id == recording_id:
+            return candidate
+    return _testimony_source_recording_by_id(app, recording_id)
 
 
 def _raw_testimony_name(path: Path) -> bool:
@@ -1417,6 +1556,8 @@ def _testimony_status_counts(items: Iterable[dict]) -> dict[str, int]:
     for item in items:
         status = item.get("status") if item.get("status") in counts else "needs_review"
         counts[status] += 1
+        if status == "already_named":
+            counts["identified"] += 1
         counts["all"] += 1
     return counts
 
@@ -1502,6 +1643,56 @@ def _save_testimony_review(
                 _utc_now(),
             ),
         )
+
+
+def _delete_testimony_review(app: Flask, recording_id: str) -> None:
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute("DELETE FROM testimony_reviews WHERE recording_id = ?", (recording_id,))
+
+
+def _unique_destination_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{path.stem} - {index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"No available filename near {path}")
+
+
+def _rename_testimony_recording(
+    app: Flask,
+    candidate: RecordingCandidate,
+    *,
+    service_date: str,
+    speaker_name: str,
+    testimony_title: str,
+) -> tuple[RecordingCandidate, str, str]:
+    source_path = Path(candidate.path)
+    proposed_path = Path(_proposed_testimony_path(app, source_path, service_date, speaker_name, testimony_title))
+    message_root = _message_recording_root(app)
+    source_root = _testimony_source_root(app)
+    if not _path_within(source_path, source_root) and not _path_within(source_path, message_root):
+        return candidate, str(proposed_path), "Source file is outside the testimony recording folder."
+    if not _path_within(proposed_path, message_root):
+        return candidate, str(proposed_path), "Proposed testimony filename is outside MessageRecordings."
+    try:
+        resolved_source = source_path.resolve()
+        resolved_target = proposed_path.resolve()
+    except FileNotFoundError:
+        return candidate, str(proposed_path), "Source file was not found."
+    if resolved_source == resolved_target:
+        return candidate, str(proposed_path), ""
+    try:
+        proposed_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path = _unique_destination_path(proposed_path)
+        source_path.rename(target_path)
+    except OSError as exc:
+        return candidate, str(proposed_path), f"File rename failed: {exc}"
+    renamed = _testimony_source_candidate_from_path(app, target_path)
+    if not renamed:
+        return candidate, str(target_path), "File was renamed but could not be reloaded."
+    return renamed, str(target_path), ""
 
 
 def _probe_missing_testimony_durations(app: Flask, limit: int) -> tuple[int, int]:
@@ -1624,7 +1815,7 @@ def _proposed_testimony_path(
     normalized_date = _normalize_date(service_date or "") or ""
     if normalized_date:
         year = normalized_date[:4]
-        date_prefix = normalized_date.replace("-", "")
+        date_prefix = _format_date(normalized_date)
     else:
         year = "Unsorted"
         date_prefix = _sanitize_filename_part(source_path.stem) or "Undated"
@@ -3148,6 +3339,7 @@ RECORDING_ADMIN_TEMPLATE = """
 	                              </div>
 	                              <div class="request-actions">
 	                                <form method="post" action="{{ url_for('archive_request', request_id=item.id) }}">
+	                                  <input type="hidden" name="tab" value="{{ active_tab }}">
 	                                  <button type="submit">Archive</button>
 	                                </form>
 	                              </div>
@@ -3157,6 +3349,7 @@ RECORDING_ADMIN_TEMPLATE = """
 	                            {% set candidates = candidates_by_request.get(item.id, []) %}
 	                            {% if candidates %}
 	                              <form class="approve-form" method="post" action="{{ url_for('send_request_link', request_id=item.id) }}">
+	                                <input type="hidden" name="tab" value="{{ active_tab }}">
 	                                <div class="approval-head">
 	                                  <div>
 	                                    <div class="meta">{{ "Delivery Retry" if item.status == "ready" else "Approval" }}</div>
@@ -3317,7 +3510,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .banner.error { border-color:rgba(255,154,154,.4); background:var(--bad-soft); color:#ffaaaa; }
       .metrics {
         display:grid;
-        grid-template-columns:repeat(5,minmax(0,1fr));
+        grid-template-columns:repeat(4,minmax(0,1fr));
         gap:.65rem;
         margin:.65rem 0 1rem;
       }
@@ -3578,14 +3771,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
       {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
       <section class="metrics" aria-label="Testimony review status">
         <div class="metric"><span>Needs Review</span><strong>{{ counts.needs_review }}</strong><small>Awaiting identification</small></div>
-        <div class="metric"><span>Identified</span><strong>{{ counts.identified }}</strong><small>Speaker confirmed</small></div>
+        <div class="metric"><span>Identified</span><strong>{{ counts.identified }}</strong><small>Speaker confirmed or already named</small></div>
         <div class="metric"><span>Not Testimony</span><strong>{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
-        <div class="metric"><span>Already Named</span><strong>{{ counts.already_named }}</strong><small>Testimony is in the filename</small></div>
         <div class="metric"><span>Files Found</span><strong>{{ counts.all }}</strong><small>Folder connected</small></div>
       </section>
       <div class="toolbar">
         <nav class="tabs" aria-label="Testimony review filters">
-          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("not_testimony", "Not Testimony"), ("already_named", "Already Named"), ("all", "All")] %}
+          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("not_testimony", "Not Testimony"), ("all", "All")] %}
             <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong>{{ counts[key] }}</strong></a>
           {% endfor %}
         </nav>
@@ -3665,6 +3857,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
                   </section>
                   <form class="review-form" method="post" action="{{ url_for('update_testimony_review', recording_id=item.id) }}">
                     <input type="hidden" name="sort" value="{{ sort }}">
+                    <input type="hidden" name="status_filter" value="{{ status_filter }}">
+                    <input type="hidden" name="source_path" value="{{ item.source_path }}">
                     <section class="edit-panel">
                       <div class="form-grid">
                         <label>

@@ -213,10 +213,15 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(prepared.status_code, 200)
         self.assertIn(b"Share link is ready", prepared.data)
-        self.assertIn(b"Open prepared share link", prepared.data)
-        self.assertIn(b"Custom note for this request.", prepared.data)
+        self.assertIn(b"Pending Requests", prepared.data)
+        self.assertNotIn(b"Open prepared share link", prepared.data)
 
-        html = prepared.data.decode("utf-8")
+        completed = self.client.get("/admin/panel?tab=completed")
+        self.assertEqual(completed.status_code, 200)
+        self.assertIn(b"Open prepared share link", completed.data)
+        self.assertIn(b"Custom note for this request.", completed.data)
+
+        html = completed.data.decode("utf-8")
         token_start = html.index("/share/") + len("/share/")
         token_end = html.index('"', token_start)
         token = html[token_start:token_end]
@@ -283,8 +288,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
             data={"recording_id": recording_id},
             follow_redirects=True,
         )
-        self.assertIn(b"Completed Requests", prepared.data)
-        self.assertIn(b"completed-row", prepared.data)
+        self.assertIn(b"Pending Requests", prepared.data)
+        self.assertIn(b"No pending requests", prepared.data)
 
         archived = self.client.post("/admin/requests/1/archive", follow_redirects=True)
 
@@ -389,10 +394,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(prepared.status_code, 200)
-        self.assertIn(b"https://nextcloud.example.test/s/share-token", prepared.data)
-        self.assertIn(b"Link prepared", prepared.data)
-        self.assertNotIn(b"Share provider: nextcloud", prepared.data)
-        self.assertIn(b"Completed Requests", prepared.data)
+        self.assertIn(b"Pending Requests", prepared.data)
+        completed = self.client.get("/admin/panel?tab=completed")
+        self.assertIn(b"https://nextcloud.example.test/s/share-token", completed.data)
+        self.assertIn(b"Link prepared", completed.data)
+        self.assertNotIn(b"Share provider: nextcloud", completed.data)
+        self.assertIn(b"Completed Requests", completed.data)
         get.assert_called_once()
         post.assert_called_once()
         self.assertEqual(post.call_args.kwargs["data"]["path"], "/Recordings/MessageRecordings/20260419 - Jesus Is Our Peace - Bro Blessen.mp3")
@@ -438,10 +445,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "/admin/requests/1/send",
                 data={"recording_id": recording_id},
                 follow_redirects=True,
-            )
+        )
 
         self.assertEqual(prepared.status_code, 200)
-        self.assertIn(b"https://nextcloud.example.test/s/worship-folder", prepared.data)
+        completed = self.client.get("/admin/panel?tab=completed")
+        self.assertIn(b"https://nextcloud.example.test/s/worship-folder", completed.data)
         self.assertEqual(
             post.call_args.kwargs["data"]["path"],
             "/Worship Recordings/2026/April/April 19, 2026 - Sunday Service",
@@ -481,10 +489,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "/admin/requests/1/send",
                 data={"recording_id": recording_id},
                 follow_redirects=True,
-            )
+        )
 
         self.assertEqual(prepared.status_code, 200)
-        self.assertIn(b"https://nextcloud.example.test/s/existing-share", prepared.data)
+        completed = self.client.get("/admin/panel?tab=completed")
+        self.assertIn(b"https://nextcloud.example.test/s/existing-share", completed.data)
         get.assert_called_once()
         post.assert_not_called()
 
@@ -522,7 +531,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b"Final Title", review.data)
         self.assertNotIn(b"Voice / ID Notes", review.data)
         self.assertNotIn(b"Proposed Destination", review.data)
+        self.assertNotIn(b"Already Named", review.data)
         self.assertNotIn(b"20250413 - Sister Rachel", review.data)
+
+        identified = self.client.get("/admin/testimonies?status=identified")
+        self.assertEqual(identified.status_code, 200)
+        self.assertIn(b"20250413 - Sister Rachel", identified.data)
 
         recording_id = _recording_id(raw_recording)
         audio = self.client.get(f"/admin/testimonies/audio/{recording_id}")
@@ -533,27 +547,41 @@ class RecordingRequestPanelTests(unittest.TestCase):
             f"/admin/testimonies/{recording_id}/review",
             data={
                 "status": "identified",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
                 "speaker_name": "Sister Test",
             },
             follow_redirects=True,
         )
 
         self.assertEqual(saved.status_code, 200)
-        self.assertIn(b"Testimony review saved", saved.data)
-        self.assertIn(b"Sister Test", saved.data)
+        self.assertIn(b"Testimony review saved and renamed", saved.data)
+        self.assertIn(b"Needs Review", saved.data)
         self.assertNotIn(b"20260419 - Sister Test&#39;s Testimony.mp3", saved.data)
         self.assertNotIn(b"Sunday Testimonies", saved.data)
 
+        renamed_path = self.root / "2026" / "Sunday Testimonies" / "April 19, 2026 - Sister Test's Testimony.mp3"
+        self.assertFalse(raw_recording.exists())
+        self.assertTrue(renamed_path.exists())
+        self.assertEqual(renamed_path.read_bytes(), b"raw-testimony-audio")
+
         with sqlite3.connect(self.db_path) as connection:
-            row = connection.execute(
-                "SELECT service_date, testimony_title, proposed_path FROM testimony_reviews WHERE recording_id = ?",
+            old_row = connection.execute(
+                "SELECT recording_id FROM testimony_reviews WHERE recording_id = ?",
                 (recording_id,),
             ).fetchone()
+            new_recording_id = _recording_id(renamed_path)
+            row = connection.execute(
+                "SELECT service_date, testimony_title, proposed_path FROM testimony_reviews WHERE recording_id = ?",
+                (new_recording_id,),
+            ).fetchone()
 
+        self.assertIsNone(old_row)
+        self.assertIsNotNone(row)
         self.assertEqual(row[0], "2026-04-19")
         self.assertEqual(row[1], "Sister Test's Testimony")
         self.assertIn("Sunday Testimonies", row[2])
-        self.assertTrue(row[2].endswith("20260419 - Sister Test's Testimony.mp3"))
+        self.assertTrue(row[2].endswith("April 19, 2026 - Sister Test's Testimony.mp3"))
 
     def test_legacy_testimony_source_config_still_works(self):
         legacy_root = self.root / "LegacyRecorder"
