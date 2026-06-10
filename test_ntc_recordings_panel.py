@@ -583,6 +583,15 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("Sunday Testimonies", row[2])
         self.assertTrue(row[2].endswith("April 19, 2026 - Sister Test's Testimony.mp3"))
 
+        identified_after_save = self.client.get("/admin/testimonies?status=identified")
+        self.assertEqual(identified_after_save.status_code, 200)
+        self.assertIn(b"Sister Test", identified_after_save.data)
+        self.assertIn(b"April 19, 2026 - Sister Test", identified_after_save.data)
+
+        renamed_audio = self.client.get(f"/admin/testimonies/audio/{new_recording_id}")
+        self.assertEqual(renamed_audio.status_code, 200)
+        self.assertEqual(renamed_audio.data, b"raw-testimony-audio")
+
     def test_legacy_testimony_source_config_still_works(self):
         legacy_root = self.root / "LegacyRecorder"
         legacy_root.mkdir()

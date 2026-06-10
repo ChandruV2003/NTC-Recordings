@@ -465,6 +465,10 @@ def create_app(test_config: dict | None = None) -> Flask:
             return guard
         candidate = _testimony_source_recording_by_id(app, recording_id)
         if not candidate:
+            row = _testimony_review_row(app, recording_id)
+            if row:
+                candidate = _testimony_candidate_from_review_row(app, row)
+        if not candidate:
             return jsonify({"error": "recording was not found"}), 404
         path = Path(candidate.path)
         if not _path_allowed(app, path) or not path.exists() or not path.is_file():
@@ -1493,52 +1497,81 @@ def _testimony_review_rows(app: Flask) -> dict[str, sqlite3.Row]:
     return {row["recording_id"]: row for row in rows}
 
 
+def _testimony_candidate_from_review_row(app: Flask, row: sqlite3.Row) -> RecordingCandidate | None:
+    for key in ("source_path", "proposed_path"):
+        value = str(row[key] or "").strip()
+        if not value:
+            continue
+        candidate = _testimony_source_candidate_from_path(app, Path(value))
+        if candidate:
+            return candidate
+    return None
+
+
+def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlite3.Row | None) -> dict:
+    duration_seconds = _row_duration(row) if row else None
+    status = _testimony_status_for_candidate(app, candidate, row, duration_seconds)
+    service_date = str(row["service_date"] or "") if row else ""
+    speaker_name = str(row["speaker_name"] or "") if row else ""
+    testimony_title = str(row["testimony_title"] or "") if row else ""
+    notes = str(row["notes"] or "") if row else ""
+    proposed_path = str(row["proposed_path"] or "") if row else ""
+    if not service_date:
+        service_date = candidate.recording_date
+    if not proposed_path and status == "identified":
+        proposed_path = _proposed_testimony_path(
+            app,
+            Path(candidate.path),
+            service_date,
+            speaker_name,
+            testimony_title,
+        )
+    return {
+        "id": candidate.id,
+        "title": candidate.title,
+        "source_path": candidate.path,
+        "source_label": Path(candidate.path).name,
+        "relative_path": candidate.relative_path,
+        "recording_date": candidate.recording_date,
+        "service_date": service_date,
+        "speaker_name": speaker_name,
+        "testimony_title": testimony_title,
+        "notes": notes,
+        "proposed_path": proposed_path,
+        "duration_seconds": duration_seconds,
+        "duration_label": _format_duration(duration_seconds),
+        "size_label": _human_size(candidate.size_bytes),
+        "modified_at": candidate.modified_at,
+        "modified_label": _format_datetime(candidate.modified_at),
+        "status": status,
+        "status_label": _testimony_status_label(status),
+        "audio_url": url_for("testimony_audio", recording_id=candidate.id),
+        "extension": Path(candidate.path).suffix.lower(),
+    }
+
+
 def _testimony_review_items(app: Flask) -> list[dict]:
     rows = _testimony_review_rows(app)
     items = []
+    seen_row_ids = set()
+    seen_paths = set()
     for candidate in _testimony_source_candidates(app):
         row = rows.get(candidate.id)
-        duration_seconds = _row_duration(row) if row else None
-        status = _testimony_status_for_candidate(app, candidate, row, duration_seconds)
-        service_date = str(row["service_date"] or "") if row else ""
-        speaker_name = str(row["speaker_name"] or "") if row else ""
-        testimony_title = str(row["testimony_title"] or "") if row else ""
-        notes = str(row["notes"] or "") if row else ""
-        proposed_path = str(row["proposed_path"] or "") if row else ""
-        if not service_date:
-            service_date = candidate.recording_date
-        if not proposed_path and status == "identified":
-            proposed_path = _proposed_testimony_path(
-                app,
-                Path(candidate.path),
-                service_date,
-                speaker_name,
-                testimony_title,
-            )
-        items.append(
-            {
-                "id": candidate.id,
-                "title": candidate.title,
-                "source_path": candidate.path,
-                "source_label": Path(candidate.path).name,
-                "relative_path": candidate.relative_path,
-                "recording_date": candidate.recording_date,
-                "service_date": service_date,
-                "speaker_name": speaker_name,
-                "testimony_title": testimony_title,
-                "notes": notes,
-                "proposed_path": proposed_path,
-                "duration_seconds": duration_seconds,
-                "duration_label": _format_duration(duration_seconds),
-                "size_label": _human_size(candidate.size_bytes),
-                "modified_at": candidate.modified_at,
-                "modified_label": _format_datetime(candidate.modified_at),
-                "status": status,
-                "status_label": _testimony_status_label(status),
-                "audio_url": url_for("testimony_audio", recording_id=candidate.id),
-                "extension": Path(candidate.path).suffix.lower(),
-            }
-        )
+        if row:
+            seen_row_ids.add(str(row["recording_id"]))
+        seen_paths.add(candidate.path)
+        items.append(_testimony_review_item(app, candidate, row))
+
+    for row_id, row in rows.items():
+        if row_id in seen_row_ids:
+            continue
+        candidate = _testimony_candidate_from_review_row(app, row)
+        if not candidate or candidate.path in seen_paths:
+            continue
+        seen_row_ids.add(row_id)
+        seen_paths.add(candidate.path)
+        items.append(_testimony_review_item(app, candidate, row))
+
     return items
 
 
