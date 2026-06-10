@@ -2268,18 +2268,19 @@ RECORDING_PUBLIC_TEMPLATE = """
         display:grid;
         gap:.22rem;
         color:var(--muted);
-        font:800 .58rem var(--mono);
+        font:900 .68rem var(--mono);
         letter-spacing:.08em;
         text-transform:uppercase;
       }
       .calendar-jump select {
-        min-height:2.4rem;
+        min-height:2.75rem;
         border-radius:12px;
-        padding:.45rem .55rem;
-        font:800 .82rem var(--sans);
+        padding:.52rem .7rem;
+        font:900 1rem var(--sans);
         letter-spacing:0;
         text-transform:none;
       }
+      .calendar-jump select option { font-size:1rem; }
       .calendar-weekdays,
       .calendar-grid {
         display:grid;
@@ -2355,6 +2356,8 @@ RECORDING_PUBLIC_TEMPLATE = """
         .calendar-picker { padding:.65rem; }
         .calendar-day { min-height:2.65rem; border-radius:11px; }
         .calendar-day small { display:none; }
+        .calendar-jump label { font-size:.64rem; }
+        .calendar-jump select { min-height:2.45rem; font-size:.94rem; padding:.45rem .58rem; }
       }
     </style>
   </head>
