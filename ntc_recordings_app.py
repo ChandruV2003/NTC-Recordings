@@ -105,7 +105,10 @@ def create_app(test_config: dict | None = None) -> Flask:
         NTC_RECORDINGS_MAX_SCAN_FILES=int(os.getenv("NTC_RECORDINGS_MAX_SCAN_FILES", "4000")),
         NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT", "80")),
         NTC_RECORDINGS_TESTIMONY_MIN_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_MIN_SECONDS", "45")),
-        NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL=os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL", ""),
+        NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL=(
+            os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL")
+            or os.getenv("NTC_TRANSCRIPTION_LOCAL_URL", "")
+        ),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_SECONDS", "90")),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT=float(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT", "120")),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_PROMPT=os.getenv(
@@ -148,6 +151,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     install_branding(app)
     _init_db(app.config["NTC_RECORDINGS_DB_PATH"])
     app.recordings_index_lock = threading.Lock()
+    app.testimony_suggestion_job_lock = threading.Lock()
+    app.testimony_suggestion_job = _initial_testimony_suggestion_job_state()
 
     def _admin_password() -> str:
         return (
@@ -372,6 +377,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             status_label=_testimony_status_label,
             format_date=_format_date,
             speaker_names=_testimony_known_speakers(app),
+            suggestion_job=_testimony_suggestion_job_status(app),
         )
 
     @app.post("/admin/testimonies/probe")
@@ -399,6 +405,37 @@ def create_app(test_config: dict | None = None) -> Flask:
             )
         )
 
+    @app.post("/admin/testimonies/suggest-all")
+    def suggest_all_testimony_speakers():
+        guard = _require_admin()
+        if guard:
+            return guard
+        current_filter = (request.form.get("status") or "needs_review").strip().lower()
+        if current_filter == "already_named":
+            current_filter = "identified"
+        if current_filter not in {"needs_review", "identified", "not_testimony", "all"}:
+            current_filter = "needs_review"
+        started = _start_testimony_suggestion_job(app)
+        if started:
+            message = "Started testimony speaker suggestion processing."
+        else:
+            message = "Testimony speaker suggestion processing is already running."
+        return redirect(
+            url_for(
+                "testimony_review",
+                status=current_filter,
+                sort=request.form.get("sort") or "shortest",
+                message=message,
+            )
+        )
+
+    @app.get("/admin/testimonies/suggest-status")
+    def testimony_suggestion_status():
+        guard = _require_admin()
+        if guard:
+            return guard
+        return jsonify(_testimony_suggestion_job_status(app))
+
     @app.post("/admin/testimonies/<recording_id>/suggest")
     def suggest_testimony_speaker(recording_id: str):
         guard = _require_admin()
@@ -411,6 +448,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             current_filter = "needs_review"
         candidate = _testimony_source_recording_from_form(app, recording_id)
         if not candidate:
+            if _wants_json_response():
+                return jsonify({"ok": False, "error": "Testimony source recording was not found."}), 404
             return redirect(url_for("testimony_review", status=current_filter, error="Testimony source recording was not found."))
 
         existing = _testimony_review_row(app, recording_id)
@@ -449,6 +488,18 @@ def create_app(test_config: dict | None = None) -> Flask:
             message = f"Suggested speaker: {suggested_speaker}."
         else:
             message = suggestion_error or "No speaker suggestion found."
+        if _wants_json_response():
+            return jsonify(
+                {
+                    "ok": True,
+                    "message": message,
+                    "recording_id": recording_id,
+                    "suggested_speaker": suggested_speaker,
+                    "suggestion_source": suggestion_source,
+                    "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
+                    "suggestion_text": suggestion_text,
+                }
+            )
         return redirect(
             url_for(
                 "testimony_review",
@@ -470,7 +521,10 @@ def create_app(test_config: dict | None = None) -> Flask:
             current_filter = "needs_review"
         candidate = _testimony_source_recording_from_form(app, recording_id)
         if not candidate:
+            if _wants_json_response():
+                return jsonify({"ok": False, "error": "Testimony source recording was not found."}), 404
             return redirect(url_for("testimony_review", status=current_filter, error="Testimony source recording was not found."))
+        original_recording_id = recording_id
         status = (request.form.get("status") or "identified").strip().lower()
         if status not in {"needs_review", "identified", "not_testimony"}:
             status = "identified"
@@ -524,6 +578,25 @@ def create_app(test_config: dict | None = None) -> Flask:
             suggestion_source=suggestion_source,
             suggestion_text=suggestion_text,
         )
+        if _wants_json_response():
+            return jsonify(
+                {
+                    "ok": True,
+                    "message": save_message,
+                    "recording_id": recording_id,
+                    "previous_recording_id": original_recording_id,
+                    "status": status,
+                    "status_label": _testimony_status_label(status),
+                    "service_date": service_date,
+                    "service_date_label": _format_date(service_date),
+                    "speaker_name": speaker_name,
+                    "title": candidate.title,
+                    "source_label": Path(candidate.path).name,
+                    "source_path": candidate.path,
+                    "audio_url": url_for("testimony_audio", recording_id=recording_id),
+                    "review_url": url_for("update_testimony_review", recording_id=recording_id),
+                }
+            )
         return redirect(
             url_for(
                 "testimony_review",
@@ -826,6 +899,11 @@ def _status_label(status: str) -> str:
         "revoked": "Revoked",
     }
     return labels.get(status, status.replace("_", " ").title())
+
+
+def _wants_json_response() -> bool:
+    accept = request.headers.get("Accept", "")
+    return request.headers.get("X-Requested-With") == "fetch" or "application/json" in accept
 
 
 def _get_request(app: Flask, request_id: int) -> sqlite3.Row | None:
@@ -1716,6 +1794,198 @@ def _testimony_status_label(status: str) -> str:
         "all": "All",
     }
     return labels.get(status, status.replace("_", " ").title())
+
+
+def _initial_testimony_suggestion_job_state() -> dict:
+    return {
+        "state": "idle",
+        "started_at": "",
+        "finished_at": "",
+        "total": 0,
+        "processed": 0,
+        "found": 0,
+        "checked": 0,
+        "skipped": 0,
+        "errors": 0,
+        "current": "",
+        "message": "",
+    }
+
+
+def _testimony_suggestion_job_status(app: Flask) -> dict:
+    lock = getattr(app, "testimony_suggestion_job_lock", None)
+    if lock:
+        with lock:
+            return dict(getattr(app, "testimony_suggestion_job", _initial_testimony_suggestion_job_state()))
+    return dict(getattr(app, "testimony_suggestion_job", _initial_testimony_suggestion_job_state()))
+
+
+def _update_testimony_suggestion_job(app: Flask, **updates) -> None:
+    with app.testimony_suggestion_job_lock:
+        state = dict(app.testimony_suggestion_job)
+        state.update(updates)
+        app.testimony_suggestion_job = state
+
+
+def _start_testimony_suggestion_job(app: Flask) -> bool:
+    with app.testimony_suggestion_job_lock:
+        if app.testimony_suggestion_job.get("state") == "running":
+            return False
+        app.testimony_suggestion_job = {
+            **_initial_testimony_suggestion_job_state(),
+            "state": "running",
+            "started_at": _utc_now(),
+            "message": "Scanning testimony review queue.",
+        }
+    thread = threading.Thread(target=_run_testimony_suggestion_job, args=(app,), name="testimony-suggestion-job", daemon=True)
+    thread.start()
+    return True
+
+
+def _run_testimony_suggestion_job(app: Flask) -> None:
+    try:
+        with app.app_context():
+            targets = _testimony_suggestion_targets(app)
+            _update_testimony_suggestion_job(app, total=len(targets), message=f"Processing {len(targets)} unidentified recordings.")
+            processed = found = checked = errors = 0
+            skipped = int(_testimony_suggestion_job_status(app).get("skipped") or 0)
+            for target in targets:
+                candidate = target["candidate"]
+                _update_testimony_suggestion_job(app, current=Path(candidate.path).name)
+                try:
+                    duration_seconds = target["duration_seconds"]
+                    status = target["status"]
+                    service_date = target["service_date"]
+                    speaker_name = target["speaker_name"]
+                    testimony_title = target["testimony_title"]
+                    notes = target["notes"]
+                    proposed_path = target["proposed_path"]
+                    suggested_speaker, suggestion_source, suggestion_text, suggestion_error = _generate_testimony_speaker_suggestion(app, candidate)
+                    if suggested_speaker:
+                        found += 1
+                    elif suggestion_source or suggestion_text:
+                        checked += 1
+                    else:
+                        errors += 1
+                        suggestion_source = ""
+                        suggestion_text = suggestion_error or "No speaker suggestion found."
+                    _save_testimony_review(
+                        app,
+                        recording_id=candidate.id,
+                        source_path=candidate.path,
+                        status=status,
+                        service_date=service_date,
+                        speaker_name=speaker_name,
+                        testimony_title=testimony_title,
+                        notes=notes,
+                        proposed_path=proposed_path,
+                        duration_seconds=duration_seconds,
+                        suggested_speaker=suggested_speaker,
+                        suggestion_source=suggestion_source,
+                        suggestion_text=suggestion_text,
+                    )
+                except Exception as exc:
+                    errors += 1
+                    app.logger.exception("testimony suggestion failed for %s", candidate.path)
+                    _save_testimony_review(
+                        app,
+                        recording_id=candidate.id,
+                        source_path=candidate.path,
+                        status=target["status"],
+                        service_date=target["service_date"],
+                        speaker_name=target["speaker_name"],
+                        testimony_title=target["testimony_title"],
+                        notes=target["notes"],
+                        proposed_path=target["proposed_path"],
+                        duration_seconds=target["duration_seconds"],
+                        suggested_speaker="",
+                        suggestion_source="",
+                        suggestion_text=f"Suggestion failed: {exc}",
+                    )
+                processed += 1
+                _update_testimony_suggestion_job(
+                    app,
+                    processed=processed,
+                    found=found,
+                    checked=checked,
+                    skipped=skipped,
+                    errors=errors,
+                    message=f"Processed {processed} of {len(targets)} recordings.",
+                )
+            _update_testimony_suggestion_job(
+                app,
+                state="finished",
+                finished_at=_utc_now(),
+                current="",
+                message=f"Finished. Suggested {found}; checked {checked}; errors {errors}.",
+            )
+    except Exception as exc:
+        app.logger.exception("testimony suggestion job failed")
+        _update_testimony_suggestion_job(
+            app,
+            state="failed",
+            finished_at=_utc_now(),
+            current="",
+            errors=_testimony_suggestion_job_status(app).get("errors", 0) + 1,
+            message=f"Suggestion job failed: {exc}",
+        )
+
+
+def _testimony_suggestion_targets(app: Flask) -> list[dict]:
+    rows = _testimony_review_rows(app)
+    targets = []
+    skipped = 0
+    for candidate in _testimony_source_candidates(app):
+        row = rows.get(candidate.id)
+        duration_seconds = _row_duration(row) if row else None
+        if duration_seconds is None:
+            duration_seconds = _probe_audio_duration(Path(candidate.path))
+        status = _testimony_status_for_candidate(app, candidate, row, duration_seconds)
+        service_date = str(row["service_date"] or "") if row else ""
+        speaker_name = str(row["speaker_name"] or "") if row else ""
+        testimony_title = str(row["testimony_title"] or "") if row else ""
+        notes = str(row["notes"] or "") if row else ""
+        proposed_path = str(row["proposed_path"] or "") if row else ""
+        suggested_speaker = str(row["suggested_speaker"] or "") if row else ""
+        suggestion_source = str(row["suggestion_source"] or "") if row else ""
+        if not service_date:
+            service_date = candidate.recording_date
+        if status == "needs_review" and _duration_is_too_short_for_testimony(app, duration_seconds):
+            status = "not_testimony"
+        if status == "not_testimony" and (not row or _row_duration(row) is None):
+            _save_testimony_review(
+                app,
+                recording_id=candidate.id,
+                source_path=candidate.path,
+                status=status,
+                service_date=service_date,
+                speaker_name=speaker_name,
+                testimony_title=testimony_title,
+                notes=notes,
+                proposed_path=proposed_path,
+                duration_seconds=duration_seconds,
+                suggested_speaker=suggested_speaker,
+                suggestion_source=suggestion_source,
+                suggestion_text=str(row["suggestion_text"] or "") if row else "",
+            )
+        if status != "needs_review" or speaker_name or suggested_speaker or suggestion_source:
+            skipped += 1
+            continue
+        targets.append(
+            {
+                "candidate": candidate,
+                "row": row,
+                "duration_seconds": duration_seconds,
+                "status": status,
+                "service_date": service_date,
+                "speaker_name": speaker_name,
+                "testimony_title": testimony_title,
+                "notes": notes,
+                "proposed_path": proposed_path,
+            }
+        )
+    _update_testimony_suggestion_job(app, skipped=skipped)
+    return targets
 
 
 def _testimony_suggestion_source_label(source: str) -> str:
@@ -3875,6 +4145,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         font-weight:850;
       }
       .banner.error { border-color:rgba(255,154,154,.4); background:var(--bad-soft); color:#ffaaaa; }
+      .banner-stack:empty { display:none; }
       .metrics {
         display:grid;
         grid-template-columns:repeat(4,minmax(0,1fr));
@@ -3899,7 +4170,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .metric small { display:block; margin-top:.32rem; color:var(--muted); line-height:1.35; }
       .toolbar {
         display:grid;
-        grid-template-columns:minmax(0,1fr) auto;
+        grid-template-columns:minmax(0,1fr) auto auto;
         gap:.8rem;
         align-items:center;
         margin:.85rem 0 1rem;
@@ -3952,6 +4223,20 @@ TESTIMONY_REVIEW_TEMPLATE = """
         flex-wrap:wrap;
       }
       .probe-form input { width:5.8rem; }
+      .job-panel {
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:.8rem;
+        margin:-.15rem 0 1rem;
+        border:1px solid rgba(143,211,255,.18);
+        border-radius:18px;
+        background:rgba(143,211,255,.055);
+        padding:.78rem .9rem;
+        color:var(--muted);
+      }
+      .job-panel strong { color:var(--text); }
+      .job-panel span { color:var(--accent); font:800 .68rem var(--mono); letter-spacing:.1em; text-transform:uppercase; }
       .panel {
         border:1px solid var(--line);
         border-radius:24px;
@@ -3976,6 +4261,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         overflow:hidden;
       }
       .review-card[open] { border-color:var(--line-strong); }
+      .review-card.is-saving { opacity:.72; pointer-events:none; }
       .review-card summary { list-style:none; cursor:pointer; padding:.85rem .9rem; }
       .review-card summary::-webkit-details-marker { display:none; }
       .review-card[open] summary { border-bottom:1px solid var(--line); background:rgba(143,211,255,.035); }
@@ -4128,6 +4414,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
         .toolbar, .review-body { grid-template-columns:1fr; }
         .probe-form { justify-content:flex-start; }
+        .job-panel { flex-direction:column; align-items:flex-start; }
         .review-row { grid-template-columns:minmax(0,1fr) minmax(0,1fr); align-items:start; }
       }
       @media (max-width:760px) {
@@ -4169,8 +4456,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
           <option value="{{ speaker_name }}"></option>
         {% endfor %}
       </datalist>
-      {% if message %}<div class="banner">{{ message }}</div>{% endif %}
-      {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+      <div class="banner-stack" data-banner-stack>
+        {% if message %}<div class="banner">{{ message }}</div>{% endif %}
+        {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+      </div>
       <section class="metrics" aria-label="Testimony review status">
         <div class="metric"><span>Needs Review</span><strong>{{ counts.needs_review }}</strong><small>Awaiting identification</small></div>
         <div class="metric"><span>Identified</span><strong>{{ counts.identified }}</strong><small>Speaker confirmed or already named</small></div>
@@ -4192,6 +4481,21 @@ TESTIMONY_REVIEW_TEMPLATE = """
           </label>
           <button type="submit">Check Durations</button>
         </form>
+        <form class="probe-form" method="post" action="{{ url_for('suggest_all_testimony_speakers') }}">
+          <input type="hidden" name="status" value="{{ status_filter }}">
+          <input type="hidden" name="sort" value="{{ sort }}">
+          <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
+        </form>
+      </div>
+      <div class="job-panel" data-suggestion-job data-status-url="{{ url_for('testimony_suggestion_status') }}" data-state="{{ suggestion_job.state }}" {% if suggestion_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
+        <div>
+          <span>Speaker Suggestions</span>
+          <strong data-job-message>{{ suggestion_job.message or "Idle." }}</strong>
+          <div data-job-counts>
+            {{ suggestion_job.processed }} / {{ suggestion_job.total }} processed · {{ suggestion_job.found }} suggested · {{ suggestion_job.checked }} checked · {{ suggestion_job.errors }} errors
+          </div>
+        </div>
+        <div data-job-current>{% if suggestion_job.current %}Now checking {{ suggestion_job.current }}{% endif %}</div>
       </div>
       <section class="panel">
         <div class="panel-head">
@@ -4221,13 +4525,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
         {% elif items %}
           <div class="review-list">
             {% for item in items %}
-              <details class="review-card {{ item.status }}">
+              <details class="review-card {{ item.status }}" data-review-id="{{ item.id }}">
                 <summary>
                   <div class="review-row">
                     <div class="cell">
                       <span class="cell-label">Recording</span>
-                      <span class="cell-value">{{ item.title }}</span>
-                      <span class="cell-subvalue">{{ item.source_label }}</span>
+                      <span class="cell-value" data-field="title">{{ item.title }}</span>
+                      <span class="cell-subvalue" data-field="source-label">{{ item.source_label }}</span>
                     </div>
                     <div class="cell">
                       <span class="cell-label">Duration</span>
@@ -4235,26 +4539,26 @@ TESTIMONY_REVIEW_TEMPLATE = """
                     </div>
                     <div class="cell">
                       <span class="cell-label">Date</span>
-                      <span class="cell-value">{{ format_date(item.service_date or item.recording_date) }}</span>
+                      <span class="cell-value" data-field="service-date-label">{{ format_date(item.service_date or item.recording_date) }}</span>
                     </div>
                     <div class="cell">
                       <span class="cell-label">Speaker</span>
-                      <span class="cell-value">{{ item.speaker_name or "Not set" }}</span>
+                      <span class="cell-value" data-field="speaker">{{ item.speaker_name or "Not set" }}</span>
                     </div>
-                    <span class="pill {{ item.status }}">{{ item.status_label }}</span>
+                    <span class="pill {{ item.status }}" data-field="status-pill">{{ item.status_label }}</span>
                   </div>
                 </summary>
                 <div class="review-body">
                   <section class="listen-panel">
                     <div>
                       <div class="meta">Listen</div>
-                      <h3>{{ item.title }}</h3>
+                      <h3 data-field="listen-title">{{ item.title }}</h3>
                     </div>
                     <audio controls preload="none" data-src="{{ item.audio_url }}"></audio>
                     <div class="file-facts">
                       <div class="fact"><span>Size</span><strong>{{ item.size_label }}</strong></div>
                       <div class="fact"><span>Modified</span><strong>{{ item.modified_label }}</strong></div>
-                      <div class="fact wide"><span>File</span><strong>{{ item.source_label }}</strong></div>
+                      <div class="fact wide"><span>File</span><strong data-field="file-fact">{{ item.source_label }}</strong></div>
                     </div>
                   </section>
                   <form class="review-form" method="post" action="{{ url_for('update_testimony_review', recording_id=item.id) }}">
@@ -4280,6 +4584,15 @@ TESTIMONY_REVIEW_TEMPLATE = """
                             {% if item.suggestion_source_label %}<small>{{ item.suggestion_source_label }}</small>{% endif %}
                           </div>
                           <button class="secondary apply-suggestion" type="button" data-speaker="{{ item.suggested_speaker }}">Use Suggestion</button>
+                          {% if item.suggestion_text %}<p>{{ item.suggestion_text }}</p>{% endif %}
+                        </div>
+                      {% elif not item.speaker_name and item.suggestion_source %}
+                        <div class="suggestion-panel subdued">
+                          <div>
+                            <span>Intro Checked</span>
+                            <strong>No speaker name found</strong>
+                            {% if item.suggestion_source_label %}<small>{{ item.suggestion_source_label }}</small>{% endif %}
+                          </div>
                           {% if item.suggestion_text %}<p>{{ item.suggestion_text }}</p>{% endif %}
                         </div>
                       {% elif not item.speaker_name %}
@@ -4309,6 +4622,139 @@ TESTIMONY_REVIEW_TEMPLATE = """
       </section>
     </main>
     <script>
+      const openCardsKey = "ntc-testimony-open-cards";
+      const statusClasses = ["needs_review", "identified", "not_testimony", "already_named"];
+      const bannerStack = document.querySelector("[data-banner-stack]");
+
+      function storedOpenCards() {
+        try {
+          return new Set(JSON.parse(window.localStorage.getItem(openCardsKey) || "[]"));
+        } catch (error) {
+          return new Set();
+        }
+      }
+
+      function saveOpenCards() {
+        const ids = Array.from(document.querySelectorAll(".review-card[open]"))
+          .map((card) => card.dataset.reviewId || "")
+          .filter(Boolean);
+        window.localStorage.setItem(openCardsKey, JSON.stringify(ids));
+      }
+
+      function restoreOpenCards() {
+        const ids = storedOpenCards();
+        if (!ids.size) return;
+        document.querySelectorAll(".review-card").forEach((card) => {
+          if (ids.has(card.dataset.reviewId || "")) {
+            card.open = true;
+            hydrateReviewAudio(card);
+          }
+        });
+      }
+
+      function showBanner(message, isError = false) {
+        if (!bannerStack || !message) return;
+        bannerStack.replaceChildren();
+        const banner = document.createElement("div");
+        banner.className = `banner${isError ? " error" : ""}`;
+        banner.textContent = message;
+        bannerStack.appendChild(banner);
+      }
+
+      function setText(card, field, value) {
+        const node = card.querySelector(`[data-field="${field}"]`);
+        if (node && value !== undefined && value !== null) {
+          node.textContent = value || "";
+        }
+      }
+
+      function updateReviewCard(card, data) {
+        setText(card, "title", data.title);
+        setText(card, "listen-title", data.title);
+        setText(card, "source-label", data.source_label);
+        setText(card, "file-fact", data.source_label);
+        setText(card, "service-date-label", data.service_date_label);
+        setText(card, "speaker", data.speaker_name || "Not set");
+
+        const statusPill = card.querySelector('[data-field="status-pill"]');
+        if (statusPill && data.status) {
+          statusPill.textContent = data.status_label || data.status;
+          statusPill.classList.remove(...statusClasses);
+          statusPill.classList.add(data.status);
+        }
+        if (data.status) {
+          card.classList.remove(...statusClasses);
+          card.classList.add(data.status);
+        }
+        if (data.recording_id) {
+          card.dataset.reviewId = data.recording_id;
+        }
+
+        const form = card.querySelector(".review-form");
+        if (form && data.review_url) {
+          form.action = data.review_url;
+        }
+        const sourcePath = card.querySelector('input[name="source_path"]');
+        if (sourcePath && data.source_path) {
+          sourcePath.value = data.source_path;
+        }
+        const serviceDate = card.querySelector('input[name="service_date"]');
+        if (serviceDate && data.service_date) {
+          serviceDate.value = data.service_date;
+        }
+
+        const audio = card.querySelector("audio[data-src]");
+        if (audio && data.audio_url && audio.dataset.src !== data.audio_url) {
+          audio.pause();
+          audio.removeAttribute("src");
+          audio.dataset.src = data.audio_url;
+          audio.load();
+          if (card.open) hydrateReviewAudio(card);
+        }
+        if (data.speaker_name) {
+          card.querySelectorAll(".suggestion-panel").forEach((panel) => panel.remove());
+        }
+        saveOpenCards();
+      }
+
+      function renderSuggestion(card, data) {
+        const form = card.querySelector(".review-form");
+        const editPanel = form ? form.querySelector(".edit-panel") : null;
+        if (!editPanel) return;
+        editPanel.querySelectorAll(".suggestion-panel").forEach((panel) => panel.remove());
+
+        const panel = document.createElement("div");
+        panel.className = `suggestion-panel${data.suggested_speaker ? "" : " subdued"}`;
+
+        const textWrap = document.createElement("div");
+        const label = document.createElement("span");
+        label.textContent = data.suggested_speaker ? "Suggested Speaker" : "Intro Checked";
+        const strong = document.createElement("strong");
+        strong.textContent = data.suggested_speaker || "No speaker name found";
+        textWrap.append(label, strong);
+        if (data.suggestion_source_label) {
+          const small = document.createElement("small");
+          small.textContent = data.suggestion_source_label;
+          textWrap.appendChild(small);
+        }
+        panel.appendChild(textWrap);
+
+        if (data.suggested_speaker) {
+          const button = document.createElement("button");
+          button.className = "secondary apply-suggestion";
+          button.type = "button";
+          button.dataset.speaker = data.suggested_speaker;
+          button.textContent = "Use Suggestion";
+          panel.appendChild(button);
+        }
+        if (data.suggestion_text) {
+          const paragraph = document.createElement("p");
+          paragraph.textContent = data.suggestion_text;
+          panel.appendChild(paragraph);
+        }
+        editPanel.appendChild(panel);
+      }
+
       document.addEventListener("click", (event) => {
         const button = event.target.closest(".apply-suggestion");
         if (!button) return;
@@ -4329,8 +4775,108 @@ TESTIMONY_REVIEW_TEMPLATE = """
         if (card.matches && card.matches(".review-card") && card.open) {
           hydrateReviewAudio(card);
         }
+        if (card.matches && card.matches(".review-card")) {
+          saveOpenCards();
+        }
       }, true);
+
+      document.addEventListener("submit", async (event) => {
+        const form = event.target.closest(".review-form");
+        saveOpenCards();
+        if (!form || !window.fetch) return;
+        event.preventDefault();
+
+        const card = form.closest(".review-card");
+        const submitter = event.submitter;
+        const url = submitter && submitter.formAction ? submitter.formAction : form.action;
+        let formData;
+        try {
+          formData = new FormData(form, submitter);
+        } catch (error) {
+          formData = new FormData(form);
+          if (submitter && submitter.name) {
+            formData.append(submitter.name, submitter.value);
+          }
+        }
+
+        card.classList.add("is-saving");
+        if (submitter) submitter.disabled = true;
+        try {
+          const response = await fetch(url, {
+            method: "POST",
+            body: formData,
+            headers: { "Accept": "application/json", "X-Requested-With": "fetch" },
+          });
+          const data = await response.json();
+          if (!response.ok || !data.ok) {
+            throw new Error(data.error || data.message || "The testimony update failed.");
+          }
+          showBanner(data.message || "Testimony review updated.");
+          if (data.suggested_speaker !== undefined || data.suggestion_text !== undefined) {
+            renderSuggestion(card, data);
+          } else {
+            updateReviewCard(card, data);
+          }
+        } catch (error) {
+          showBanner(error.message || "The testimony update failed.", true);
+        } finally {
+          card.classList.remove("is-saving");
+          if (submitter) submitter.disabled = false;
+        }
+      });
+
+      function updateSuggestionJob(job) {
+        const panel = document.querySelector("[data-suggestion-job]");
+        if (!panel || !job) return;
+        const message = panel.querySelector("[data-job-message]");
+        const counts = panel.querySelector("[data-job-counts]");
+        const current = panel.querySelector("[data-job-current]");
+        const button = document.querySelector("[data-process-suggestions-button]");
+        const priorState = panel.dataset.state || "";
+
+        panel.hidden = !["running", "finished", "failed"].includes(job.state);
+        panel.dataset.state = job.state || "";
+        if (message) message.textContent = job.message || "Idle.";
+        if (counts) {
+          counts.textContent = `${job.processed || 0} / ${job.total || 0} processed · ${job.found || 0} suggested · ${job.checked || 0} checked · ${job.errors || 0} errors`;
+        }
+        if (current) {
+          current.textContent = job.current ? `Now checking ${job.current}` : "";
+        }
+        if (button) {
+          button.disabled = job.state === "running";
+        }
+        if (priorState === "running" && ["finished", "failed"].includes(job.state)) {
+          const tag = document.activeElement ? document.activeElement.tagName : "";
+          const editing = ["INPUT", "TEXTAREA", "SELECT"].includes(tag);
+          if (!editing && job.state === "finished") {
+            saveOpenCards();
+            window.setTimeout(() => window.location.reload(), 900);
+          }
+        }
+      }
+
+      async function pollSuggestionJob() {
+        const panel = document.querySelector("[data-suggestion-job]");
+        if (!panel || !panel.dataset.statusUrl) return;
+        try {
+          const response = await fetch(panel.dataset.statusUrl, { headers: { "Accept": "application/json" } });
+          if (!response.ok) return;
+          const job = await response.json();
+          updateSuggestionJob(job);
+          if (job.state === "running") {
+            window.setTimeout(pollSuggestionJob, 3000);
+          }
+        } catch (error) {
+          window.setTimeout(pollSuggestionJob, 6000);
+        }
+      }
+
+      restoreOpenCards();
       document.querySelectorAll(".review-card[open]").forEach(hydrateReviewAudio);
+      if (document.querySelector("[data-suggestion-job]")?.dataset.state === "running") {
+        pollSuggestionJob();
+      }
     </script>
   </body>
 </html>

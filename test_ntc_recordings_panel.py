@@ -530,6 +530,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b'preload="none" data-src="/admin/testimonies/audio/', review.data)
         self.assertNotIn(b'preload="metadata" src="/admin/testimonies/audio/', review.data)
         self.assertIn(b"Suggest Speaker", review.data)
+        self.assertIn(b"Process Suggestions", review.data)
+        self.assertIn(b'data-suggestion-job', review.data)
+        self.assertIn(b'data-status-url="/admin/testimonies/suggest-status"', review.data)
+        self.assertIn(b'data-review-id="', review.data)
+        self.assertIn(b"ntc-testimony-open-cards", review.data)
+        self.assertIn(b"X-Requested-With", review.data)
         self.assertIn(b'id="speaker-name-options"', review.data)
         self.assertNotIn(b"DN300R folder", review.data)
         self.assertNotIn(b"Final Title", review.data)
@@ -629,6 +635,64 @@ class RecordingRequestPanelTests(unittest.TestCase):
         renamed_audio = self.client.get(f"/admin/testimonies/audio/{new_recording_id}")
         self.assertEqual(renamed_audio.status_code, 200)
         self.assertEqual(renamed_audio.data, b"raw-testimony-audio")
+
+    def test_testimony_review_supports_json_row_updates(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "REC00077.mp3"
+        raw_recording.write_bytes(b"async-testimony-audio")
+        service_timestamp = datetime(2026, 7, 23, 12, tzinfo=timezone.utc).timestamp()
+        os.utime(raw_recording, (service_timestamp, service_timestamp))
+        recording_id = _recording_id(raw_recording)
+
+        self._login()
+        response = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "status": "identified",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2026-07-23",
+                "speaker_name": "Kevin",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["previous_recording_id"], recording_id)
+        self.assertNotEqual(payload["recording_id"], recording_id)
+        self.assertEqual(payload["status"], "identified")
+        self.assertEqual(payload["status_label"], "Identified")
+        self.assertEqual(payload["speaker_name"], "Kevin")
+        self.assertEqual(payload["service_date_label"], "July 23, 2026")
+        self.assertIn("July 23, 2026 - Kevin", payload["source_label"])
+        self.assertIn("/admin/testimonies/audio/", payload["audio_url"])
+        self.assertIn("/admin/testimonies/", payload["review_url"])
+        self.assertFalse(raw_recording.exists())
+        self.assertTrue(Path(payload["source_path"]).exists())
+
+    def test_bulk_testimony_suggestions_route_starts_background_job(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        (testimony_source_root / "REC00100.mp3").write_bytes(b"raw-testimony-audio")
+
+        self._login()
+        with patch("ntc_recordings_app._start_testimony_suggestion_job", return_value=True) as starter:
+            started = self.client.post(
+                "/admin/testimonies/suggest-all",
+                data={"status": "needs_review", "sort": "shortest"},
+                follow_redirects=True,
+            )
+
+        self.assertEqual(started.status_code, 200)
+        self.assertIn(b"Started testimony speaker suggestion processing", started.data)
+        starter.assert_called_once()
+
+        status = self.client.get("/admin/testimonies/suggest-status")
+        self.assertEqual(status.status_code, 200)
+        self.assertIn("state", status.get_json())
 
     def test_legacy_testimony_source_config_still_works(self):
         legacy_root = self.root / "LegacyRecorder"
