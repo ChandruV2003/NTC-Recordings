@@ -2595,8 +2595,9 @@ def _person_name_candidate(value: str, known_speakers: Iterable[str]) -> bool:
         return False
     if any(word in TRANSCRIPT_NAME_REJECT_WORDS for word in checked_words):
         return False
-    if any(len(word) <= 1 for word in checked_words):
-        return False
+    for index, word in enumerate(checked_words):
+        if len(word) <= 1 and not (index > 0 and len(word) == 1):
+            return False
     return True
 
 

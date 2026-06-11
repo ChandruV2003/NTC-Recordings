@@ -770,6 +770,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             _extract_intro_speaker("Praise the Lord, my name is Rachel and I want to testify.", ["Sister Rachel"]),
             "Sister Rachel",
         )
+        self.assertEqual(_extract_intro_speaker("Praise the Lord, my name is John C.", []), "John C")
         self.assertEqual(_extract_intro_speaker("This is for all of us as we worship today.", []), "")
         self.assertEqual(_extract_intro_speaker("I'm not going to give a long testimony today.", []), "")
         self.assertEqual(_extract_intro_speaker("I am deeply thankful for what God has done.", []), "")
