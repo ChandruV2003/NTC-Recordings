@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from ntc_recordings_app import _date_from_file_metadata, _recording_id, create_app
+from ntc_recordings_app import _date_from_file_metadata, _recording_id, _testimony_suggestion_targets, create_app
 
 
 class RecordingRequestPanelTests(unittest.TestCase):
@@ -693,6 +693,27 @@ class RecordingRequestPanelTests(unittest.TestCase):
         status = self.client.get("/admin/testimonies/suggest-status")
         self.assertEqual(status.status_code, 200)
         self.assertIn("state", status.get_json())
+
+    def test_bulk_testimony_suggestions_skip_named_message_files(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "REC00101.mp3"
+        raw_recording.write_bytes(b"raw-testimony-audio")
+        named_message = testimony_source_root / "20260610 - God Is Able - Sis Judith.mp3"
+        named_message.write_bytes(b"named-message-audio")
+
+        with patch("ntc_recordings_app._probe_audio_duration", return_value=120):
+            targets = _testimony_suggestion_targets(self.app)
+
+        self.assertEqual([Path(item["candidate"].path).name for item in targets], ["REC00101.mp3"])
+        with sqlite3.connect(self.db_path) as connection:
+            named_row = connection.execute(
+                "SELECT status FROM testimony_reviews WHERE recording_id = ?",
+                (_recording_id(named_message),),
+            ).fetchone()
+
+        self.assertIsNotNone(named_row)
+        self.assertEqual(named_row[0], "not_testimony")
 
     def test_legacy_testimony_source_config_still_works(self):
         legacy_root = self.root / "LegacyRecorder"

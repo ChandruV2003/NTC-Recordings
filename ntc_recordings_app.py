@@ -1647,6 +1647,17 @@ def _raw_testimony_name(path: Path) -> bool:
     return "testimony" in normalized or "testimonies" in normalized
 
 
+def _raw_recorder_name(path: Path) -> bool:
+    return bool(re.fullmatch(r"(?i)rec\d+", _strip_audio_extensions(path.name).strip()))
+
+
+def _named_non_testimony_recording(candidate: RecordingCandidate) -> bool:
+    path = Path(candidate.path)
+    if _raw_testimony_name(path) or _raw_recorder_name(path):
+        return False
+    return candidate.kind != "testimony"
+
+
 def _testimony_review_row(app: Flask, recording_id: str) -> sqlite3.Row | None:
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         return connection.execute("SELECT * FROM testimony_reviews WHERE recording_id = ?", (recording_id,)).fetchone()
@@ -2195,6 +2206,8 @@ def _testimony_status_for_candidate(
         return status
     if status not in {"needs_review", "identified", "not_testimony", "already_named"}:
         status = "already_named" if _raw_testimony_name(Path(candidate.path)) else "needs_review"
+    if status == "needs_review" and _named_non_testimony_recording(candidate):
+        return "not_testimony"
     if status == "needs_review" and _duration_is_too_short_for_testimony(app, duration_seconds):
         return "not_testimony"
     return status
