@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from ntc_recordings_app import _recording_id, create_app
+from ntc_recordings_app import _date_from_file_metadata, _recording_id, create_app
 
 
 class RecordingRequestPanelTests(unittest.TestCase):
@@ -511,7 +511,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         testimony_source_root.mkdir()
         raw_recording = testimony_source_root / "REC00042.mp3"
         raw_recording.write_bytes(b"raw-testimony-audio")
-        service_timestamp = datetime(2026, 4, 19, tzinfo=timezone.utc).timestamp()
+        service_timestamp = datetime(2026, 4, 19, 12, tzinfo=timezone.utc).timestamp()
         os.utime(raw_recording, (service_timestamp, service_timestamp))
         (testimony_source_root / "20250413 - Sister Rachel's Testimony.mp3").write_bytes(b"named-testimony-audio")
 
@@ -654,6 +654,14 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(review.status_code, 200)
         self.assertIn(b"REC00099", review.data)
         self.assertIn(b"Testimony Review", review.data)
+
+    def test_metadata_dates_use_local_church_day(self):
+        raw_recording = self.root / "REC00494.mp3"
+        raw_recording.write_bytes(b"evening-service-audio")
+        service_timestamp = datetime(2026, 6, 11, 0, 8, 32, tzinfo=timezone.utc).timestamp()
+        os.utime(raw_recording, (service_timestamp, service_timestamp))
+
+        self.assertEqual(_date_from_file_metadata(raw_recording.stat()), "2026-06-10")
 
 
 if __name__ == "__main__":

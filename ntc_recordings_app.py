@@ -22,6 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from flask import Flask, jsonify, redirect, render_template_string, request, send_file, session, url_for
@@ -2189,9 +2190,17 @@ def _proposed_testimony_path(
 
 def _date_from_file_metadata(stat_result: os.stat_result) -> str | None:
     try:
-        return datetime.fromtimestamp(stat_result.st_mtime, timezone.utc).date().isoformat()
+        return datetime.fromtimestamp(stat_result.st_mtime, _recording_local_timezone()).date().isoformat()
     except (OSError, OverflowError, ValueError):
         return None
+
+
+def _recording_local_timezone():
+    timezone_name = os.getenv("NTC_RECORDINGS_LOCAL_TIMEZONE", "America/New_York")
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return timezone.utc
 
 
 def _sanitize_filename_part(value: str) -> str:
