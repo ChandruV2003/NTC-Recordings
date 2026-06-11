@@ -22,10 +22,11 @@ from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
-from flask import Flask, jsonify, redirect, render_template_string, request, send_file, session, url_for
+from flask import Flask, has_request_context, jsonify, redirect, render_template_string, request, send_file, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from ntc_env import install_legacy_env_aliases
@@ -64,6 +65,126 @@ MONTHS = {
     "november": 11,
     "dec": 12,
     "december": 12,
+}
+TRANSCRIPT_NAME_BOUNDARY_WORDS = {
+    "actually",
+    "also",
+    "and",
+    "are",
+    "as",
+    "at",
+    "because",
+    "been",
+    "being",
+    "but",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "he",
+    "i",
+    "in",
+    "is",
+    "it",
+    "may",
+    "might",
+    "must",
+    "of",
+    "on",
+    "she",
+    "should",
+    "so",
+    "that",
+    "then",
+    "they",
+    "this",
+    "to",
+    "today",
+    "tonight",
+    "uh",
+    "um",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "will",
+    "with",
+    "would",
+    "you",
+}
+TRANSCRIPT_NAME_REJECT_FIRST_WORDS = {
+    "a",
+    "able",
+    "all",
+    "before",
+    "blessed",
+    "completely",
+    "deeply",
+    "driving",
+    "for",
+    "going",
+    "grateful",
+    "happy",
+    "here",
+    "his",
+    "living",
+    "looking",
+    "not",
+    "on",
+    "set",
+    "she",
+    "sorry",
+    "such",
+    "sure",
+    "thankful",
+    "that",
+    "the",
+    "this",
+    "to",
+    "waiting",
+    "with",
+    "your",
+}
+TRANSCRIPT_NAME_REJECT_WORDS = {
+    "able",
+    "all",
+    "always",
+    "blessing",
+    "come",
+    "completely",
+    "deeply",
+    "emotional",
+    "give",
+    "grateful",
+    "honor",
+    "hopeless",
+    "late",
+    "lie",
+    "life",
+    "looking",
+    "music",
+    "not",
+    "praise",
+    "right",
+    "saying",
+    "sinner",
+    "song",
+    "testimony",
+    "trials",
+    "us",
+    "very",
+    "word",
+    "your",
 }
 
 
@@ -123,6 +244,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         ),
         NTC_RECORDINGS_PANEL_TITLE=os.getenv("NTC_RECORDINGS_PANEL_TITLE", "NTC NAS Recordings"),
         NTC_RECORDINGS_PUBLIC_BASE_URL=os.getenv("NTC_RECORDINGS_PUBLIC_BASE_URL", ""),
+        NTC_RECORDINGS_PUBLIC_PREFIX=os.getenv("NTC_RECORDINGS_PUBLIC_PREFIX", ""),
         NTC_RECORDINGS_SHARE_PROVIDER=os.getenv("NTC_RECORDINGS_SHARE_PROVIDER", "internal"),
         NTC_RECORDINGS_ADMIN_PASSWORD=os.getenv("NTC_RECORDINGS_ADMIN_PASSWORD", ""),
         NTC_ADMIN_PASSWORD=os.getenv("NTC_ADMIN_PASSWORD", ""),
@@ -154,6 +276,10 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.testimony_suggestion_job_lock = threading.Lock()
     app.testimony_suggestion_job = _initial_testimony_suggestion_job_state()
 
+    @app.context_processor
+    def _recordings_url_context():
+        return {"recordings_url_for": lambda endpoint, **values: _recordings_url_for(app, endpoint, **values)}
+
     def _admin_password() -> str:
         return (
             app.config.get("NTC_RECORDINGS_ADMIN_PASSWORD")
@@ -167,7 +293,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     def _require_admin():
         if _is_admin():
             return None
-        return redirect(url_for("admin_login", error="Admin password required."))
+        return _redirect_to(app, "admin_login", error="Admin password required.")
 
     @app.get("/healthz")
     def healthz():
@@ -209,11 +335,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         requested_date = _normalize_date((request.form.get("requested_date") or "").strip())
         notes = (request.form.get("notes") or "").strip()
         if not requester_name or not email or not requested_date:
-            return redirect(url_for("public_form", error="Name, email, and recording date are required."))
+            return _redirect_to(app, "public_form", error="Name, email, and recording date are required.")
         recordings = _get_recordings(app)
         candidate = _default_candidate_for_date(app, recordings, requested_date, recording_kind)
         if not candidate:
-            return redirect(url_for("public_form", error="Please choose one of the available recording dates."))
+            return _redirect_to(app, "public_form", error="Please choose one of the available recording dates.")
         request_id = _insert_request(
             app,
             requester_name=requester_name,
@@ -226,7 +352,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             notes=notes,
         )
         app.logger.info("recording request %s created for %s (%s)", request_id, requested_date, candidate.id)
-        return redirect(url_for("public_form", message="Request submitted. We will email the recording link when it is approved."))
+        return _redirect_to(app, "public_form", message="Request submitted. We will email the recording link when it is approved.")
 
     @app.route("/admin", methods=["GET", "POST"])
     @app.route("/admin/login", methods=["GET", "POST"])
@@ -243,14 +369,14 @@ def create_app(test_config: dict | None = None) -> Flask:
             if hmac.compare_digest(password, expected):
                 session["recordings_admin"] = True
                 session.modified = True
-                return redirect(url_for("admin_panel"))
+                return _redirect_to(app, "admin_panel")
             return render_template_string(
                 RECORDING_ADMIN_LOGIN_TEMPLATE,
                 title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
                 error="Password was not accepted.",
             )
         if _is_admin():
-            return redirect(url_for("admin_panel"))
+            return _redirect_to(app, "admin_panel")
         return render_template_string(
             RECORDING_ADMIN_LOGIN_TEMPLATE,
             title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
@@ -261,7 +387,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     def admin_logout():
         session.pop("recordings_admin", None)
         session.modified = True
-        return redirect(url_for("public_form"))
+        return _redirect_to(app, "public_form")
 
     @app.get("/admin/panel")
     def admin_panel():
@@ -396,13 +522,12 @@ def create_app(test_config: dict | None = None) -> Flask:
             current_filter = "identified"
         if current_filter not in {"needs_review", "identified", "not_testimony", "all"}:
             current_filter = "needs_review"
-        return redirect(
-            url_for(
-                "testimony_review",
-                status=current_filter,
-                sort=request.form.get("sort") or "shortest",
-                message=f"Checked {probed + skipped} testimony source file{'s' if probed + skipped != 1 else ''}; saved {probed} duration{'s' if probed != 1 else ''}.",
-            )
+        return _redirect_to(
+            app,
+            "testimony_review",
+            status=current_filter,
+            sort=request.form.get("sort") or "shortest",
+            message=f"Checked {probed + skipped} testimony source file{'s' if probed + skipped != 1 else ''}; saved {probed} duration{'s' if probed != 1 else ''}.",
         )
 
     @app.post("/admin/testimonies/suggest-all")
@@ -420,13 +545,12 @@ def create_app(test_config: dict | None = None) -> Flask:
             message = "Started testimony speaker suggestion processing."
         else:
             message = "Testimony speaker suggestion processing is already running."
-        return redirect(
-            url_for(
-                "testimony_review",
-                status=current_filter,
-                sort=request.form.get("sort") or "shortest",
-                message=message,
-            )
+        return _redirect_to(
+            app,
+            "testimony_review",
+            status=current_filter,
+            sort=request.form.get("sort") or "shortest",
+            message=message,
         )
 
     @app.get("/admin/testimonies/suggest-status")
@@ -450,7 +574,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not candidate:
             if _wants_json_response():
                 return jsonify({"ok": False, "error": "Testimony source recording was not found."}), 404
-            return redirect(url_for("testimony_review", status=current_filter, error="Testimony source recording was not found."))
+            return _redirect_to(app, "testimony_review", status=current_filter, error="Testimony source recording was not found.")
 
         existing = _testimony_review_row(app, recording_id)
         duration_seconds = _row_duration(existing) if existing else _probe_audio_duration(Path(candidate.path))
@@ -500,13 +624,12 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "suggestion_text": suggestion_text,
                 }
             )
-        return redirect(
-            url_for(
-                "testimony_review",
-                status=current_filter,
-                sort=request.form.get("sort") or "shortest",
-                message=message,
-            )
+        return _redirect_to(
+            app,
+            "testimony_review",
+            status=current_filter,
+            sort=request.form.get("sort") or "shortest",
+            message=message,
         )
 
     @app.post("/admin/testimonies/<recording_id>/review")
@@ -523,7 +646,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not candidate:
             if _wants_json_response():
                 return jsonify({"ok": False, "error": "Testimony source recording was not found."}), 404
-            return redirect(url_for("testimony_review", status=current_filter, error="Testimony source recording was not found."))
+            return _redirect_to(app, "testimony_review", status=current_filter, error="Testimony source recording was not found.")
         original_recording_id = recording_id
         status = (request.form.get("status") or "identified").strip().lower()
         if status not in {"needs_review", "identified", "not_testimony"}:
@@ -539,7 +662,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         testimony_title = _testimony_title_for_speaker(speaker_name)
         notes = str(existing["notes"] or "") if existing else ""
         duration_seconds = _row_duration(existing) if existing else None
-        suggested_speaker = str(existing["suggested_speaker"] or "") if existing else ""
+        suggested_speaker = _valid_person_name_suggestion(str(existing["suggested_speaker"] or "") if existing else "", _testimony_known_speakers(app))
         suggestion_source = str(existing["suggestion_source"] or "") if existing else ""
         suggestion_text = str(existing["suggestion_text"] or "") if existing else ""
         proposed_path = ""
@@ -593,17 +716,16 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "title": candidate.title,
                     "source_label": Path(candidate.path).name,
                     "source_path": candidate.path,
-                    "audio_url": url_for("testimony_audio", recording_id=recording_id),
-                    "review_url": url_for("update_testimony_review", recording_id=recording_id),
+                    "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=recording_id),
+                    "review_url": _recordings_url_for(app, "update_testimony_review", recording_id=recording_id),
                 }
             )
-        return redirect(
-            url_for(
-                "testimony_review",
-                status=current_filter,
-                sort=request.form.get("sort") or "shortest",
-                message=save_message,
-            )
+        return _redirect_to(
+            app,
+            "testimony_review",
+            status=current_filter,
+            sort=request.form.get("sort") or "shortest",
+            message=save_message,
         )
 
     @app.get("/admin/testimonies/audio/<recording_id>")
@@ -631,11 +753,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         target_tab = _request_return_tab()
         row = _get_request(app, request_id)
         if not row:
-            return redirect(url_for("admin_panel", tab=target_tab, error="Request was not found."))
+            return _redirect_to(app, "admin_panel", tab=target_tab, error="Request was not found.")
         recording_id = (request.form.get("recording_id") or "").strip()
         candidate = _recording_target_by_id(app, recording_id)
         if not candidate:
-            return redirect(url_for("admin_panel", tab=target_tab, error="Selected recording was not found."))
+            return _redirect_to(app, "admin_panel", tab=target_tab, error="Selected recording was not found.")
         email_message = (request.form.get("email_message") or "").strip()
         if not email_message:
             email_message = _default_recording_email_message(row, candidate)
@@ -657,8 +779,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             email_message=email_message,
         )
         if email_sent:
-            return redirect(url_for("admin_panel", tab=target_tab, message=f"Recording link emailed to {row['email']}."))
-        return redirect(url_for("admin_panel", tab=target_tab, message="Share link is ready."))
+            return _redirect_to(app, "admin_panel", tab=target_tab, message=f"Recording link emailed to {row['email']}.")
+        return _redirect_to(app, "admin_panel", tab=target_tab, message="Share link is ready.")
 
     @app.post("/admin/requests/<int:request_id>/revoke")
     def revoke_request_link(request_id: int):
@@ -667,13 +789,13 @@ def create_app(test_config: dict | None = None) -> Flask:
             return guard
         row = _get_request(app, request_id)
         if not row:
-            return redirect(url_for("admin_panel", tab="pending", error="Request was not found."))
+            return _redirect_to(app, "admin_panel", tab="pending", error="Request was not found.")
         target_tab = _request_return_tab(default="completed")
         revoke_error = _revoke_share_link(app, row)
         _mark_request_revoked(app, request_id, revoke_error=revoke_error)
         if revoke_error:
-            return redirect(url_for("admin_panel", tab=target_tab, error=f"Request closed locally. Revoke warning: {revoke_error}"))
-        return redirect(url_for("admin_panel", tab=target_tab, message="Recording access revoked."))
+            return _redirect_to(app, "admin_panel", tab=target_tab, error=f"Request closed locally. Revoke warning: {revoke_error}")
+        return _redirect_to(app, "admin_panel", tab=target_tab, message="Recording access revoked.")
 
     @app.post("/admin/requests/<int:request_id>/archive")
     def archive_request(request_id: int):
@@ -683,11 +805,11 @@ def create_app(test_config: dict | None = None) -> Flask:
         row = _get_request(app, request_id)
         target_tab = _request_return_tab(default="completed")
         if not row:
-            return redirect(url_for("admin_panel", tab=target_tab, error="Request was not found."))
+            return _redirect_to(app, "admin_panel", tab=target_tab, error="Request was not found.")
         if row["status"] != "revoked":
-            return redirect(url_for("admin_panel", tab=target_tab, error="Revoke access before archiving a request."))
+            return _redirect_to(app, "admin_panel", tab=target_tab, error="Revoke access before archiving a request.")
         _archive_request(app, request_id)
-        return redirect(url_for("admin_panel", tab=target_tab, message="Request archived."))
+        return _redirect_to(app, "admin_panel", tab=target_tab, message="Request archived.")
 
     @app.get("/share/<token>")
     def share_recording(token: str):
@@ -699,7 +821,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             RECORDING_SHARE_TEMPLATE,
             title=row["recording_title"] or "Requested Recording",
             request_row=row,
-            download_url=url_for("download_recording", token=token),
+            download_url=_recordings_url_for(app, "download_recording", token=token),
             is_folder=shared_path.exists() and shared_path.is_dir(),
             folder_items=_folder_audio_items(app, shared_path),
             format_date=_format_date,
@@ -904,6 +1026,60 @@ def _status_label(status: str) -> str:
 def _wants_json_response() -> bool:
     accept = request.headers.get("Accept", "")
     return request.headers.get("X-Requested-With") == "fetch" or "application/json" in accept
+
+
+def _recordings_url_for(app: Flask, endpoint: str, **values) -> str:
+    generated = url_for(endpoint, **values)
+    if values.get("_external") or not generated.startswith("/") or re.match(r"^[a-z][a-z0-9+.-]*://", generated, flags=re.IGNORECASE):
+        return generated
+    prefix = _public_mount_prefix(app)
+    if not prefix:
+        return generated
+    if generated == prefix or generated.startswith(f"{prefix}/"):
+        return generated
+    if generated == "/":
+        return f"{prefix}/"
+    return f"{prefix}{generated}"
+
+
+def _public_mount_prefix(app: Flask) -> str:
+    explicit = _normalize_mount_prefix(app.config.get("NTC_RECORDINGS_PUBLIC_PREFIX"))
+    if explicit:
+        return explicit
+    if has_request_context():
+        forwarded = _normalize_mount_prefix(request.headers.get("X-Forwarded-Prefix", ""))
+        if forwarded:
+            return forwarded
+        script_root = _normalize_mount_prefix(request.script_root or request.environ.get("SCRIPT_NAME", ""))
+        if script_root:
+            return script_root
+    base_url = str(app.config.get("NTC_RECORDINGS_PUBLIC_BASE_URL") or "").strip()
+    parsed = urlparse(base_url)
+    base_prefix = _normalize_mount_prefix(parsed.path)
+    if not base_prefix:
+        return ""
+    if not has_request_context() or not parsed.hostname:
+        return base_prefix
+    request_hostname = (request.host or "").split(":", 1)[0].strip("[]").lower()
+    forwarded_hostname = (request.headers.get("X-Forwarded-Host") or "").split(",", 1)[0].split(":", 1)[0].strip("[]").lower()
+    public_hostname = parsed.hostname.lower()
+    if request_hostname == public_hostname or forwarded_hostname == public_hostname:
+        return base_prefix
+    return ""
+
+
+def _normalize_mount_prefix(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith(("http://", "https://")):
+        raw = urlparse(raw).path
+    raw = "/" + raw.strip("/")
+    return "" if raw == "/" else raw
+
+
+def _redirect_to(app: Flask, endpoint: str, **values):
+    return redirect(_recordings_url_for(app, endpoint, **values))
 
 
 def _get_request(app: Flask, request_id: int) -> sqlite3.Row | None:
@@ -1680,7 +1856,7 @@ def _testimony_candidate_from_review_row(app: Flask, row: sqlite3.Row) -> Record
     return None
 
 
-def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlite3.Row | None) -> dict:
+def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlite3.Row | None, known_speakers: Iterable[str]) -> dict:
     duration_seconds = _row_duration(row) if row else None
     status = _testimony_status_for_candidate(app, candidate, row, duration_seconds)
     service_date = str(row["service_date"] or "") if row else ""
@@ -1688,7 +1864,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     testimony_title = str(row["testimony_title"] or "") if row else ""
     notes = str(row["notes"] or "") if row else ""
     proposed_path = str(row["proposed_path"] or "") if row else ""
-    suggested_speaker = str(row["suggested_speaker"] or "") if row else ""
+    suggested_speaker = _valid_person_name_suggestion(str(row["suggested_speaker"] or "") if row else "", known_speakers)
     suggestion_source = str(row["suggestion_source"] or "") if row else ""
     suggestion_text = str(row["suggestion_text"] or "") if row else ""
     if not suggested_speaker and not speaker_name:
@@ -1729,13 +1905,14 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "modified_label": _format_datetime(candidate.modified_at),
         "status": status,
         "status_label": _testimony_status_label(status),
-        "audio_url": url_for("testimony_audio", recording_id=candidate.id),
+        "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=candidate.id),
         "extension": Path(candidate.path).suffix.lower(),
     }
 
 
 def _testimony_review_items(app: Flask) -> list[dict]:
     rows = _testimony_review_rows(app)
+    known_speakers = _testimony_known_speakers(app)
     items = []
     seen_row_ids = set()
     seen_paths = set()
@@ -1744,7 +1921,7 @@ def _testimony_review_items(app: Flask) -> list[dict]:
         if row:
             seen_row_ids.add(str(row["recording_id"]))
         seen_paths.add(candidate.path)
-        items.append(_testimony_review_item(app, candidate, row))
+        items.append(_testimony_review_item(app, candidate, row, known_speakers))
 
     for row_id, row in rows.items():
         if row_id in seen_row_ids:
@@ -1754,7 +1931,7 @@ def _testimony_review_items(app: Flask) -> list[dict]:
             continue
         seen_row_ids.add(row_id)
         seen_paths.add(candidate.path)
-        items.append(_testimony_review_item(app, candidate, row))
+        items.append(_testimony_review_item(app, candidate, row, known_speakers))
 
     return items
 
@@ -1944,6 +2121,7 @@ def _run_testimony_suggestion_job(app: Flask) -> None:
 
 def _testimony_suggestion_targets(app: Flask) -> list[dict]:
     rows = _testimony_review_rows(app)
+    known_speakers = _testimony_known_speakers(app)
     targets = []
     skipped = 0
     for candidate in _testimony_source_candidates(app):
@@ -1957,7 +2135,7 @@ def _testimony_suggestion_targets(app: Flask) -> list[dict]:
         testimony_title = str(row["testimony_title"] or "") if row else ""
         notes = str(row["notes"] or "") if row else ""
         proposed_path = str(row["proposed_path"] or "") if row else ""
-        suggested_speaker = str(row["suggested_speaker"] or "") if row else ""
+        suggested_speaker = _valid_person_name_suggestion(str(row["suggested_speaker"] or "") if row else "", known_speakers)
         suggestion_source = str(row["suggestion_source"] or "") if row else ""
         if not service_date:
             service_date = candidate.recording_date
@@ -2358,14 +2536,14 @@ def _extract_intro_speaker(transcript: str, known_speakers: Iterable[str]) -> st
         r"\bmy\s+name'?s\s+([a-z][a-z' -]{1,60})",
         r"\bi\s+am\s+([a-z][a-z' -]{1,60})",
         r"\bi'?m\s+([a-z][a-z' -]{1,60})",
-        r"\bthis\s+is\s+([a-z][a-z' -]{1,60})",
+        r"\bthis\s+is\s+((?:brother|bro|sister|sis)\s+[a-z][a-z' -]{1,50})",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if not match:
             continue
         name = _clean_transcript_name(match.group(1))
-        if not name:
+        if not _person_name_candidate(name, known_speakers):
             continue
         return _canonical_speaker_name(name, known_speakers)
     return ""
@@ -2373,12 +2551,53 @@ def _extract_intro_speaker(transcript: str, known_speakers: Iterable[str]) -> st
 
 def _clean_transcript_name(value: str) -> str:
     value = re.split(r"[\.,;:!?()\[\]\n\r]", value, maxsplit=1)[0]
-    value = re.split(r"\b(?:and|but|so|because|from|today|tonight|this|i|we|uh|um|actually)\b", value, maxsplit=1, flags=re.IGNORECASE)[0]
+    boundary = "|".join(sorted(re.escape(word) for word in TRANSCRIPT_NAME_BOUNDARY_WORDS))
+    value = re.split(rf"\b(?:{boundary})\b", value, maxsplit=1, flags=re.IGNORECASE)[0]
+    value = re.sub(r"(?i)'s\s+(?:testimony|story)\b.*$", "", value)
+    value = re.sub(r"(?i)\b(?:testimony|story)\b.*$", "", value)
     words = re.findall(r"[A-Za-z][A-Za-z']*", value)
-    rejected_first_words = {"thankful", "grateful", "happy", "blessed", "here", "going", "glad", "sorry"}
-    if not words or words[0].lower() in rejected_first_words:
+    if not words:
         return ""
     return _clean_speaker_name(" ".join(words[:4]))
+
+
+def _valid_person_name_suggestion(value: str, known_speakers: Iterable[str]) -> str:
+    candidate = _clean_speaker_name(value)
+    if not _person_name_candidate(candidate, known_speakers):
+        return ""
+    return _canonical_speaker_name(candidate, known_speakers)
+
+
+def _person_name_candidate(value: str, known_speakers: Iterable[str]) -> bool:
+    candidate = _clean_speaker_name(value)
+    if not candidate:
+        return False
+    known = list(known_speakers)
+    candidate_key = _speaker_key(candidate)
+    candidate_titleless_key = _speaker_key(_remove_speaker_title(candidate))
+    for known_speaker in known:
+        if candidate_key == _speaker_key(known_speaker) or candidate_titleless_key == _speaker_key(_remove_speaker_title(known_speaker)):
+            return True
+    words = candidate.split()
+    lowered = [word.strip("'").lower() for word in words]
+    starts_with_title = lowered[0] in {"brother", "sister"}
+    if starts_with_title:
+        if len(words) < 2 or len(words) > 4:
+            return False
+        checked_words = lowered[1:]
+    else:
+        if len(words) > 3:
+            return False
+        checked_words = lowered
+    if not checked_words:
+        return False
+    if checked_words[0] in TRANSCRIPT_NAME_REJECT_FIRST_WORDS:
+        return False
+    if any(word in TRANSCRIPT_NAME_REJECT_WORDS for word in checked_words):
+        return False
+    if any(len(word) <= 1 for word in checked_words):
+        return False
+    return True
 
 
 def _clean_speaker_name(value: str) -> str:
@@ -2983,7 +3202,7 @@ RECORDING_PUBLIC_TEMPLATE = """
         inset: 0;
         z-index: -1;
         pointer-events: none;
-        background: url("{{ url_for('ntc_brand_background') }}") center / min(1120px, 118vw) auto no-repeat;
+        background: url("{{ recordings_url_for('ntc_brand_background') }}") center / min(1120px, 118vw) auto no-repeat;
         opacity: 0.31;
         filter: saturate(1.08) contrast(1.04);
       }
@@ -3217,7 +3436,7 @@ RECORDING_PUBLIC_TEMPLATE = """
       <div class="grid">
         <section class="card">
           <h2>Request a Recording</h2>
-          <form method="post" action="{{ url_for('create_request') }}">
+          <form method="post" action="{{ recordings_url_for('create_request') }}">
             <div class="form-grid">
               <div class="decision-row">
                 <label>
@@ -3291,7 +3510,7 @@ RECORDING_PUBLIC_TEMPLATE = """
     <script type="application/json" id="recording-date-data">{{ recording_dates|tojson }}</script>
     <script>
       (() => {
-        const form = document.querySelector('form[action="{{ url_for('create_request') }}"]');
+        const form = document.querySelector('form[action="{{ recordings_url_for('create_request') }}"]');
         const kindSelect = document.querySelector('select[name="recording_kind"]');
         const dateInput = document.querySelector('input[name="requested_date"]');
         const dataScript = document.getElementById("recording-date-data");
@@ -3873,9 +4092,9 @@ RECORDING_ADMIN_TEMPLATE = """
           <p class="muted">Approve message, worship, and testimony recording requests.</p>
         </div>
         <div class="actions">
-          <a href="{{ url_for('testimony_review') }}">Testimony Review</a>
-          <a href="{{ url_for('public_form') }}">Public Form</a>
-          <form method="post" action="{{ url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
+          <a href="{{ recordings_url_for('testimony_review') }}">Testimony Review</a>
+          <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
+          <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
         </div>
       </header>
       {% if message %}<div class="banner">{{ message }}</div>{% endif %}
@@ -3887,8 +4106,8 @@ RECORDING_ADMIN_TEMPLATE = """
         <div class="metric"><span>Delivery</span><strong>{{ "Email" if email_enabled else "Link" }}</strong><small>{{ "Email delivery enabled" if email_enabled else "Manual approval" }}</small></div>
       </section>
       <nav class="tabs" aria-label="Request list">
-        <a class="tab {{ 'active' if active_tab == 'pending' else '' }}" {% if active_tab == "pending" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='pending') }}">Pending <strong>{{ pending_count }}</strong></a>
-        <a class="tab {{ 'active' if active_tab == 'completed' else '' }}" {% if active_tab == "completed" %}aria-current="page"{% endif %} href="{{ url_for('admin_panel', tab='completed') }}">Completed <strong>{{ completed_count }}</strong></a>
+        <a class="tab {{ 'active' if active_tab == 'pending' else '' }}" {% if active_tab == "pending" %}aria-current="page"{% endif %} href="{{ recordings_url_for('admin_panel', tab='pending') }}">Pending <strong>{{ pending_count }}</strong></a>
+        <a class="tab {{ 'active' if active_tab == 'completed' else '' }}" {% if active_tab == "completed" %}aria-current="page"{% endif %} href="{{ recordings_url_for('admin_panel', tab='completed') }}">Completed <strong>{{ completed_count }}</strong></a>
       </nav>
       <div class="grid">
         <section class="card">
@@ -3973,8 +4192,8 @@ RECORDING_ADMIN_TEMPLATE = """
 	                                <p>This link stays active until access is revoked.</p>
 	                              </div>
 	                              <div class="request-actions">
-	                                <a href="{{ item.share_url or url_for('share_recording', token=item.share_token) }}">Open prepared share link</a>
-	                                <form method="post" action="{{ url_for('revoke_request_link', request_id=item.id) }}">
+	                                <a href="{{ item.share_url or recordings_url_for('share_recording', token=item.share_token) }}">Open prepared share link</a>
+	                                <form method="post" action="{{ recordings_url_for('revoke_request_link', request_id=item.id) }}">
 	                                  <input type="hidden" name="tab" value="{{ active_tab }}">
 	                                  <button class="danger" type="submit">Revoke Access</button>
 	                                </form>
@@ -3988,7 +4207,7 @@ RECORDING_ADMIN_TEMPLATE = """
 	                                <p>This request is complete. Mark it archived only if you want the internal history flag.</p>
 	                              </div>
 	                              <div class="request-actions">
-	                                <form method="post" action="{{ url_for('archive_request', request_id=item.id) }}">
+	                                <form method="post" action="{{ recordings_url_for('archive_request', request_id=item.id) }}">
 	                                  <input type="hidden" name="tab" value="{{ active_tab }}">
 	                                  <button type="submit">Archive</button>
 	                                </form>
@@ -3998,7 +4217,7 @@ RECORDING_ADMIN_TEMPLATE = """
 	                          {% if item.status in ["pending", "ready"] %}
 	                            {% set candidates = candidates_by_request.get(item.id, []) %}
 	                            {% if candidates %}
-	                              <form class="approve-form" method="post" action="{{ url_for('send_request_link', request_id=item.id) }}">
+	                              <form class="approve-form" method="post" action="{{ recordings_url_for('send_request_link', request_id=item.id) }}">
 	                                <input type="hidden" name="tab" value="{{ active_tab }}">
 	                                <div class="approval-head">
 	                                  <div>
@@ -4112,7 +4331,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         inset:0;
         z-index:-1;
         pointer-events:none;
-        background:url("{{ url_for('ntc_brand_background') }}") center / min(1120px,118vw) auto no-repeat;
+        background:url("{{ recordings_url_for('ntc_brand_background') }}") center / min(1120px,118vw) auto no-repeat;
         opacity:.31;
         filter:saturate(1.08) contrast(1.04);
       }
@@ -4459,9 +4678,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
           <p class="muted">Listen through service recordings and identify testimony speakers.</p>
         </div>
         <div class="actions">
-          <a href="{{ url_for('admin_panel') }}">Requests</a>
-          <a href="{{ url_for('public_form') }}">Public Form</a>
-          <form method="post" action="{{ url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
+          <a href="{{ recordings_url_for('admin_panel') }}">Requests</a>
+          <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
+          <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
         </div>
       </header>
       <datalist id="speaker-name-options">
@@ -4482,10 +4701,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
       <div class="toolbar">
         <nav class="tabs" aria-label="Testimony review filters">
           {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("not_testimony", "Not Testimony"), ("all", "All")] %}
-            <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong>{{ counts[key] }}</strong></a>
+            <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ recordings_url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong>{{ counts[key] }}</strong></a>
           {% endfor %}
         </nav>
-        <form class="probe-form" method="post" action="{{ url_for('probe_testimony_durations') }}">
+        <form class="probe-form" method="post" action="{{ recordings_url_for('probe_testimony_durations') }}">
           <input type="hidden" name="status" value="{{ status_filter }}">
           <input type="hidden" name="sort" value="{{ sort }}">
           <label>
@@ -4494,13 +4713,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
           </label>
           <button type="submit">Check Durations</button>
         </form>
-        <form class="probe-form" method="post" action="{{ url_for('suggest_all_testimony_speakers') }}">
+        <form class="probe-form" method="post" action="{{ recordings_url_for('suggest_all_testimony_speakers') }}">
           <input type="hidden" name="status" value="{{ status_filter }}">
           <input type="hidden" name="sort" value="{{ sort }}">
           <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
         </form>
       </div>
-      <div class="job-panel" data-suggestion-job data-status-url="{{ url_for('testimony_suggestion_status') }}" data-state="{{ suggestion_job.state }}" {% if suggestion_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
+      <div class="job-panel" data-suggestion-job data-status-url="{{ recordings_url_for('testimony_suggestion_status') }}" data-state="{{ suggestion_job.state }}" {% if suggestion_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
         <div>
           <span>Speaker Suggestions</span>
           <strong data-job-message>{{ suggestion_job.message or "Idle." }}</strong>
@@ -4516,7 +4735,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
             <h2>{{ status_label(status_filter) }}</h2>
             <p class="muted">Listen, confirm the service date, then save the speaker or mark clips that are not testimonies.</p>
           </div>
-          <form class="probe-form" method="get" action="{{ url_for('testimony_review') }}">
+          <form class="probe-form" method="get" action="{{ recordings_url_for('testimony_review') }}">
             <input type="hidden" name="status" value="{{ status_filter }}">
             <label>
               <span>Sort</span>
@@ -4574,7 +4793,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                       <div class="fact wide"><span>File</span><strong data-field="file-fact">{{ item.source_label }}</strong></div>
                     </div>
                   </section>
-                  <form class="review-form" method="post" action="{{ url_for('update_testimony_review', recording_id=item.id) }}">
+                  <form class="review-form" method="post" action="{{ recordings_url_for('update_testimony_review', recording_id=item.id) }}">
                     <input type="hidden" name="sort" value="{{ sort }}">
                     <input type="hidden" name="status_filter" value="{{ status_filter }}">
                     <input type="hidden" name="source_path" value="{{ item.source_path }}">
@@ -4615,7 +4834,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                             <strong>No suggestion yet</strong>
                             <small>Checks the filename first, then the configured intro transcription.</small>
                           </div>
-                          <button class="secondary" type="submit" formaction="{{ url_for('suggest_testimony_speaker', recording_id=item.id) }}" formmethod="post">Suggest Speaker</button>
+                          <button class="secondary" type="submit" formaction="{{ recordings_url_for('suggest_testimony_speaker', recording_id=item.id) }}" formmethod="post">Suggest Speaker</button>
                         </div>
                       {% endif %}
                     </section>
@@ -4768,6 +4987,18 @@ TESTIMONY_REVIEW_TEMPLATE = """
         editPanel.appendChild(panel);
       }
 
+      async function readJsonResponse(response) {
+        const contentType = response.headers.get("Content-Type") || "";
+        if (contentType.toLowerCase().includes("application/json")) {
+          return response.json();
+        }
+        const text = await response.text();
+        return {
+          ok: false,
+          error: text.trim().startsWith("<") ? "The server returned a page instead of a testimony update. Refresh and try again." : "The server response was not JSON.",
+        };
+      }
+
       document.addEventListener("click", (event) => {
         const button = event.target.closest(".apply-suggestion");
         if (!button) return;
@@ -4820,7 +5051,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
             body: formData,
             headers: { "Accept": "application/json", "X-Requested-With": "fetch" },
           });
-          const data = await response.json();
+          const data = await readJsonResponse(response);
           if (!response.ok || !data.ok) {
             throw new Error(data.error || data.message || "The testimony update failed.");
           }

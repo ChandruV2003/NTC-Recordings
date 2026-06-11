@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from ntc_recordings_app import _date_from_file_metadata, _recording_id, _testimony_suggestion_targets, create_app
+from ntc_recordings_app import _date_from_file_metadata, _extract_intro_speaker, _recording_id, _testimony_suggestion_targets, create_app
 
 
 class RecordingRequestPanelTests(unittest.TestCase):
@@ -112,6 +112,48 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(created.status_code, 200)
         self.assertIn(b"Request submitted", created.data)
+
+    def test_public_mount_renders_prefixed_forms_and_redirects(self):
+        self.app.config["NTC_RECORDINGS_PUBLIC_BASE_URL"] = "https://ntcnas.myftp.org/recordings"
+
+        public = self.client.get("/", base_url="https://ntcnas.myftp.org")
+
+        self.assertEqual(public.status_code, 200)
+        self.assertIn(b'action="/recordings/request"', public.data)
+
+        created = self.client.post(
+            "/request",
+            base_url="https://ntcnas.myftp.org",
+            data={
+                "requester_name": "Public Prefix Person",
+                "email": "prefix@example.test",
+                "requested_date": self._first_recording_date_from_public_form(),
+            },
+        )
+
+        self.assertEqual(created.status_code, 302)
+        self.assertTrue(created.headers["Location"].startswith("/recordings/?message="))
+
+        login = self.client.post(
+            "/admin/login",
+            base_url="https://ntcnas.myftp.org",
+            data={"password": "admin-password"},
+        )
+        self.assertEqual(login.status_code, 302)
+        self.assertEqual(login.headers["Location"], "/recordings/admin/panel")
+
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir(exist_ok=True)
+        (testimony_source_root / "REC00123.mp3").write_bytes(b"prefix-testimony-audio")
+
+        review = self.client.get("/admin/testimonies", base_url="https://ntcnas.myftp.org")
+
+        self.assertEqual(review.status_code, 200)
+        self.assertIn(b'href="/recordings/admin/panel"', review.data)
+        self.assertIn(b'data-status-url="/recordings/admin/testimonies/suggest-status"', review.data)
+        self.assertIn(b'action="/recordings/admin/testimonies/', review.data)
+        self.assertIn(b'formaction="/recordings/admin/testimonies/', review.data)
+        self.assertIn(b'data-src="/recordings/admin/testimonies/audio/', review.data)
 
     def test_worship_request_matches_worship_recording(self):
         created = self.client.post(
@@ -714,6 +756,23 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertIsNotNone(named_row)
         self.assertEqual(named_row[0], "not_testimony")
+
+    def test_intro_speaker_suggestions_require_person_names(self):
+        self.assertEqual(
+            _extract_intro_speaker("Praise the Lord. For those of you who do not know me, my name is Kevin.", []),
+            "Kevin",
+        )
+        self.assertEqual(
+            _extract_intro_speaker("Praise the Lord, I'm Sister Shirley and I want to thank the Lord.", []),
+            "Sister Shirley",
+        )
+        self.assertEqual(
+            _extract_intro_speaker("Praise the Lord, my name is Rachel and I want to testify.", ["Sister Rachel"]),
+            "Sister Rachel",
+        )
+        self.assertEqual(_extract_intro_speaker("This is for all of us as we worship today.", []), "")
+        self.assertEqual(_extract_intro_speaker("I'm not going to give a long testimony today.", []), "")
+        self.assertEqual(_extract_intro_speaker("I am deeply thankful for what God has done.", []), "")
 
     def test_legacy_testimony_source_config_still_works(self):
         legacy_root = self.root / "LegacyRecorder"
