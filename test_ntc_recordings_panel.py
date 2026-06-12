@@ -17,9 +17,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.root.mkdir(parents=True)
         self.worship_root = Path(self.tempdir.name) / "WorshipRecordings"
         self.worship_root.mkdir(parents=True)
+        self.testimony_root = Path(self.tempdir.name) / "TestimonyRecordings"
+        self.testimony_root.mkdir(parents=True)
         self.recording = self.root / "20260419 - Jesus Is Our Peace - Bro Blessen.mp3"
         self.recording.write_bytes(b"fake-mp3-audio")
-        (self.root / "February 8, 2026 - Brother Paul's Testimony.mp3").write_bytes(b"fake-testimony-audio")
+        (self.testimony_root / "February 8, 2026 - Brother Paul's Testimony.mp3").write_bytes(b"fake-testimony-audio")
+        (self.testimony_root / "February 8, 2026 - Sister Mary's Testimony.mp3").write_bytes(b"second-testimony-audio")
         self.worship_service = self.worship_root / "2026" / "April" / "April 19, 2026 - Sunday Service"
         (self.worship_service / "LR").mkdir(parents=True)
         (self.worship_service / "FULL").mkdir(parents=True)
@@ -31,8 +34,9 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "TESTING": True,
                 "SECRET_KEY": "test-secret",
                 "NTC_RECORDINGS_DB_PATH": str(self.db_path),
-                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root}",
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
                 "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(self.root / "DN300R"),
+                "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
                 "NTC_RECORDINGS_PUBLIC_BASE_URL": "https://recordings.example.test",
                 "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
                 "NTC_RECORDINGS_EMAIL_ENABLED": "0",
@@ -91,6 +95,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"renderCalendar", response.data)
         self.assertIn(b"syncJumpControls", response.data)
         self.assertNotIn(b'<select name="requested_date"', response.data)
+        self.assertNotIn(b"${option.count} file", response.data)
         self.assertIn(b"Send Copy To", response.data)
         self.assertNotIn(b"Search Recordings", response.data)
         self.assertNotIn(b"Jesus Is Our Peace - Bro Blessen", response.data)
@@ -214,7 +219,15 @@ class RecordingRequestPanelTests(unittest.TestCase):
         panel = self.client.get("/admin/panel").data
         self.assertIn(b"Testimony Person", panel)
         self.assertIn(b"Testimony", panel)
-        self.assertIn(b"Brother Paul", panel)
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT recording_path, recording_title FROM recording_requests WHERE requester_name = ?",
+                ("Testimony Person",),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertTrue(row[0].endswith(".mp3"))
+        self.assertIn("Testimony", row[1])
+        self.assertIn("TestimonyRecordings", row[0])
 
     def test_admin_requires_password_and_can_prepare_share_link(self):
         self.client.post(
@@ -397,16 +410,16 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["recording_count"], 4)
+        self.assertEqual(payload["recording_count"], 5)
         self.assertEqual(payload["recording_counts_by_kind"]["message"], 1)
         self.assertEqual(payload["recording_counts_by_kind"]["worship"], 2)
-        self.assertEqual(payload["recording_counts_by_kind"]["testimony"], 1)
+        self.assertEqual(payload["recording_counts_by_kind"]["testimony"], 2)
         with sqlite3.connect(self.db_path) as connection:
             indexed_count = connection.execute("SELECT COUNT(*) FROM recording_library").fetchone()[0]
             refreshed_at = connection.execute(
                 "SELECT value FROM recording_library_meta WHERE key = 'last_refresh_finished'"
             ).fetchone()
-        self.assertEqual(indexed_count, 4)
+        self.assertEqual(indexed_count, 5)
         self.assertIsNotNone(refreshed_at)
 
     def test_nextcloud_share_provider_can_generate_public_link(self):
@@ -695,7 +708,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b"20260419 - Sister Test&#39;s Testimony.mp3", saved.data)
         self.assertNotIn(b"Sunday Testimonies", saved.data)
 
-        renamed_path = self.root / "2026" / "Sunday Testimonies" / "April 19, 2026 - Sister Test's Testimony.mp3"
+        renamed_path = self.testimony_root / "2026" / "Sunday Testimonies" / "April 19, 2026 - Sister Test's Testimony.mp3"
         self.assertFalse(raw_recording.exists())
         self.assertTrue(renamed_path.exists())
         self.assertEqual(renamed_path.read_bytes(), b"raw-testimony-audio")
@@ -716,6 +729,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(row[0], "2026-04-19")
         self.assertEqual(row[1], "Sister Test's Testimony")
         self.assertIn("Sunday Testimonies", row[2])
+        self.assertIn("TestimonyRecordings", row[2])
         self.assertTrue(row[2].endswith("April 19, 2026 - Sister Test's Testimony.mp3"))
 
         identified_after_save = self.client.get("/admin/testimonies?status=identified")
@@ -763,6 +777,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("/admin/testimonies/", payload["review_url"])
         self.assertFalse(raw_recording.exists())
         self.assertTrue(Path(payload["source_path"]).exists())
+        self.assertIn("TestimonyRecordings", payload["source_path"])
 
     def test_testimony_review_ajax_auth_failure_returns_json(self):
         response = self.client.post(

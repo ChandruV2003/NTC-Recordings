@@ -39,8 +39,9 @@ install_legacy_env_aliases()
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac"}
 DEFAULT_MESSAGE_RECORDING_DIR = "/mnt/MainRecordings/Recordings/MessageRecordings"
 DEFAULT_WORSHIP_RECORDING_DIR = "/mnt/MainRecordings/Recordings/WorshipRecordings"
+DEFAULT_TESTIMONY_RECORDING_DIR = "/mnt/MainRecordings/Recordings/TestimonyRecordings"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
-DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR}"
+DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
 MONTHS = {
     "jan": 1,
     "january": 1,
@@ -224,6 +225,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             or os.getenv("NTC_RECORDINGS_DN300R_DIR")
             or str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R")
         ),
+        NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR=os.getenv("NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR", DEFAULT_TESTIMONY_RECORDING_DIR),
         NTC_RECORDINGS_MAX_SCAN_FILES=int(os.getenv("NTC_RECORDINGS_MAX_SCAN_FILES", "4000")),
         NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT", "80")),
         NTC_RECORDINGS_TESTIMONY_MIN_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_MIN_SECONDS", "45")),
@@ -1736,11 +1738,32 @@ def _message_recording_root(app: Flask) -> Path:
     return Path(DEFAULT_MESSAGE_RECORDING_DIR)
 
 
+def _testimony_recording_root(app: Flask) -> Path:
+    configured = Path(str(app.config.get("NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR") or DEFAULT_TESTIMONY_RECORDING_DIR))
+    roots = _library_roots(app)
+    for kind, root in roots:
+        if kind == "testimony":
+            return root
+    for _, root in roots:
+        if "testimonyrecordings" in re.sub(r"[^a-z]+", "", str(root).lower()):
+            return root
+    return configured
+
+
+def _relative_to_first_root(path: Path, roots: Iterable[Path]) -> str:
+    for root in roots:
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            continue
+    raise ValueError(f"{path} is outside known roots")
+
+
 def _testimony_source_candidates(app: Flask) -> list[RecordingCandidate]:
     root = _testimony_source_root(app)
     if not root.exists() or not root.is_dir():
         return []
-    message_root = _message_recording_root(app)
+    known_roots = [_testimony_recording_root(app), _message_recording_root(app), root]
     candidates = []
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
@@ -1753,12 +1776,9 @@ def _testimony_source_candidates(app: Flask) -> list[RecordingCandidate]:
             continue
         recording_date = _extract_recording_date(" ".join(path.parts)) or _date_from_file_metadata(stat) or ""
         try:
-            relative_path = str(path.relative_to(message_root))
+            relative_path = _relative_to_first_root(path, known_roots)
         except ValueError:
-            try:
-                relative_path = str(path.relative_to(root))
-            except ValueError:
-                relative_path = path.name
+            relative_path = path.name
         kind = "testimony" if _raw_testimony_name(path) else "message"
         candidates.append(
             RecordingCandidate(
@@ -1779,7 +1799,8 @@ def _testimony_source_candidates(app: Flask) -> list[RecordingCandidate]:
 def _testimony_source_candidate_from_path(app: Flask, path: Path) -> RecordingCandidate | None:
     root = _testimony_source_root(app)
     message_root = _message_recording_root(app)
-    if not _path_within(path, root) and not _path_within(path, message_root):
+    testimony_root = _testimony_recording_root(app)
+    if not _path_within(path, root) and not _path_within(path, message_root) and not _path_within(path, testimony_root):
         return None
     if not path.exists() or not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
         return None
@@ -1791,12 +1812,9 @@ def _testimony_source_candidate_from_path(app: Flask, path: Path) -> RecordingCa
         return None
     recording_date = _extract_recording_date(" ".join(path.parts)) or _date_from_file_metadata(stat) or ""
     try:
-        relative_path = str(path.relative_to(message_root))
+        relative_path = _relative_to_first_root(path, [testimony_root, message_root, root])
     except ValueError:
-        try:
-            relative_path = str(path.relative_to(root))
-        except ValueError:
-            relative_path = path.name
+        relative_path = path.name
     kind = "testimony" if _raw_testimony_name(path) else "message"
     return RecordingCandidate(
         id=_recording_id(path),
@@ -2290,11 +2308,12 @@ def _rename_testimony_recording(
     source_path = Path(candidate.path)
     proposed_path = Path(_proposed_testimony_path(app, source_path, service_date, speaker_name, testimony_title))
     message_root = _message_recording_root(app)
+    testimony_root = _testimony_recording_root(app)
     source_root = _testimony_source_root(app)
-    if not _path_within(source_path, source_root) and not _path_within(source_path, message_root):
+    if not _path_within(source_path, source_root) and not _path_within(source_path, message_root) and not _path_within(source_path, testimony_root):
         return candidate, str(proposed_path), "Source file is outside the testimony recording folder."
-    if not _path_within(proposed_path, message_root):
-        return candidate, str(proposed_path), "Proposed testimony filename is outside MessageRecordings."
+    if not _path_within(proposed_path, testimony_root):
+        return candidate, str(proposed_path), "Proposed testimony filename is outside TestimonyRecordings."
     try:
         resolved_source = source_path.resolve()
         resolved_target = proposed_path.resolve()
@@ -2695,7 +2714,7 @@ def _proposed_testimony_path(
     if not title:
         title = "Testimony"
     filename = _sanitize_filename_part(f"{date_prefix} - {title}") + source_path.suffix.lower()
-    return str(_message_recording_root(app) / year / "Sunday Testimonies" / filename)
+    return str(_testimony_recording_root(app) / year / "Sunday Testimonies" / filename)
 
 
 def _date_from_file_metadata(stat_result: os.stat_result) -> str | None:
@@ -3721,7 +3740,7 @@ RECORDING_PUBLIC_TEMPLATE = """
             dayButton.className = `calendar-day ${availableForKind ? "is-available" : "is-unavailable"} ${dateKey === selectedDate ? "is-selected" : ""}`;
             dayButton.disabled = !availableForKind;
             dayButton.setAttribute("aria-label", option ? option.label : `${month + 1}/${day}/${year} unavailable`);
-            dayButton.innerHTML = `<span>${day}</span>${option ? `<small>${option.count} file${option.count === 1 ? "" : "s"}</small>` : ""}`;
+            dayButton.innerHTML = `<span>${day}</span>`;
             if (availableForKind) {
               dayButton.addEventListener("click", () => {
                 setSelectedDate(dateKey);
