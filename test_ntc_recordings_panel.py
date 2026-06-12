@@ -715,6 +715,34 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertFalse(raw_recording.exists())
         self.assertTrue(Path(payload["source_path"]).exists())
 
+    def test_testimony_review_ajax_auth_failure_returns_json(self):
+        response = self.client.post(
+            "/admin/testimonies/missing-recording/review",
+            data={
+                "status": "identified",
+                "source_path": "/missing/file.mp3",
+                "speaker_name": "Nobody",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.content_type, "application/json")
+        self.assertEqual(response.get_json()["error"], "Admin session expired. Sign in again, then retry the testimony update.")
+
+    def test_testimony_review_uses_form_action_for_regular_save_buttons(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        (testimony_source_root / "REC00088.mp3").write_bytes(b"async-testimony-audio")
+
+        self._login()
+        response = self.client.get("/admin/testimonies")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"function submissionUrl(form, submitter)", response.data)
+        self.assertIn(b'getAttribute("formaction")', response.data)
+        self.assertNotIn(b"submitter.formAction ? submitter.formAction : form.action", response.data)
+
     def test_bulk_testimony_suggestions_route_starts_background_job(self):
         testimony_source_root = self.root / "DN300R"
         testimony_source_root.mkdir()

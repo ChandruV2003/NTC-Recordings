@@ -293,6 +293,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     def _require_admin():
         if _is_admin():
             return None
+        if _wants_json_response():
+            return jsonify({"ok": False, "error": "Admin session expired. Sign in again, then retry the testimony update."}), 401
         return _redirect_to(app, "admin_login", error="Admin password required.")
 
     @app.get("/healthz")
@@ -4996,8 +4998,14 @@ TESTIMONY_REVIEW_TEMPLATE = """
         const text = await response.text();
         return {
           ok: false,
-          error: text.trim().startsWith("<") ? "The server returned a page instead of a testimony update. Refresh and try again." : "The server response was not JSON.",
+          error: text.trim().startsWith("<") ? `The server returned a page instead of a testimony update (HTTP ${response.status}). Sign in again if the admin page expired, then retry.` : `The server response was not JSON (HTTP ${response.status}).`,
         };
+      }
+
+      function submissionUrl(form, submitter) {
+        const override = submitter ? submitter.getAttribute("formaction") : "";
+        const target = override || form.getAttribute("action") || form.action;
+        return new URL(target, window.location.href).toString();
       }
 
       document.addEventListener("click", (event) => {
@@ -5033,7 +5041,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
 
         const card = form.closest(".review-card");
         const submitter = event.submitter;
-        const url = submitter && submitter.formAction ? submitter.formAction : form.action;
+        const url = submissionUrl(form, submitter);
         let formData;
         try {
           formData = new FormData(form, submitter);
