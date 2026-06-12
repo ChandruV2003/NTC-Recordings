@@ -4789,15 +4789,15 @@ TESTIMONY_REVIEW_TEMPLATE = """
         {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
       </div>
       <section class="metrics" aria-label="Testimony review status">
-        <div class="metric"><span>Needs Review</span><strong>{{ counts.needs_review }}</strong><small>Awaiting identification</small></div>
-        <div class="metric"><span>Identified</span><strong>{{ counts.identified }}</strong><small>Speaker confirmed or already named</small></div>
-        <div class="metric"><span>Not Testimony</span><strong>{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
-        <div class="metric"><span>Files Found</span><strong>{{ counts.all }}</strong><small>Folder connected</small></div>
+        <div class="metric"><span>Needs Review</span><strong data-count="needs_review">{{ counts.needs_review }}</strong><small>Awaiting identification</small></div>
+        <div class="metric"><span>Identified</span><strong data-count="identified">{{ counts.identified }}</strong><small>Speaker confirmed or already named</small></div>
+        <div class="metric"><span>Not Testimony</span><strong data-count="not_testimony">{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
+        <div class="metric"><span>Files Found</span><strong data-count="all">{{ counts.all }}</strong><small>Folder connected</small></div>
       </section>
       <div class="toolbar">
         <nav class="tabs" aria-label="Testimony review filters">
           {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("not_testimony", "Not Testimony"), ("all", "All")] %}
-            <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ recordings_url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong>{{ counts[key] }}</strong></a>
+            <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ recordings_url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong data-count="{{ key }}">{{ counts[key] }}</strong></a>
           {% endfor %}
         </nav>
         <form class="probe-form" method="post" action="{{ recordings_url_for('probe_testimony_durations') }}">
@@ -4851,9 +4851,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
         {% if not testimony_source_exists %}
           <div class="empty">Testimony source folder is not connected.</div>
         {% elif items %}
-          <div class="review-list">
+          <div class="review-list" data-review-list data-active-filter="{{ status_filter }}" data-empty-message="No recordings match this filter.">
             {% for item in items %}
-              <details class="review-card {{ item.status }}" data-review-id="{{ item.id }}">
+              <details class="review-card {{ item.status }}" data-review-id="{{ item.id }}" data-status="{{ item.status }}">
                 <summary>
                   <div class="review-row">
                     <div class="cell">
@@ -4953,6 +4953,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
       const openCardsKey = "ntc-testimony-open-cards";
       const statusClasses = ["needs_review", "identified", "not_testimony", "already_named"];
       const bannerStack = document.querySelector("[data-banner-stack]");
+      const reviewList = document.querySelector("[data-review-list]");
+      const activeReviewFilter = reviewList ? reviewList.dataset.activeFilter || "needs_review" : "needs_review";
 
       function storedOpenCards() {
         try {
@@ -4996,7 +4998,44 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
       }
 
+      function countStatus(status) {
+        return status === "already_named" ? "identified" : status;
+      }
+
+      function changeCount(status, delta) {
+        const key = countStatus(status);
+        if (!key || !delta) return;
+        document.querySelectorAll(`[data-count="${key}"]`).forEach((node) => {
+          const current = Number.parseInt(node.textContent || "0", 10);
+          node.textContent = String(Math.max(0, (Number.isNaN(current) ? 0 : current) + delta));
+        });
+      }
+
+      function updateStatusCounts(previousStatus, nextStatus) {
+        const previousKey = countStatus(previousStatus);
+        const nextKey = countStatus(nextStatus);
+        if (!previousKey || !nextKey || previousKey === nextKey) return;
+        changeCount(previousKey, -1);
+        changeCount(nextKey, 1);
+      }
+
+      function belongsInActiveFilter(status) {
+        const key = countStatus(status);
+        if (activeReviewFilter === "all") return true;
+        if (activeReviewFilter === "identified") return key === "identified";
+        return key === activeReviewFilter;
+      }
+
+      function replaceEmptyReviewList() {
+        if (!reviewList || reviewList.querySelector(".review-card")) return;
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = reviewList.dataset.emptyMessage || "No recordings match this filter.";
+        reviewList.replaceWith(empty);
+      }
+
       function updateReviewCard(card, data) {
+        const previousStatus = card.dataset.status || "";
         setText(card, "title", data.title);
         setText(card, "listen-title", data.title);
         setText(card, "source-label", data.source_label);
@@ -5013,6 +5052,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         if (data.status) {
           card.classList.remove(...statusClasses);
           card.classList.add(data.status);
+          card.dataset.status = data.status;
         }
         if (data.recording_id) {
           card.dataset.reviewId = data.recording_id;
@@ -5041,6 +5081,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
         if (data.speaker_name) {
           card.querySelectorAll(".suggestion-panel").forEach((panel) => panel.remove());
+        }
+        if (data.status) {
+          updateStatusCounts(previousStatus, data.status);
+          if (!belongsInActiveFilter(data.status)) {
+            card.remove();
+            replaceEmptyReviewList();
+          }
         }
         saveOpenCards();
       }
