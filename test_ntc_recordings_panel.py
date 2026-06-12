@@ -8,7 +8,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from ntc_recordings_app import _date_from_file_metadata, _extract_intro_speaker, _recording_id, _testimony_suggestion_targets, create_app
+from ntc_recordings_app import (
+    _date_from_file_metadata,
+    _extract_intro_speaker,
+    _recording_id,
+    _testimony_suggestion_targets,
+    _valid_person_name_suggestion,
+    create_app,
+)
 
 
 class RecordingRequestPanelTests(unittest.TestCase):
@@ -919,6 +926,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(_extract_intro_speaker("This is for all of us as we worship today.", []), "")
         self.assertEqual(_extract_intro_speaker("I'm not going to give a long testimony today.", []), "")
         self.assertEqual(_extract_intro_speaker("I am deeply thankful for what God has done.", []), "")
+        self.assertEqual(_extract_intro_speaker("Praise the Lord. I am happening to me in this situation.", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Happening To Me", []), "")
 
     def test_legacy_testimony_source_config_still_works(self):
         legacy_root = self.root / "LegacyRecorder"
