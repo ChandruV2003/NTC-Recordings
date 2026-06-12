@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import tempfile
@@ -691,16 +692,17 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(suggestion_row[2], "transcript_intro")
         self.assertIn("my name is Kevin", suggestion_row[3])
 
-        saved = self.client.post(
-            f"/admin/testimonies/{recording_id}/review",
-            data={
-                "status": "identified",
-                "status_filter": "needs_review",
-                "source_path": str(raw_recording),
-                "speaker_name": "Sister Test",
-            },
-            follow_redirects=True,
-        )
+        with patch("os.rename", side_effect=OSError(errno.EXDEV, "Invalid cross-device link")):
+            saved = self.client.post(
+                f"/admin/testimonies/{recording_id}/review",
+                data={
+                    "status": "identified",
+                    "status_filter": "needs_review",
+                    "source_path": str(raw_recording),
+                    "speaker_name": "Sister Test",
+                },
+                follow_redirects=True,
+            )
 
         self.assertEqual(saved.status_code, 200)
         self.assertIn(b"Testimony review saved and renamed", saved.data)

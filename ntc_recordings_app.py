@@ -13,6 +13,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import smtplib
 import sqlite3
 import subprocess
@@ -2324,9 +2325,9 @@ def _rename_testimony_recording(
     try:
         proposed_path.parent.mkdir(parents=True, exist_ok=True)
         target_path = _unique_destination_path(proposed_path)
-        source_path.rename(target_path)
+        shutil.move(str(source_path), str(target_path))
     except OSError as exc:
-        return candidate, str(proposed_path), f"File rename failed: {exc}"
+        return candidate, str(proposed_path), f"File move failed: {exc}"
     renamed = _testimony_source_candidate_from_path(app, target_path)
     if not renamed:
         return candidate, str(target_path), "File was renamed but could not be reloaded."
