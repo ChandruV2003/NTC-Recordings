@@ -270,11 +270,17 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         share = self.client.get(f"/share/{token}")
         self.assertEqual(share.status_code, 200)
-        self.assertIn(b"Download Recording", share.data)
+        self.assertIn(b"<audio", share.data)
+        self.assertIn(b'controlsList="nodownload"', share.data)
+        self.assertIn(b"Download access is disabled", share.data)
+
+        stream = self.client.get(f"/share/{token}/stream")
+        self.assertEqual(stream.status_code, 200)
+        self.assertEqual(stream.data, b"fake-mp3-audio")
 
         download = self.client.get(f"/share/{token}/download")
-        self.assertEqual(download.status_code, 200)
-        self.assertEqual(download.data, b"fake-mp3-audio")
+        self.assertEqual(download.status_code, 403)
+        self.assertEqual(download.get_json()["error"], "recording downloads are disabled for shared links")
 
         revoked = self.client.post("/admin/requests/1/revoke", follow_redirects=True)
         self.assertEqual(revoked.status_code, 200)
@@ -427,8 +433,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
         fake_get.json.return_value = {"ocs": {"data": []}}
         fake_response = Mock(status_code=200)
         fake_response.json.return_value = {"ocs": {"data": {"id": 2468, "url": "https://nextcloud.example.test/s/share-token"}}}
+        fake_put = Mock(status_code=200)
 
-        with patch("ntc_recordings_app.requests.get", return_value=fake_get) as get, patch("ntc_recordings_app.requests.post", return_value=fake_response) as post:
+        with (
+            patch("ntc_recordings_app.requests.get", return_value=fake_get) as get,
+            patch("ntc_recordings_app.requests.post", return_value=fake_response) as post,
+            patch("ntc_recordings_app.requests.put", return_value=fake_put) as put,
+        ):
             prepared = self.client.post(
                 "/admin/requests/1/send",
                 data={"recording_id": recording_id},
@@ -444,7 +455,20 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Completed Requests", completed.data)
         get.assert_called_once()
         post.assert_called_once()
+        put.assert_called_once()
         self.assertEqual(post.call_args.kwargs["data"]["path"], "/Recordings/MessageRecordings/20260419 - Jesus Is Our Peace - Bro Blessen.mp3")
+        self.assertEqual(post.call_args.kwargs["data"]["shareType"], 3)
+        self.assertEqual(post.call_args.kwargs["data"]["permissions"], 1)
+        self.assertEqual(
+            json.loads(post.call_args.kwargs["data"]["attributes"]),
+            [{"scope": "permissions", "key": "download", "value": False}],
+        )
+        self.assertIn("/shares/2468", put.call_args.args[0])
+        self.assertEqual(put.call_args.kwargs["data"]["permissions"], 1)
+        self.assertEqual(
+            json.loads(put.call_args.kwargs["data"]["attributes"]),
+            [{"scope": "permissions", "key": "download", "value": False}],
+        )
 
         fake_delete = Mock(status_code=200)
         with patch("ntc_recordings_app.requests.delete", return_value=fake_delete) as delete:
@@ -481,8 +505,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
         fake_get.json.return_value = {"ocs": {"data": []}}
         fake_response = Mock(status_code=200)
         fake_response.json.return_value = {"ocs": {"data": {"id": 1357, "url": "https://nextcloud.example.test/s/worship-folder"}}}
+        fake_put = Mock(status_code=200)
 
-        with patch("ntc_recordings_app.requests.get", return_value=fake_get), patch("ntc_recordings_app.requests.post", return_value=fake_response) as post:
+        with (
+            patch("ntc_recordings_app.requests.get", return_value=fake_get),
+            patch("ntc_recordings_app.requests.post", return_value=fake_response) as post,
+            patch("ntc_recordings_app.requests.put", return_value=fake_put) as put,
+        ):
             prepared = self.client.post(
                 "/admin/requests/1/send",
                 data={"recording_id": recording_id},
@@ -496,6 +525,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
             post.call_args.kwargs["data"]["path"],
             "/Worship Recordings/2026/April/April 19, 2026 - Sunday Service",
         )
+        self.assertEqual(post.call_args.kwargs["data"]["permissions"], 1)
+        self.assertEqual(
+            json.loads(post.call_args.kwargs["data"]["attributes"]),
+            [{"scope": "permissions", "key": "download", "value": False}],
+        )
+        put.assert_called_once()
+        self.assertIn("/shares/1357", put.call_args.args[0])
 
     def test_nextcloud_share_provider_reuses_existing_public_link(self):
         self.app.config.update(
@@ -526,7 +562,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
             }
         }
 
-        with patch("ntc_recordings_app.requests.get", return_value=fake_get) as get, patch("ntc_recordings_app.requests.post") as post:
+        fake_put = Mock(status_code=200)
+
+        with (
+            patch("ntc_recordings_app.requests.get", return_value=fake_get) as get,
+            patch("ntc_recordings_app.requests.post") as post,
+            patch("ntc_recordings_app.requests.put", return_value=fake_put) as put,
+        ):
             prepared = self.client.post(
                 "/admin/requests/1/send",
                 data={"recording_id": recording_id},
@@ -538,6 +580,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"https://nextcloud.example.test/s/existing-share", completed.data)
         get.assert_called_once()
         post.assert_not_called()
+        put.assert_called_once()
+        self.assertIn("/shares/9753", put.call_args.args[0])
+        self.assertEqual(put.call_args.kwargs["data"]["permissions"], 1)
+        self.assertEqual(
+            json.loads(put.call_args.kwargs["data"]["attributes"]),
+            [{"scope": "permissions", "key": "download", "value": False}],
+        )
 
         fake_delete = Mock(status_code=200)
         with patch("ntc_recordings_app.requests.delete", return_value=fake_delete) as delete:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import html
 import hmac
+import json
 import os
 import re
 import secrets
@@ -823,21 +824,25 @@ def create_app(test_config: dict | None = None) -> Flask:
             RECORDING_SHARE_TEMPLATE,
             title=row["recording_title"] or "Requested Recording",
             request_row=row,
-            download_url=_recordings_url_for(app, "download_recording", token=token),
+            stream_url=_recordings_url_for(app, "stream_recording", token=token),
             is_folder=shared_path.exists() and shared_path.is_dir(),
             folder_items=_folder_audio_items(app, shared_path),
             format_date=_format_date,
         )
 
-    @app.get("/share/<token>/download")
-    def download_recording(token: str):
+    @app.get("/share/<token>/stream")
+    def stream_recording(token: str):
         row = _get_request_by_token(app, token)
         if not row or not row["recording_path"]:
             return jsonify({"error": "share link was not found"}), 404
         path = Path(row["recording_path"])
         if not _path_allowed(app, path) or not path.exists() or not path.is_file():
             return jsonify({"error": "recording file is unavailable"}), 404
-        return send_file(path, as_attachment=True, download_name=path.name, conditional=True)
+        return send_file(path, as_attachment=False, conditional=True)
+
+    @app.get("/share/<token>/download")
+    def download_recording(token: str):
+        return jsonify({"error": "recording downloads are disabled for shared links"}), 403
 
     return app
 
@@ -2846,7 +2851,10 @@ def _create_share_link(
         existing_url = str(existing_row["share_url"] or "").strip()
         existing_id = str(existing_row["share_external_id"] or "").strip()
         if existing_url and existing_id and existing_row["recording_id"] == candidate.id:
-            return existing_url, "nextcloud", existing_id, ""
+            secure_error = _secure_nextcloud_share(app, existing_id)
+            if not secure_error:
+                return existing_url, "nextcloud", existing_id, ""
+            return internal_url, "internal", "", f"Nextcloud share fallback: {secure_error}"
 
     nextcloud_url, nextcloud_share_id, error = _create_nextcloud_share_link(app, candidate)
     if nextcloud_url:
@@ -2861,7 +2869,11 @@ def _create_nextcloud_share_link(app: Flask, candidate: RecordingCandidate) -> t
 
     existing_shares, lookup_error = _list_nextcloud_shares(app, nextcloud_path)
     if existing_shares:
-        return existing_shares[0]["url"], existing_shares[0]["id"], ""
+        share = existing_shares[0]
+        secure_error = _secure_nextcloud_share(app, share["id"])
+        if secure_error:
+            return "", "", secure_error
+        return share["url"], share["id"], ""
     if lookup_error:
         return "", "", lookup_error
 
@@ -2876,7 +2888,7 @@ def _create_nextcloud_share_link(app: Flask, candidate: RecordingCandidate) -> t
             params={"format": "json"},
             headers={"OCS-APIRequest": "true"},
             auth=(username, password),
-            data={"path": nextcloud_path, "shareType": 3, "permissions": 1},
+            data=_nextcloud_public_share_payload(nextcloud_path),
             timeout=15,
         )
     except requests.RequestException as exc:
@@ -2893,7 +2905,81 @@ def _create_nextcloud_share_link(app: Flask, candidate: RecordingCandidate) -> t
     if not share_url:
         message = (((payload.get("ocs") or {}).get("meta") or {}).get("message") or "missing share URL").strip()
         return "", "", message
+    secure_error = _secure_nextcloud_share(app, share_id)
+    if secure_error:
+        _delete_nextcloud_share(app, share_id)
+        return "", "", secure_error
     return share_url, share_id, ""
+
+
+def _nextcloud_public_share_payload(nextcloud_path: str = "", *, include_share_type: bool = True) -> dict[str, str | int]:
+    payload: dict[str, str | int] = {
+        "permissions": 1,
+        "attributes": _nextcloud_no_download_attributes(),
+    }
+    if include_share_type:
+        payload["shareType"] = 3
+    if nextcloud_path:
+        payload["path"] = nextcloud_path
+    return payload
+
+
+def _nextcloud_no_download_attributes() -> str:
+    return json.dumps(
+        [
+            {
+                "scope": "permissions",
+                "key": "download",
+                "value": False,
+            }
+        ],
+        separators=(",", ":"),
+    )
+
+
+def _secure_nextcloud_share(app: Flask, share_id: str) -> str:
+    if not share_id:
+        return "Nextcloud share id is missing"
+    config = _nextcloud_config(app)
+    if not config:
+        return "Nextcloud credentials are not configured"
+    base_url, username, password = config
+    endpoint = f"{base_url}/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}"
+    try:
+        response = requests.put(
+            endpoint,
+            params={"format": "json"},
+            headers={"OCS-APIRequest": "true"},
+            auth=(username, password),
+            data=_nextcloud_public_share_payload(include_share_type=False),
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        return str(exc)
+    if response.status_code >= 400:
+        return f"Nextcloud returned HTTP {response.status_code} while locking share"
+    return ""
+
+
+def _delete_nextcloud_share(app: Flask, share_id: str) -> str:
+    config = _nextcloud_config(app)
+    if not config:
+        return "Nextcloud credentials are not configured"
+    base_url, username, password = config
+    endpoint = f"{base_url}/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}"
+    try:
+        response = requests.delete(
+            endpoint,
+            params={"format": "json"},
+            headers={"OCS-APIRequest": "true"},
+            auth=(username, password),
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        return str(exc)
+    if response.status_code >= 400:
+        return f"Nextcloud returned HTTP {response.status_code}"
+    return ""
 
 
 def _revoke_share_link(app: Flask, row: sqlite3.Row) -> str:
@@ -2902,10 +2988,8 @@ def _revoke_share_link(app: Flask, row: sqlite3.Row) -> str:
     if provider != "nextcloud":
         return ""
 
-    config = _nextcloud_config(app)
-    if not config:
+    if not _nextcloud_config(app):
         return "Nextcloud credentials are not configured"
-    base_url, username, password = config
 
     share_ids = [external_id] if external_id else []
     if not share_ids:
@@ -2925,20 +3009,9 @@ def _revoke_share_link(app: Flask, row: sqlite3.Row) -> str:
 
     errors = []
     for share_id in share_ids:
-        endpoint = f"{base_url}/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}"
-        try:
-            response = requests.delete(
-                endpoint,
-                params={"format": "json"},
-                headers={"OCS-APIRequest": "true"},
-                auth=(username, password),
-                timeout=15,
-            )
-        except requests.RequestException as exc:
-            errors.append(str(exc))
-            continue
-        if response.status_code >= 400:
-            errors.append(f"Nextcloud returned HTTP {response.status_code}")
+        error = _delete_nextcloud_share(app, share_id)
+        if error:
+            errors.append(error)
     if errors:
         return "; ".join(errors)
     return ""
@@ -3072,7 +3145,7 @@ def _default_recording_email_message(row: sqlite3.Row, candidate: RecordingCandi
     return (
         "Praise the Lord,\n\n"
         f"Your requested recording from {_format_date(row['requested_date'])} is ready.\n\n"
-        "Please use the link below to listen to or download the recording.\n\n"
+        "Please use the link below to listen to the recording.\n\n"
         f"{selection_label}: {candidate.title}\n\n"
         "God bless,\n"
         "NTC Newark"
@@ -5152,7 +5225,8 @@ RECORDING_SHARE_TEMPLATE = """
       h1 { margin:0 0 .75rem; font-size:clamp(32px,5vw,54px); line-height:1; letter-spacing:-.05em; }
       p { color:var(--muted); line-height:1.5; }
       ul { margin:1rem auto 0; max-width:32rem; padding-left:1.2rem; color:var(--muted); text-align:left; line-height:1.55; }
-      a { display:inline-block; margin-top:1rem; border:1px solid var(--line); border-radius:16px; background:rgba(143,211,255,.14); color:var(--text); padding:.9rem 1.1rem; text-decoration:none; font-weight:900; }
+      audio { width:100%; margin-top:1rem; }
+      .notice { border:1px solid var(--line); border-radius:16px; background:rgba(143,211,255,.1); color:var(--muted); margin-top:1rem; padding:.85rem 1rem; }
     </style>
   </head>
   <body>
@@ -5173,7 +5247,8 @@ RECORDING_SHARE_TEMPLATE = """
             </ul>
           {% endif %}
         {% else %}
-          <a href="{{ download_url }}">Download Recording</a>
+          <audio controls controlsList="nodownload" preload="metadata" src="{{ stream_url }}"></audio>
+          <p class="notice">Download access is disabled for shared recording links.</p>
         {% endif %}
       </section>
     </main>
