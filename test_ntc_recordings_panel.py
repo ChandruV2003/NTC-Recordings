@@ -11,7 +11,9 @@ from unittest.mock import Mock, patch
 from ntc_recordings_app import (
     _date_from_file_metadata,
     _extract_intro_speaker,
+    _normalize_recording_email_message,
     _recording_id,
+    _testimony_looks_like_message_recording,
     _testimony_suggestion_targets,
     _valid_person_name_suggestion,
     create_app,
@@ -909,6 +911,53 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIsNotNone(named_row)
         self.assertEqual(named_row[0], "not_testimony")
 
+    def test_bulk_testimony_suggestions_mark_long_message_like_rows(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        message_recording = testimony_source_root / "REC00485.mp3"
+        message_recording.write_bytes(b"long-message-audio")
+        recording_id = _recording_id(message_recording)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    speaker_name,
+                    testimony_title,
+                    notes,
+                    proposed_path,
+                    duration_seconds,
+                    suggested_speaker,
+                    suggestion_source,
+                    suggestion_text,
+                    suggestion_updated_at,
+                    updated_at
+                )
+                VALUES (?, ?, 'needs_review', '2026-05-31', '', '', '', '', ?, '', 'transcript_intro', ?, '', ?)
+                """,
+                (
+                    recording_id,
+                    str(message_recording),
+                    3696,
+                    "You may be seated. Shall we turn to 2 Samuel? This whole chapter is very interesting.",
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                ),
+            )
+
+        targets = _testimony_suggestion_targets(self.app)
+
+        self.assertNotIn(recording_id, [item["candidate"].id for item in targets])
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT status, suggestion_text FROM testimony_reviews WHERE recording_id = ?",
+                (recording_id,),
+            ).fetchone()
+        self.assertEqual(row[0], "not_testimony")
+        self.assertIn("Shall we turn", row[1])
+
     def test_intro_speaker_suggestions_require_person_names(self):
         self.assertEqual(
             _extract_intro_speaker("Praise the Lord. For those of you who do not know me, my name is Kevin.", []),
@@ -928,6 +977,31 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(_extract_intro_speaker("I am deeply thankful for what God has done.", []), "")
         self.assertEqual(_extract_intro_speaker("Praise the Lord. I am happening to me in this situation.", []), "")
         self.assertEqual(_valid_person_name_suggestion("Happening To Me", []), "")
+
+    def test_email_message_normalizes_escaped_newlines(self):
+        message = "Praise the Lord,\\n\\nYour recording is ready.\\n\\nGod bless,\\nNTC Newark"
+
+        normalized = _normalize_recording_email_message(message)
+
+        self.assertEqual(normalized, "Praise the Lord,\n\nYour recording is ready.\n\nGod bless,\nNTC Newark")
+        self.assertNotIn("\\n", normalized)
+
+    def test_long_message_like_recordings_are_not_testimonies(self):
+        self.assertTrue(
+            _testimony_looks_like_message_recording(
+                self.app,
+                3700,
+                "You may be seated. Shall we turn to Philippians chapter 2 in verses 12 and 13.",
+            )
+        )
+        self.assertTrue(_testimony_looks_like_message_recording(self.app, 15000, "Thank you."))
+        self.assertFalse(
+            _testimony_looks_like_message_recording(
+                self.app,
+                980,
+                "Praise the Lord. My name is Nancy and I want to testify.",
+            )
+        )
 
     def test_legacy_testimony_source_config_still_works(self):
         legacy_root = self.root / "LegacyRecorder"

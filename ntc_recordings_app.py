@@ -46,6 +46,20 @@ DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFA
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "identified", "not_testimony", "duplicate", "all"}
 TESTIMONY_REVIEW_STATUSES = {"needs_review", "identified", "not_testimony", "duplicate", "already_named"}
 TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "identified", "not_testimony", "duplicate"}
+TESTIMONY_MESSAGE_INTRO_PATTERNS = [
+    r"\bshall\s+we\s+turn\s+to\b",
+    r"\blet'?s\s+turn\s+to\b",
+    r"\bturn\s+with\s+me\s+to\b",
+    r"\bturn\s+to\s+(?:the\s+book\s+of\s+)?[1-3]?\s*[a-z]+\b",
+    r"\b[a-z]+\s+chapter\s+\d+\b",
+    r"\bchapter\s+\d+\s+(?:and|in|verse|verses)\b",
+    r"\bverse\s+\d+\b",
+    r"\bverses\s+\d+\s*(?:and|-|through|to)\s*\d+\b",
+    r"\byou\s+may\s+be\s+seated\b",
+    r"\bplease\s+be\s+seated\b",
+    r"\bbe\s+seated\b",
+    r"\bword\s+of\s+god\s+says\b",
+]
 MONTHS = {
     "jan": 1,
     "january": 1,
@@ -783,7 +797,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         candidate = _recording_target_by_id(app, recording_id)
         if not candidate:
             return _redirect_to(app, "admin_panel", tab=target_tab, error="Selected recording was not found.")
-        email_message = (request.form.get("email_message") or "").strip()
+        email_message = _normalize_recording_email_message((request.form.get("email_message") or "").strip())
         if not email_message:
             email_message = _default_recording_email_message(row, candidate)
         token = row["share_token"] or secrets.token_urlsafe(22)
@@ -2095,6 +2109,14 @@ def _run_testimony_suggestion_job(app: Flask) -> None:
                     notes = target["notes"]
                     proposed_path = target["proposed_path"]
                     suggested_speaker, suggestion_source, suggestion_text, suggestion_error = _generate_testimony_speaker_suggestion(app, candidate)
+                    if (
+                        status == "needs_review"
+                        and not suggested_speaker
+                        and _testimony_looks_like_message_recording(app, duration_seconds, suggestion_text)
+                    ):
+                        status = "not_testimony"
+                        suggestion_source = suggestion_source or "transcript_intro"
+                        suggestion_text = suggestion_text or "Likely message recording based on duration and intro."
                     if suggested_speaker:
                         found += 1
                     elif suggestion_source or suggestion_text:
@@ -2185,9 +2207,14 @@ def _testimony_suggestion_targets(app: Flask) -> list[dict]:
         suggestion_source = str(row["suggestion_source"] or "") if row else ""
         if not service_date:
             service_date = candidate.recording_date
+        not_testimony_text = str(row["suggestion_text"] or "") if row else ""
         if status == "needs_review" and _duration_is_too_short_for_testimony(app, duration_seconds):
             status = "not_testimony"
-        if status == "not_testimony" and (not row or _row_duration(row) is None):
+            not_testimony_text = not_testimony_text or "Too short to be a testimony recording."
+        if status == "needs_review" and _testimony_looks_like_message_recording(app, duration_seconds, str(row["suggestion_text"] or "") if row else ""):
+            status = "not_testimony"
+            not_testimony_text = not_testimony_text or "Likely message recording based on duration and intro."
+        if status == "not_testimony" and (not row or str(row["status"] or "") != "not_testimony" or _row_duration(row) is None):
             _save_testimony_review(
                 app,
                 recording_id=candidate.id,
@@ -2201,7 +2228,7 @@ def _testimony_suggestion_targets(app: Flask) -> list[dict]:
                 duration_seconds=duration_seconds,
                 suggested_speaker=suggested_speaker,
                 suggestion_source=suggestion_source,
-                suggestion_text=str(row["suggestion_text"] or "") if row else "",
+                suggestion_text=not_testimony_text,
             )
         if status != "needs_review" or speaker_name or suggested_speaker or suggestion_source:
             skipped += 1
@@ -2446,6 +2473,27 @@ def _duration_is_too_short_for_testimony(app: Flask, duration_seconds: float | N
     except (TypeError, ValueError):
         minimum = 45
     return 0 < duration_seconds < max(1, minimum)
+
+
+def _testimony_looks_like_message_recording(app: Flask, duration_seconds: float | None, intro_text: str) -> bool:
+    if duration_seconds is None:
+        return False
+    try:
+        hard_max = int(app.config.get("NTC_RECORDINGS_TESTIMONY_HARD_MAX_SECONDS") or 4500)
+    except (TypeError, ValueError):
+        hard_max = 4500
+    if duration_seconds >= max(1, hard_max):
+        return True
+    try:
+        message_minimum = int(app.config.get("NTC_RECORDINGS_TESTIMONY_MESSAGE_MIN_SECONDS") or 1800)
+    except (TypeError, ValueError):
+        message_minimum = 1800
+    if duration_seconds < max(1, message_minimum):
+        return False
+    text = " ".join((intro_text or "").split()).lower()
+    if not text:
+        return False
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in TESTIMONY_MESSAGE_INTRO_PATTERNS)
 
 
 def _testimony_title_for_speaker(speaker_name: str) -> str:
@@ -3192,6 +3240,12 @@ def _default_recording_email_message(row: sqlite3.Row, candidate: RecordingCandi
     )
 
 
+def _normalize_recording_email_message(value: str) -> str:
+    message = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+    message = message.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    return message.strip()
+
+
 def _recording_email_html(
     app: Flask,
     row: sqlite3.Row,
@@ -3204,7 +3258,8 @@ def _recording_email_html(
     safe_share_url = html.escape(share_url, quote=True)
     safe_title = html.escape(candidate.title)
     safe_date = html.escape(_format_date(row["requested_date"]))
-    safe_message = html.escape(email_message or _default_recording_email_message(row, candidate)).replace("\n", "<br>")
+    normalized_message = _normalize_recording_email_message(email_message or _default_recording_email_message(row, candidate))
+    safe_message = html.escape(normalized_message).replace("\n", "<br>")
     return f"""
     <!doctype html>
     <html style="margin:0;padding:0;width:100%;height:100%;background:#06101d;">
