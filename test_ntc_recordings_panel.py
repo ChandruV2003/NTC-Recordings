@@ -631,6 +631,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"REC00042", review.data)
         self.assertIn(b"Check Durations", review.data)
         self.assertIn(b"Save Speaker", review.data)
+        self.assertIn(b"Mark Duplicate", review.data)
         self.assertIn(b"Listen, confirm the service date", review.data)
         self.assertIn(b'preload="none" data-src="/admin/testimonies/audio/', review.data)
         self.assertNotIn(b'preload="metadata" src="/admin/testimonies/audio/', review.data)
@@ -742,6 +743,56 @@ class RecordingRequestPanelTests(unittest.TestCase):
         renamed_audio = self.client.get(f"/admin/testimonies/audio/{new_recording_id}")
         self.assertEqual(renamed_audio.status_code, 200)
         self.assertEqual(renamed_audio.data, b"raw-testimony-audio")
+
+    def test_testimony_review_can_mark_duplicate_recordings(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        primary_recording = testimony_source_root / "REC00198.wav"
+        duplicate_recording = testimony_source_root / "REC10199.wav"
+        primary_recording.write_bytes(b"same-testimony-content-primary")
+        duplicate_recording.write_bytes(b"same-testimony-content-duplicate")
+        service_timestamp = datetime(2025, 8, 3, 12, tzinfo=timezone.utc).timestamp()
+        os.utime(primary_recording, (service_timestamp, service_timestamp))
+        os.utime(duplicate_recording, (service_timestamp, service_timestamp))
+        duplicate_id = _recording_id(duplicate_recording)
+
+        self._login()
+        response = self.client.post(
+            f"/admin/testimonies/{duplicate_id}/review",
+            data={
+                "status": "duplicate",
+                "status_filter": "needs_review",
+                "source_path": str(duplicate_recording),
+                "service_date": "2025-08-03",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "duplicate")
+        self.assertEqual(payload["status_label"], "Duplicate")
+        self.assertEqual(payload["source_label"], "REC10199.wav")
+
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT status, service_date, speaker_name FROM testimony_reviews WHERE recording_id = ?",
+                (duplicate_id,),
+            ).fetchone()
+        self.assertEqual(row, ("duplicate", "2025-08-03", ""))
+
+        needs_review = self.client.get("/admin/testimonies?status=needs_review").data
+        self.assertIn(b"REC00198", needs_review)
+        self.assertNotIn(b"REC10199", needs_review)
+
+        duplicate = self.client.get("/admin/testimonies?status=duplicate").data
+        self.assertIn(b"REC10199", duplicate)
+        self.assertIn(b"Duplicate", duplicate)
+
+        all_items = self.client.get("/admin/testimonies?status=all").data
+        self.assertIn(b"REC00198", all_items)
+        self.assertIn(b"REC10199", all_items)
 
     def test_testimony_review_supports_json_row_updates(self):
         testimony_source_root = self.root / "DN300R"

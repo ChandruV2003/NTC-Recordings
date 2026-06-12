@@ -43,6 +43,9 @@ DEFAULT_WORSHIP_RECORDING_DIR = "/mnt/MainRecordings/Recordings/WorshipRecording
 DEFAULT_TESTIMONY_RECORDING_DIR = "/mnt/MainRecordings/Recordings/TestimonyRecordings"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
+TESTIMONY_REVIEW_FILTERS = {"needs_review", "identified", "not_testimony", "duplicate", "all"}
+TESTIMONY_REVIEW_STATUSES = {"needs_review", "identified", "not_testimony", "duplicate", "already_named"}
+TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "identified", "not_testimony", "duplicate"}
 MONTHS = {
     "jan": 1,
     "january": 1,
@@ -472,7 +475,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         status_filter = (request.args.get("status") or "needs_review").strip().lower()
         if status_filter == "already_named":
             status_filter = "identified"
-        if status_filter not in {"needs_review", "identified", "not_testimony", "all"}:
+        if status_filter not in TESTIMONY_REVIEW_FILTERS:
             status_filter = "needs_review"
         sort = (request.args.get("sort") or "shortest").strip().lower()
         if sort not in {"shortest", "newest", "name"}:
@@ -526,7 +529,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         current_filter = (request.form.get("status") or "needs_review").strip().lower()
         if current_filter == "already_named":
             current_filter = "identified"
-        if current_filter not in {"needs_review", "identified", "not_testimony", "all"}:
+        if current_filter not in TESTIMONY_REVIEW_FILTERS:
             current_filter = "needs_review"
         return _redirect_to(
             app,
@@ -544,7 +547,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         current_filter = (request.form.get("status") or "needs_review").strip().lower()
         if current_filter == "already_named":
             current_filter = "identified"
-        if current_filter not in {"needs_review", "identified", "not_testimony", "all"}:
+        if current_filter not in TESTIMONY_REVIEW_FILTERS:
             current_filter = "needs_review"
         started = _start_testimony_suggestion_job(app)
         if started:
@@ -574,7 +577,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         current_filter = (request.form.get("status_filter") or "needs_review").strip().lower()
         if current_filter == "already_named":
             current_filter = "identified"
-        if current_filter not in {"needs_review", "identified", "not_testimony", "all"}:
+        if current_filter not in TESTIMONY_REVIEW_FILTERS:
             current_filter = "needs_review"
         candidate = _testimony_source_recording_from_form(app, recording_id)
         if not candidate:
@@ -595,7 +598,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         notes = str(existing["notes"] or "") if existing else ""
         proposed_path = str(existing["proposed_path"] or "") if existing else ""
         status = str(existing["status"] or "") if existing else _testimony_status_for_candidate(app, candidate, None, duration_seconds)
-        if status not in {"needs_review", "identified", "not_testimony", "already_named"}:
+        if status not in TESTIMONY_REVIEW_STATUSES:
             status = "needs_review"
 
         suggested_speaker, suggestion_source, suggestion_text, suggestion_error = _generate_testimony_speaker_suggestion(app, candidate)
@@ -646,7 +649,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         current_filter = (request.form.get("status_filter") or "needs_review").strip().lower()
         if current_filter == "already_named":
             current_filter = "identified"
-        if current_filter not in {"needs_review", "identified", "not_testimony", "all"}:
+        if current_filter not in TESTIMONY_REVIEW_FILTERS:
             current_filter = "needs_review"
         candidate = _testimony_source_recording_from_form(app, recording_id)
         if not candidate:
@@ -655,7 +658,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             return _redirect_to(app, "testimony_review", status=current_filter, error="Testimony source recording was not found.")
         original_recording_id = recording_id
         status = (request.form.get("status") or "identified").strip().lower()
-        if status not in {"needs_review", "identified", "not_testimony"}:
+        if status not in TESTIMONY_REVIEW_EDITABLE_STATUSES:
             status = "identified"
         existing = _testimony_review_row(app, recording_id)
         service_date = (
@@ -1972,7 +1975,7 @@ def _row_duration(row: sqlite3.Row | None) -> float | None:
 
 
 def _testimony_status_counts(items: Iterable[dict]) -> dict[str, int]:
-    counts = {"needs_review": 0, "identified": 0, "not_testimony": 0, "already_named": 0, "all": 0}
+    counts = {"needs_review": 0, "identified": 0, "not_testimony": 0, "duplicate": 0, "already_named": 0, "all": 0}
     for item in items:
         status = item.get("status") if item.get("status") in counts else "needs_review"
         counts[status] += 1
@@ -2004,6 +2007,7 @@ def _testimony_status_label(status: str) -> str:
         "needs_review": "Needs Review",
         "identified": "Identified",
         "not_testimony": "Not Testimony",
+        "duplicate": "Duplicate",
         "already_named": "Already Named",
         "all": "All",
     }
@@ -2407,9 +2411,9 @@ def _testimony_status_for_candidate(
     duration_seconds: float | None,
 ) -> str:
     status = str(row["status"] or "") if row else ""
-    if status in {"identified", "not_testimony", "already_named"}:
+    if status in {"identified", "not_testimony", "duplicate", "already_named"}:
         return status
-    if status not in {"needs_review", "identified", "not_testimony", "already_named"}:
+    if status not in TESTIMONY_REVIEW_STATUSES:
         status = "already_named" if _raw_testimony_name(Path(candidate.path)) else "needs_review"
     if status == "needs_review" and _named_non_testimony_recording(candidate):
         return "not_testimony"
@@ -4476,7 +4480,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .banner-stack:empty { display:none; }
       .metrics {
         display:grid;
-        grid-template-columns:repeat(4,minmax(0,1fr));
+        grid-template-columns:repeat(5,minmax(0,1fr));
         gap:.65rem;
         margin:.65rem 0 1rem;
       }
@@ -4639,6 +4643,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .pill.needs_review { color:var(--warn); border-color:rgba(255,200,117,.35); background:var(--warn-soft); }
       .pill.identified, .pill.already_named { color:var(--good); border-color:rgba(116,221,180,.34); background:var(--good-soft); }
       .pill.not_testimony { color:var(--bad); border-color:rgba(255,170,168,.35); background:var(--bad-soft); }
+      .pill.duplicate { color:var(--accent); border-color:rgba(143,211,255,.34); background:rgba(143,211,255,.08); }
       .review-body {
         display:grid;
         grid-template-columns:minmax(16rem,.8fr) minmax(0,1.2fr);
@@ -4792,11 +4797,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div class="metric"><span>Needs Review</span><strong data-count="needs_review">{{ counts.needs_review }}</strong><small>Awaiting identification</small></div>
         <div class="metric"><span>Identified</span><strong data-count="identified">{{ counts.identified }}</strong><small>Speaker confirmed or already named</small></div>
         <div class="metric"><span>Not Testimony</span><strong data-count="not_testimony">{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
+        <div class="metric"><span>Duplicates</span><strong data-count="duplicate">{{ counts.duplicate }}</strong><small>Already covered by another file</small></div>
         <div class="metric"><span>Files Found</span><strong data-count="all">{{ counts.all }}</strong><small>Folder connected</small></div>
       </section>
       <div class="toolbar">
         <nav class="tabs" aria-label="Testimony review filters">
-          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("not_testimony", "Not Testimony"), ("all", "All")] %}
+          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("not_testimony", "Not Testimony"), ("duplicate", "Duplicate"), ("all", "All")] %}
             <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ recordings_url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong data-count="{{ key }}">{{ counts[key] }}</strong></a>
           {% endfor %}
         </nav>
@@ -4937,6 +4943,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                     <div class="button-row">
                       <button class="secondary" type="submit" name="status" value="needs_review">Needs Review</button>
                       <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Testimony</button>
+                      <button class="secondary" type="submit" name="status" value="duplicate">Mark Duplicate</button>
                       <button class="save" type="submit" name="status" value="identified">Save Speaker</button>
                     </div>
                   </form>
@@ -4951,7 +4958,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
     </main>
     <script>
       const openCardsKey = "ntc-testimony-open-cards";
-      const statusClasses = ["needs_review", "identified", "not_testimony", "already_named"];
+      const statusClasses = ["needs_review", "identified", "not_testimony", "duplicate", "already_named"];
       const bannerStack = document.querySelector("[data-banner-stack]");
       const reviewList = document.querySelector("[data-review-list]");
       const activeReviewFilter = reviewList ? reviewList.dataset.activeFilter || "needs_review" : "needs_review";
