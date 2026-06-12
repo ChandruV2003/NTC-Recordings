@@ -273,6 +273,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             "NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_PROMPT",
             "This is a church testimony. The speaker may introduce themselves by saying my name is, I am, or I'm.",
         ),
+        NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS", "240")),
+        NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS", "768")),
+        NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT", "30")),
         NTC_RECORDINGS_INDEX_REFRESH_SECONDS=float(
             os.getenv(
                 "NTC_RECORDINGS_INDEX_REFRESH_SECONDS",
@@ -312,6 +315,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.recordings_index_lock = threading.Lock()
     app.testimony_suggestion_job_lock = threading.Lock()
     app.testimony_suggestion_job = _initial_testimony_suggestion_job_state()
+    app.testimony_transcript_job_lock = threading.Lock()
+    app.testimony_transcript_job = _initial_testimony_transcript_job_state()
 
     @app.context_processor
     def _recordings_url_context():
@@ -543,6 +548,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             format_date=_format_date,
             speaker_names=_testimony_known_speakers(app),
             suggestion_job=_testimony_suggestion_job_status(app),
+            transcript_job=_testimony_transcript_job_status(app),
         )
 
     @app.post("/admin/testimonies/probe")
@@ -598,6 +604,40 @@ def create_app(test_config: dict | None = None) -> Flask:
         if guard:
             return guard
         return jsonify(_testimony_suggestion_job_status(app))
+
+    @app.post("/admin/testimonies/transcribe-identified")
+    def transcribe_identified_testimonies():
+        guard = _require_admin()
+        if guard:
+            return guard
+        current_filter = (request.form.get("status") or "identified").strip().lower()
+        if current_filter == "already_named":
+            current_filter = "identified"
+        if current_filter not in TESTIMONY_REVIEW_FILTERS:
+            current_filter = "identified"
+        try:
+            limit = int(request.form.get("limit") or app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT") or 30)
+        except ValueError:
+            limit = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT") or 30)
+        started = _start_testimony_transcript_job(app, min(max(limit, 1), 100))
+        if started:
+            message = "Started identified testimony transcript processing."
+        else:
+            message = "Identified testimony transcript processing is already running."
+        return _redirect_to(
+            app,
+            "testimony_review",
+            status=current_filter,
+            sort=request.form.get("sort") or "shortest",
+            message=message,
+        )
+
+    @app.get("/admin/testimonies/transcript-status")
+    def testimony_transcript_status():
+        guard = _require_admin()
+        if guard:
+            return guard
+        return jsonify(_testimony_transcript_job_status(app))
 
     @app.post("/admin/testimonies/<recording_id>/suggest")
     def suggest_testimony_speaker(recording_id: str):
@@ -974,6 +1014,10 @@ def _init_db(db_path: str) -> None:
                 suggestion_source TEXT NOT NULL DEFAULT '',
                 suggestion_text TEXT NOT NULL DEFAULT '',
                 suggestion_updated_at TEXT NOT NULL DEFAULT '',
+                transcript_text TEXT NOT NULL DEFAULT '',
+                transcript_source TEXT NOT NULL DEFAULT '',
+                transcript_error TEXT NOT NULL DEFAULT '',
+                transcript_updated_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             )
             """
@@ -982,6 +1026,10 @@ def _init_db(db_path: str) -> None:
         _ensure_column(connection, "testimony_reviews", "suggestion_source", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "suggestion_text", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "suggestion_updated_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "transcript_text", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "transcript_source", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "transcript_error", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "transcript_updated_at", "TEXT NOT NULL DEFAULT ''")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_status ON testimony_reviews(status)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_source_path ON testimony_reviews(source_path)")
 
@@ -1926,6 +1974,10 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     suggested_speaker = _valid_person_name_suggestion(str(row["suggested_speaker"] or "") if row else "", known_speakers)
     suggestion_source = str(row["suggestion_source"] or "") if row else ""
     suggestion_text = str(row["suggestion_text"] or "") if row else ""
+    transcript_text = _row_optional_text(row, "transcript_text")
+    transcript_source = _row_optional_text(row, "transcript_source")
+    transcript_error = _row_optional_text(row, "transcript_error")
+    transcript_updated_at = _row_optional_text(row, "transcript_updated_at")
     if not suggested_speaker and not speaker_name:
         suggested_speaker = _testimony_filename_speaker_suggestion(Path(candidate.path))
         if suggested_speaker:
@@ -1957,6 +2009,13 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "suggestion_source": suggestion_source,
         "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
         "suggestion_text": suggestion_text,
+        "transcript_text": transcript_text,
+        "transcript_excerpt": _compact_transcript_excerpt(transcript_text, 900),
+        "transcript_source": transcript_source,
+        "transcript_source_label": _testimony_transcript_source_label(transcript_source),
+        "transcript_error": transcript_error,
+        "transcript_updated_at": transcript_updated_at,
+        "transcript_updated_label": _format_datetime(transcript_updated_at),
         "duration_seconds": duration_seconds,
         "duration_label": _format_duration(duration_seconds),
         "size_label": _human_size(candidate.size_bytes),
@@ -2002,6 +2061,12 @@ def _row_duration(row: sqlite3.Row | None) -> float | None:
         return float(row["duration_seconds"])
     except (TypeError, ValueError):
         return None
+
+
+def _row_optional_text(row: sqlite3.Row | None, key: str) -> str:
+    if not row or key not in row.keys():
+        return ""
+    return str(row[key] or "")
 
 
 def _testimony_status_counts(items: Iterable[dict]) -> dict[str, int]:
@@ -2250,11 +2315,142 @@ def _testimony_suggestion_targets(app: Flask) -> list[dict]:
     return targets
 
 
+def _initial_testimony_transcript_job_state() -> dict:
+    return {
+        "state": "idle",
+        "started_at": "",
+        "finished_at": "",
+        "total": 0,
+        "processed": 0,
+        "saved": 0,
+        "skipped": 0,
+        "errors": 0,
+        "current": "",
+        "message": "",
+    }
+
+
+def _testimony_transcript_job_status(app: Flask) -> dict:
+    lock = getattr(app, "testimony_transcript_job_lock", None)
+    if lock:
+        with lock:
+            return dict(getattr(app, "testimony_transcript_job", _initial_testimony_transcript_job_state()))
+    return dict(getattr(app, "testimony_transcript_job", _initial_testimony_transcript_job_state()))
+
+
+def _update_testimony_transcript_job(app: Flask, **updates) -> None:
+    with app.testimony_transcript_job_lock:
+        state = dict(app.testimony_transcript_job)
+        state.update(updates)
+        app.testimony_transcript_job = state
+
+
+def _start_testimony_transcript_job(app: Flask, limit: int | None = None) -> bool:
+    with app.testimony_transcript_job_lock:
+        if app.testimony_transcript_job.get("state") == "running":
+            return False
+        app.testimony_transcript_job = {
+            **_initial_testimony_transcript_job_state(),
+            "state": "running",
+            "started_at": _utc_now(),
+            "message": "Scanning identified testimonies.",
+        }
+    thread = threading.Thread(target=_run_testimony_transcript_job, args=(app, limit), name="testimony-transcript-job", daemon=True)
+    thread.start()
+    return True
+
+
+def _run_testimony_transcript_job(app: Flask, limit: int | None = None) -> None:
+    try:
+        with app.app_context():
+            targets = _testimony_transcript_targets(app, limit)
+            _update_testimony_transcript_job(app, total=len(targets), message=f"Processing {len(targets)} identified testimonies.")
+            processed = saved = errors = 0
+            for target in targets:
+                row = target["row"]
+                candidate = target["candidate"]
+                _update_testimony_transcript_job(app, current=Path(candidate.path).name)
+                transcript_text = ""
+                transcript_error = ""
+                try:
+                    transcript_text, transcript_error = _transcribe_testimony_review_excerpt(app, Path(candidate.path))
+                    if transcript_text:
+                        saved += 1
+                    else:
+                        errors += 1
+                        transcript_error = transcript_error or "Transcript was empty."
+                except Exception as exc:
+                    errors += 1
+                    transcript_error = f"Transcript failed: {exc}"
+                    app.logger.exception("testimony transcript failed for %s", candidate.path)
+                _save_testimony_transcript(
+                    app,
+                    recording_id=str(row["recording_id"]),
+                    transcript_text=transcript_text,
+                    transcript_source="transcript_excerpt" if transcript_text else "",
+                    transcript_error=transcript_error,
+                )
+                processed += 1
+                _update_testimony_transcript_job(
+                    app,
+                    processed=processed,
+                    saved=saved,
+                    errors=errors,
+                    message=f"Processed {processed} of {len(targets)} identified testimonies.",
+                )
+            _update_testimony_transcript_job(
+                app,
+                state="finished",
+                finished_at=_utc_now(),
+                current="",
+                message=f"Finished. Saved {saved}; errors {errors}.",
+            )
+    except Exception as exc:
+        app.logger.exception("testimony transcript job failed")
+        _update_testimony_transcript_job(
+            app,
+            state="failed",
+            finished_at=_utc_now(),
+            current="",
+            errors=_testimony_transcript_job_status(app).get("errors", 0) + 1,
+            message=f"Transcript job failed: {exc}",
+        )
+
+
+def _testimony_transcript_targets(app: Flask, limit: int | None = None) -> list[dict]:
+    rows = _testimony_review_rows(app)
+    targets = []
+    skipped = 0
+    for row in rows.values():
+        if str(row["status"] or "") not in {"identified", "already_named"}:
+            continue
+        if _row_optional_text(row, "transcript_text"):
+            skipped += 1
+            continue
+        candidate = _testimony_candidate_from_review_row(app, row)
+        if not candidate:
+            skipped += 1
+            continue
+        targets.append({"row": row, "candidate": candidate})
+    targets.sort(key=lambda item: (str(item["row"]["service_date"] or ""), str(item["row"]["speaker_name"] or ""), Path(item["candidate"].path).name))
+    if limit:
+        targets = targets[: max(0, limit)]
+    _update_testimony_transcript_job(app, skipped=skipped)
+    return targets
+
+
 def _testimony_suggestion_source_label(source: str) -> str:
     labels = {
         "filename": "from filename",
         "transcript_intro": "from intro transcript",
         "history": "from confirmed history",
+    }
+    return labels.get(source, source.replace("_", " ") if source else "")
+
+
+def _testimony_transcript_source_label(source: str) -> str:
+    labels = {
+        "transcript_excerpt": "from stored transcript excerpt",
     }
     return labels.get(source, source.replace("_", " ") if source else "")
 
@@ -2326,6 +2522,30 @@ def _save_testimony_review(
                 suggestion_text,
                 suggestion_updated_at,
                 _utc_now(),
+            ),
+        )
+
+
+def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: str, transcript_source: str, transcript_error: str) -> None:
+    updated_at = _utc_now()
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute(
+            """
+            UPDATE testimony_reviews
+            SET transcript_text = ?,
+                transcript_source = ?,
+                transcript_error = ?,
+                transcript_updated_at = ?,
+                updated_at = ?
+            WHERE recording_id = ?
+            """,
+            (
+                transcript_text,
+                transcript_source,
+                transcript_error,
+                updated_at,
+                updated_at,
+                recording_id,
             ),
         )
 
@@ -2608,6 +2828,73 @@ def _transcribe_testimony_intro(app: Flask, source_path: Path) -> tuple[str, str
             response = requests.post(
                 transcribe_url,
                 params={"language": "en", "prompt": prompt, "max_new_tokens": "128"},
+                data=wav_path.read_bytes(),
+                headers={"Content-Type": "audio/wav", "Accept": "application/json"},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            return "", f"Transcription request failed: {exc}"
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text.strip(), ""
+    return str(payload.get("text") or "").strip(), ""
+
+
+def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple[str, str]:
+    transcribe_url = str(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL") or "").strip()
+    if not transcribe_url:
+        return "", "Testimony transcripts need a transcription URL configured."
+    try:
+        seconds = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS") or 240)
+    except (TypeError, ValueError):
+        seconds = 240
+    seconds = min(max(seconds, 30), 900)
+    try:
+        max_tokens = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS") or 768)
+    except (TypeError, ValueError):
+        max_tokens = 768
+    max_tokens = min(max(max_tokens, 128), 2048)
+    timeout = float(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT") or 120)
+    prompt = str(
+        app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_PROMPT")
+        or "Transcribe this church testimony clearly. Keep names exactly as spoken."
+    )
+    with tempfile.TemporaryDirectory(prefix="ntc-testimony-transcript-") as temp_dir:
+        wav_path = Path(temp_dir) / "testimony.wav"
+        completed = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(source_path),
+                "-t",
+                str(seconds),
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-f",
+                "wav",
+                str(wav_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=min(max(timeout, 30), 120),
+            check=False,
+        )
+        if completed.returncode != 0 or not wav_path.exists():
+            detail = (completed.stderr or completed.stdout or "").strip()
+            return "", f"Could not prepare testimony audio for transcription{': ' + detail[:180] if detail else ''}."
+        try:
+            response = requests.post(
+                transcribe_url,
+                params={"language": "en", "prompt": prompt, "max_new_tokens": str(max_tokens)},
                 data=wav_path.read_bytes(),
                 headers={"Content-Type": "audio/wav", "Accept": "application/json"},
                 timeout=timeout,
@@ -4807,6 +5094,15 @@ TESTIMONY_REVIEW_TEMPLATE = """
         color:var(--muted);
         line-height:1.45;
       }
+      .transcript-panel {
+        grid-template-columns:minmax(0,1fr);
+        border-color:rgba(143,211,255,.18);
+        background:rgba(143,211,255,.04);
+      }
+      .transcript-panel p {
+        max-height:10.5rem;
+        overflow:auto;
+      }
       .empty {
         border:1px dashed rgba(143,211,255,.25);
         border-radius:18px;
@@ -4891,6 +5187,11 @@ TESTIMONY_REVIEW_TEMPLATE = """
           <input type="hidden" name="sort" value="{{ sort }}">
           <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
         </form>
+        <form class="probe-form" method="post" action="{{ recordings_url_for('transcribe_identified_testimonies') }}">
+          <input type="hidden" name="status" value="{{ status_filter }}">
+          <input type="hidden" name="sort" value="{{ sort }}">
+          <button type="submit" data-process-transcripts-button {% if transcript_job.state == "running" %}disabled{% endif %}>Process Transcripts</button>
+        </form>
       </div>
       <div class="job-panel" data-suggestion-job data-status-url="{{ recordings_url_for('testimony_suggestion_status') }}" data-state="{{ suggestion_job.state }}" {% if suggestion_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
         <div>
@@ -4901,6 +5202,16 @@ TESTIMONY_REVIEW_TEMPLATE = """
           </div>
         </div>
         <div data-job-current>{% if suggestion_job.current %}Now checking {{ suggestion_job.current }}{% endif %}</div>
+      </div>
+      <div class="job-panel" data-transcript-job data-status-url="{{ recordings_url_for('testimony_transcript_status') }}" data-state="{{ transcript_job.state }}" {% if transcript_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
+        <div>
+          <span>Identified Transcripts</span>
+          <strong data-job-message>{{ transcript_job.message or "Idle." }}</strong>
+          <div data-job-counts>
+            {{ transcript_job.processed }} / {{ transcript_job.total }} processed · {{ transcript_job.saved }} saved · {{ transcript_job.errors }} errors
+          </div>
+        </div>
+        <div data-job-current>{% if transcript_job.current %}Now transcribing {{ transcript_job.current }}{% endif %}</div>
       </div>
       <section class="panel">
         <div class="panel-head">
@@ -4982,7 +5293,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                         </label>
                       </div>
                       {% if not item.speaker_name and item.suggested_speaker %}
-                        <div class="suggestion-panel">
+                        <div class="suggestion-panel speaker-assist-panel">
                           <div>
                             <span>Suggested Speaker</span>
                             <strong>{{ item.suggested_speaker }}</strong>
@@ -4992,7 +5303,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           {% if item.suggestion_text %}<p>{{ item.suggestion_text }}</p>{% endif %}
                         </div>
                       {% elif not item.speaker_name and item.suggestion_source %}
-                        <div class="suggestion-panel subdued">
+                        <div class="suggestion-panel subdued speaker-assist-panel">
                           <div>
                             <span>Intro Checked</span>
                             <strong>No speaker name found</strong>
@@ -5001,13 +5312,39 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           {% if item.suggestion_text %}<p>{{ item.suggestion_text }}</p>{% endif %}
                         </div>
                       {% elif not item.speaker_name %}
-                        <div class="suggestion-panel subdued">
+                        <div class="suggestion-panel subdued speaker-assist-panel">
                           <div>
                             <span>Speaker Assist</span>
                             <strong>No suggestion yet</strong>
                             <small>Checks the filename first, then the configured intro transcription.</small>
                           </div>
                           <button class="secondary" type="submit" formaction="{{ recordings_url_for('suggest_testimony_speaker', recording_id=item.id) }}" formmethod="post">Suggest Speaker</button>
+                        </div>
+                      {% endif %}
+                      {% if item.transcript_excerpt %}
+                        <div class="suggestion-panel subdued transcript-panel">
+                          <div>
+                            <span>Transcript</span>
+                            <strong>Stored testimony excerpt</strong>
+                            {% if item.transcript_updated_label %}<small>{{ item.transcript_updated_label }}</small>{% endif %}
+                          </div>
+                          <p>{{ item.transcript_excerpt }}</p>
+                        </div>
+                      {% elif item.transcript_error %}
+                        <div class="suggestion-panel subdued transcript-panel">
+                          <div>
+                            <span>Transcript</span>
+                            <strong>Transcript not saved</strong>
+                          </div>
+                          <p>{{ item.transcript_error }}</p>
+                        </div>
+                      {% elif item.status in ["identified", "already_named"] %}
+                        <div class="suggestion-panel subdued transcript-panel">
+                          <div>
+                            <span>Transcript</span>
+                            <strong>Not processed yet</strong>
+                            <small>Use Process Transcripts to store an excerpt for naming cleanup.</small>
+                          </div>
                         </div>
                       {% endif %}
                     </section>
@@ -5158,7 +5495,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           if (card.open) hydrateReviewAudio(card);
         }
         if (data.speaker_name) {
-          card.querySelectorAll(".suggestion-panel").forEach((panel) => panel.remove());
+          card.querySelectorAll(".speaker-assist-panel").forEach((panel) => panel.remove());
         }
         if (data.status) {
           updateStatusCounts(previousStatus, data.status);
@@ -5174,10 +5511,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
         const form = card.querySelector(".review-form");
         const editPanel = form ? form.querySelector(".edit-panel") : null;
         if (!editPanel) return;
-        editPanel.querySelectorAll(".suggestion-panel").forEach((panel) => panel.remove());
+        editPanel.querySelectorAll(".speaker-assist-panel").forEach((panel) => panel.remove());
 
         const panel = document.createElement("div");
-        panel.className = `suggestion-panel${data.suggested_speaker ? "" : " subdued"}`;
+        panel.className = `suggestion-panel speaker-assist-panel${data.suggested_speaker ? "" : " subdued"}`;
 
         const textWrap = document.createElement("div");
         const label = document.createElement("span");
@@ -5343,10 +5680,60 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
       }
 
+      function updateTranscriptJob(job) {
+        const panel = document.querySelector("[data-transcript-job]");
+        if (!panel || !job) return;
+        const message = panel.querySelector("[data-job-message]");
+        const counts = panel.querySelector("[data-job-counts]");
+        const current = panel.querySelector("[data-job-current]");
+        const button = document.querySelector("[data-process-transcripts-button]");
+        const priorState = panel.dataset.state || "";
+
+        panel.hidden = !["running", "finished", "failed"].includes(job.state);
+        panel.dataset.state = job.state || "";
+        if (message) message.textContent = job.message || "Idle.";
+        if (counts) {
+          counts.textContent = `${job.processed || 0} / ${job.total || 0} processed · ${job.saved || 0} saved · ${job.errors || 0} errors`;
+        }
+        if (current) {
+          current.textContent = job.current ? `Now transcribing ${job.current}` : "";
+        }
+        if (button) {
+          button.disabled = job.state === "running";
+        }
+        if (priorState === "running" && ["finished", "failed"].includes(job.state)) {
+          const tag = document.activeElement ? document.activeElement.tagName : "";
+          const editing = ["INPUT", "TEXTAREA", "SELECT"].includes(tag);
+          if (!editing && job.state === "finished") {
+            saveOpenCards();
+            window.setTimeout(() => window.location.reload(), 900);
+          }
+        }
+      }
+
+      async function pollTranscriptJob() {
+        const panel = document.querySelector("[data-transcript-job]");
+        if (!panel || !panel.dataset.statusUrl) return;
+        try {
+          const response = await fetch(panel.dataset.statusUrl, { headers: { "Accept": "application/json" } });
+          if (!response.ok) return;
+          const job = await response.json();
+          updateTranscriptJob(job);
+          if (job.state === "running") {
+            window.setTimeout(pollTranscriptJob, 3000);
+          }
+        } catch (error) {
+          window.setTimeout(pollTranscriptJob, 6000);
+        }
+      }
+
       restoreOpenCards();
       document.querySelectorAll(".review-card[open]").forEach(hydrateReviewAudio);
       if (document.querySelector("[data-suggestion-job]")?.dataset.state === "running") {
         pollSuggestionJob();
+      }
+      if (document.querySelector("[data-transcript-job]")?.dataset.state === "running") {
+        pollTranscriptJob();
       }
     </script>
   </body>

@@ -15,6 +15,8 @@ from ntc_recordings_app import (
     _recording_id,
     _testimony_looks_like_message_recording,
     _testimony_suggestion_targets,
+    _testimony_transcript_targets,
+    _save_testimony_transcript,
     _valid_person_name_suggestion,
     create_app,
 )
@@ -646,8 +648,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b'preload="metadata" src="/admin/testimonies/audio/', review.data)
         self.assertIn(b"Suggest Speaker", review.data)
         self.assertIn(b"Process Suggestions", review.data)
+        self.assertIn(b"Process Transcripts", review.data)
         self.assertIn(b'data-suggestion-job', review.data)
         self.assertIn(b'data-status-url="/admin/testimonies/suggest-status"', review.data)
+        self.assertIn(b'data-transcript-job', review.data)
+        self.assertIn(b'data-status-url="/admin/testimonies/transcript-status"', review.data)
         self.assertIn(b'data-review-id="', review.data)
         self.assertIn(b"ntc-testimony-open-cards", review.data)
         self.assertIn(b"X-Requested-With", review.data)
@@ -889,6 +894,71 @@ class RecordingRequestPanelTests(unittest.TestCase):
         status = self.client.get("/admin/testimonies/suggest-status")
         self.assertEqual(status.status_code, 200)
         self.assertIn("state", status.get_json())
+
+    def test_identified_testimony_transcript_route_starts_background_job(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        (testimony_source_root / "REC00200.mp3").write_bytes(b"raw-testimony-audio")
+
+        self._login()
+        with patch("ntc_recordings_app._start_testimony_transcript_job", return_value=True) as starter:
+            started = self.client.post(
+                "/admin/testimonies/transcribe-identified",
+                data={"status": "identified", "sort": "name"},
+                follow_redirects=True,
+            )
+
+        self.assertEqual(started.status_code, 200)
+        self.assertIn(b"Started identified testimony transcript processing", started.data)
+        starter.assert_called_once()
+
+        status = self.client.get("/admin/testimonies/transcript-status")
+        self.assertEqual(status.status_code, 200)
+        self.assertIn("state", status.get_json())
+
+    def test_identified_testimony_transcripts_are_saved_and_skipped_afterwards(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        recording = testimony_source_root / "REC00201.mp3"
+        recording.write_bytes(b"identified-testimony-audio")
+        recording_id = _recording_id(recording)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    speaker_name,
+                    testimony_title,
+                    updated_at
+                )
+                VALUES (?, ?, 'identified', '2026-05-24', 'Brother Prabhu', "Brother Prabhu's Testimony", ?)
+                """,
+                (recording_id, str(recording), datetime.now(timezone.utc).isoformat()),
+            )
+
+        targets = _testimony_transcript_targets(self.app)
+        self.assertEqual([Path(item["candidate"].path).name for item in targets], ["REC00201.mp3"])
+
+        self._login()
+        review_before = self.client.get("/admin/testimonies?status=identified")
+        self.assertEqual(review_before.status_code, 200)
+        self.assertIn(b"Not processed yet", review_before.data)
+
+        _save_testimony_transcript(
+            self.app,
+            recording_id,
+            "Praise the Lord. I would like to thank God for helping me this week.",
+            "transcript_excerpt",
+            "",
+        )
+
+        self.assertEqual(_testimony_transcript_targets(self.app), [])
+        review_after = self.client.get("/admin/testimonies?status=identified")
+        self.assertIn(b"Stored testimony excerpt", review_after.data)
+        self.assertIn(b"thank God for helping me", review_after.data)
 
     def test_bulk_testimony_suggestions_skip_named_message_files(self):
         testimony_source_root = self.root / "DN300R"
