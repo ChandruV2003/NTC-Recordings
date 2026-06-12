@@ -960,6 +960,59 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Stored testimony excerpt", review_after.data)
         self.assertIn(b"thank God for helping me", review_after.data)
 
+    def test_identified_transcript_survives_testimony_rename(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        recording = testimony_source_root / "REC00202.mp3"
+        recording.write_bytes(b"identified-testimony-audio")
+        recording_id = _recording_id(recording)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    speaker_name,
+                    testimony_title,
+                    transcript_text,
+                    transcript_source,
+                    transcript_updated_at,
+                    updated_at
+                )
+                VALUES (?, ?, 'identified', '2026-05-24', 'Brother Prabhu', "Brother Prabhu's Testimony", ?, 'transcript_excerpt', ?, ?)
+                """,
+                (
+                    recording_id,
+                    str(recording),
+                    "Praise the Lord. This transcript should stay with the renamed file.",
+                    datetime.now(timezone.utc).isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+        self._login()
+        saved = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "source_path": str(recording),
+                "status_filter": "identified",
+                "status": "identified",
+                "service_date": "2026-05-24",
+                "speaker_name": "Brother Prabhu Varghese",
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(saved.status_code, 200)
+        with sqlite3.connect(self.db_path) as connection:
+            rows = connection.execute(
+                "SELECT speaker_name, transcript_text FROM testimony_reviews WHERE speaker_name = 'Brother Prabhu Varghese'"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertIn("transcript should stay", rows[0][1])
+
     def test_bulk_testimony_suggestions_skip_named_message_files(self):
         testimony_source_root = self.root / "DN300R"
         testimony_source_root.mkdir()

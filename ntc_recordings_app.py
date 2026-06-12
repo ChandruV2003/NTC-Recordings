@@ -744,6 +744,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         suggested_speaker = _valid_person_name_suggestion(str(existing["suggested_speaker"] or "") if existing else "", _testimony_known_speakers(app))
         suggestion_source = str(existing["suggestion_source"] or "") if existing else ""
         suggestion_text = str(existing["suggestion_text"] or "") if existing else ""
+        transcript_text = _row_optional_text(existing, "transcript_text")
+        transcript_source = _row_optional_text(existing, "transcript_source")
+        transcript_error = _row_optional_text(existing, "transcript_error")
         proposed_path = ""
         save_message = "Testimony review saved."
         if status == "identified":
@@ -780,6 +783,14 @@ def create_app(test_config: dict | None = None) -> Flask:
             suggestion_source=suggestion_source,
             suggestion_text=suggestion_text,
         )
+        if transcript_text or transcript_source or transcript_error:
+            _save_testimony_transcript(
+                app,
+                recording_id,
+                transcript_text=transcript_text,
+                transcript_source=transcript_source,
+                transcript_error=transcript_error,
+            )
         if _wants_json_response():
             return jsonify(
                 {
