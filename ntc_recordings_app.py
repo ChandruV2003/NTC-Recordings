@@ -288,6 +288,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         NTC_RECORDINGS_SHARE_PROVIDER=os.getenv("NTC_RECORDINGS_SHARE_PROVIDER", "internal"),
         NTC_RECORDINGS_ADMIN_PASSWORD=os.getenv("NTC_RECORDINGS_ADMIN_PASSWORD", ""),
         NTC_ADMIN_PASSWORD=os.getenv("NTC_ADMIN_PASSWORD", ""),
+        NTC_ADMIN_SESSION_HOURS=float(os.getenv("NTC_ADMIN_SESSION_HOURS", "8")),
         NTC_RECORDINGS_LOGO_URL=os.getenv(
             "NTC_RECORDINGS_LOGO_URL",
             "https://drive.google.com/uc?id=1QiyDf3SW6jHcctra1qr5DKXlLn2_GCE0",
@@ -309,6 +310,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     )
     if test_config:
         app.config.update(test_config)
+    app.permanent_session_lifetime = timedelta(hours=max(1, float(app.config.get("NTC_ADMIN_SESSION_HOURS") or 8)))
 
     install_branding(app)
     _init_db(app.config["NTC_RECORDINGS_DB_PATH"])
@@ -330,7 +332,23 @@ def create_app(test_config: dict | None = None) -> Flask:
         ).strip()
 
     def _is_admin() -> bool:
-        return bool(session.get("recordings_admin"))
+        if not session.get("recordings_admin"):
+            return False
+        authenticated_at = session.get("recordings_admin_authenticated_at")
+        try:
+            authenticated = datetime.fromisoformat(str(authenticated_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            session.pop("recordings_admin", None)
+            session.pop("recordings_admin_authenticated_at", None)
+            session.modified = True
+            return False
+        timeout = timedelta(hours=max(1, float(app.config.get("NTC_ADMIN_SESSION_HOURS") or 8)))
+        if datetime.now(timezone.utc) - authenticated > timeout:
+            session.pop("recordings_admin", None)
+            session.pop("recordings_admin_authenticated_at", None)
+            session.modified = True
+            return False
+        return True
 
     def _require_admin():
         if _is_admin():
@@ -411,7 +429,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                 )
             password = request.form.get("password", "")
             if hmac.compare_digest(password, expected):
+                session.permanent = True
                 session["recordings_admin"] = True
+                session["recordings_admin_authenticated_at"] = datetime.now(timezone.utc).isoformat()
                 session.modified = True
                 return _redirect_to(app, "admin_panel")
             return render_template_string(
@@ -430,6 +450,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     @app.post("/admin/logout")
     def admin_logout():
         session.pop("recordings_admin", None)
+        session.pop("recordings_admin_authenticated_at", None)
         session.modified = True
         return _redirect_to(app, "public_form")
 
