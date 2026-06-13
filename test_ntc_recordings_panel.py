@@ -651,8 +651,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b'preload="metadata" src="/admin/testimonies/audio/', review.data)
         self.assertIn(b"Suggest Speaker", review.data)
         self.assertIn(b"Process Suggestions", review.data)
-        self.assertIn(b"Process Transcripts", review.data)
-        self.assertIn(b"Quarantine Rejected", review.data)
+        self.assertNotIn(b"Process Transcripts", review.data)
+        self.assertNotIn(b"Quarantine Rejected", review.data)
         self.assertIn(b'data-suggestion-job', review.data)
         self.assertIn(b'data-status-url="/admin/testimonies/suggest-status"', review.data)
         self.assertIn(b'data-transcript-job', review.data)
@@ -671,6 +671,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         identified = self.client.get("/admin/testimonies?status=identified")
         self.assertEqual(identified.status_code, 200)
         self.assertIn(b"20250413 - Sister Rachel", identified.data)
+        self.assertIn(b"Process Transcripts", identified.data)
 
         recording_id = _recording_id(raw_recording)
         audio = self.client.get(f"/admin/testimonies/audio/{recording_id}")
@@ -807,6 +808,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         duplicate = self.client.get("/admin/testimonies?status=duplicate").data
         self.assertIn(b"REC10199", duplicate)
         self.assertIn(b"Duplicate", duplicate)
+        self.assertIn(b"Quarantine Duplicates", duplicate)
 
         all_items = self.client.get("/admin/testimonies?status=all").data
         self.assertIn(b"REC00198", all_items)

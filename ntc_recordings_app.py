@@ -5055,10 +5055,17 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .metric small { display:block; margin-top:.32rem; color:var(--muted); line-height:1.35; }
       .toolbar {
         display:grid;
-        grid-template-columns:minmax(0,1fr) auto auto;
+        grid-template-columns:minmax(0,1fr) auto;
         gap:.8rem;
         align-items:center;
         margin:.85rem 0 1rem;
+      }
+      .toolbar-actions {
+        display:flex;
+        justify-content:flex-end;
+        align-items:flex-end;
+        gap:.6rem;
+        flex-wrap:wrap;
       }
       .tabs {
         display:flex;
@@ -5308,7 +5315,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       @media (max-width:1100px) {
         .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
         .toolbar, .review-body { grid-template-columns:1fr; }
-        .probe-form { justify-content:flex-start; }
+        .toolbar-actions, .probe-form { justify-content:flex-start; }
         .job-panel { flex-direction:column; align-items:flex-start; }
         .review-row { grid-template-columns:minmax(0,1fr) minmax(0,1fr); align-items:start; }
       }
@@ -5328,7 +5335,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .metrics, .review-row, .file-facts, .form-grid { grid-template-columns:1fr; }
         .wide { grid-column:auto; }
         .suggestion-panel { grid-template-columns:1fr; }
-        .button-row, .button-row button, .probe-form, .probe-form input, .probe-form button { width:100%; }
+        .button-row, .button-row button, .toolbar-actions, .probe-form, .probe-form input, .probe-form button { width:100%; }
       }
     </style>
   </head>
@@ -5368,38 +5375,46 @@ TESTIMONY_REVIEW_TEMPLATE = """
             <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ recordings_url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong data-count="{{ key }}">{{ counts[key] }}</strong></a>
           {% endfor %}
         </nav>
-        <form class="probe-form" method="post" action="{{ recordings_url_for('probe_testimony_durations') }}">
-          <input type="hidden" name="status" value="{{ status_filter }}">
-          <input type="hidden" name="sort" value="{{ sort }}">
-          <label>
-            <span>Probe</span>
-            <input name="limit" type="number" min="1" max="120" value="{{ probe_limit }}">
-          </label>
-          <button type="submit">Check Durations</button>
-        </form>
-        <form class="probe-form" method="post" action="{{ recordings_url_for('suggest_all_testimony_speakers') }}">
-          <input type="hidden" name="status" value="{{ status_filter }}">
-          <input type="hidden" name="sort" value="{{ sort }}">
-          <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
-        </form>
-        <form class="probe-form" method="post" action="{{ recordings_url_for('transcribe_identified_testimonies') }}">
-          <input type="hidden" name="status" value="{{ status_filter }}">
-          <input type="hidden" name="sort" value="{{ sort }}">
-          <button type="submit" data-process-transcripts-button {% if transcript_job.state == "running" %}disabled{% endif %}>Process Transcripts</button>
-        </form>
-        <form class="probe-form" method="post" action="{{ recordings_url_for('quarantine_testimony_reviews') }}">
-          <input type="hidden" name="status" value="{{ status_filter }}">
-          <input type="hidden" name="sort" value="{{ sort }}">
-          <button type="submit">
-            {% if status_filter == "not_testimony" %}
-              Quarantine Not Testimony
-            {% elif status_filter == "duplicate" %}
-              Quarantine Duplicates
-            {% else %}
-              Quarantine Rejected
-            {% endif %}
-          </button>
-        </form>
+        <div class="toolbar-actions">
+          {% if status_filter in ["needs_review", "all"] %}
+            <form class="probe-form" method="post" action="{{ recordings_url_for('probe_testimony_durations') }}">
+              <input type="hidden" name="status" value="{{ status_filter }}">
+              <input type="hidden" name="sort" value="{{ sort }}">
+              <label>
+                <span>Probe</span>
+                <input name="limit" type="number" min="1" max="120" value="{{ probe_limit }}">
+              </label>
+              <button type="submit">Check Durations</button>
+            </form>
+            <form class="probe-form" method="post" action="{{ recordings_url_for('suggest_all_testimony_speakers') }}">
+              <input type="hidden" name="status" value="{{ status_filter }}">
+              <input type="hidden" name="sort" value="{{ sort }}">
+              <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
+            </form>
+          {% endif %}
+          {% if status_filter in ["identified", "all"] %}
+            <form class="probe-form" method="post" action="{{ recordings_url_for('transcribe_identified_testimonies') }}">
+              <input type="hidden" name="status" value="{{ status_filter }}">
+              <input type="hidden" name="sort" value="{{ sort }}">
+              <button type="submit" data-process-transcripts-button {% if transcript_job.state == "running" %}disabled{% endif %}>Process Transcripts</button>
+            </form>
+          {% endif %}
+          {% if status_filter in ["not_testimony", "duplicate", "all"] %}
+            <form class="probe-form" method="post" action="{{ recordings_url_for('quarantine_testimony_reviews') }}">
+              <input type="hidden" name="status" value="{{ status_filter }}">
+              <input type="hidden" name="sort" value="{{ sort }}">
+              <button type="submit">
+                {% if status_filter == "not_testimony" %}
+                  Quarantine Not Testimony
+                {% elif status_filter == "duplicate" %}
+                  Quarantine Duplicates
+                {% else %}
+                  Quarantine Rejected
+                {% endif %}
+              </button>
+            </form>
+          {% endif %}
+        </div>
       </div>
       <div class="job-panel" data-suggestion-job data-status-url="{{ recordings_url_for('testimony_suggestion_status') }}" data-state="{{ suggestion_job.state }}" {% if suggestion_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
         <div>
