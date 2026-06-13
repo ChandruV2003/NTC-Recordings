@@ -41,12 +41,18 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac"}
 DEFAULT_MESSAGE_RECORDING_DIR = "/mnt/MainRecordings/Recordings/MessageRecordings"
 DEFAULT_WORSHIP_RECORDING_DIR = "/mnt/MainRecordings/Recordings/WorshipRecordings"
 DEFAULT_TESTIMONY_RECORDING_DIR = "/mnt/MainRecordings/Recordings/TestimonyRecordings"
-DEFAULT_TESTIMONY_REJECTED_DIR = "/mnt/MainRecordings/Recordings/TestimonyReviewRejected"
+DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rejected"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "identified", "not_testimony", "duplicate", "all"}
 TESTIMONY_REVIEW_STATUSES = {"needs_review", "identified", "not_testimony", "duplicate", "already_named"}
 TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "identified", "not_testimony", "duplicate"}
+TESTIMONY_EVENT_FOLDERS = {
+    "2025-04-11": ("Funeral Testimonies", "April 11-12, 2025 - Sister Marykutty's Funeral"),
+    "2025-04-12": ("Funeral Testimonies", "April 11-12, 2025 - Sister Marykutty's Funeral"),
+    "2025-04-20": ("Funeral Testimonies", "April 20-21, 2025 - Brother K.T. Varghese's Funeral"),
+    "2025-04-21": ("Funeral Testimonies", "April 20-21, 2025 - Brother K.T. Varghese's Funeral"),
+}
 TESTIMONY_MESSAGE_INTRO_PATTERNS = [
     r"\bshall\s+we\s+turn\s+to\b",
     r"\blet'?s\s+turn\s+to\b",
@@ -3265,7 +3271,18 @@ def _proposed_testimony_path(
     if not title:
         title = "Testimony"
     filename = _sanitize_filename_part(f"{date_prefix} - {title}") + source_path.suffix.lower()
+    event_folder = _testimony_event_folder(service_date)
+    if event_folder:
+        category, folder_name = event_folder
+        return str(_testimony_recording_root(app) / year / category / folder_name / filename)
     return str(_testimony_recording_root(app) / year / "Sunday Testimonies" / filename)
+
+
+def _testimony_event_folder(service_date: str) -> tuple[str, str] | None:
+    normalized_date = _normalize_date(service_date or "")
+    if not normalized_date:
+        return None
+    return TESTIMONY_EVENT_FOLDERS.get(normalized_date)
 
 
 def _date_from_file_metadata(stat_result: os.stat_result) -> str | None:

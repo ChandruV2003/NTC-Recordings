@@ -814,6 +814,49 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"REC00198", all_items)
         self.assertIn(b"REC10199", all_items)
 
+    def test_funeral_date_testimony_saves_to_funeral_folder(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "REC00090.mp3"
+        raw_recording.write_bytes(b"funeral-testimony-audio")
+        recording_id = _recording_id(raw_recording)
+
+        self._login()
+        response = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "status": "identified",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2025-04-20",
+                "speaker_name": "Brother Blessen",
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        funeral_path = (
+            self.testimony_root
+            / "2025"
+            / "Funeral Testimonies"
+            / "April 20-21, 2025 - Brother K.T. Varghese's Funeral"
+            / "April 20, 2025 - Brother Blessen's Testimony.mp3"
+        )
+        self.assertFalse(raw_recording.exists())
+        self.assertTrue(funeral_path.exists())
+        self.assertEqual(funeral_path.read_bytes(), b"funeral-testimony-audio")
+
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT source_path, proposed_path FROM testimony_reviews WHERE recording_id = ?",
+                (_recording_id(funeral_path),),
+            ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], str(funeral_path))
+        self.assertIn("Funeral Testimonies", row[1])
+        self.assertIn("Brother K.T. Varghese", row[1])
+
     def test_testimony_review_quarantines_rejected_recordings(self):
         testimony_source_root = self.root / "DN300R"
         testimony_source_root.mkdir()
