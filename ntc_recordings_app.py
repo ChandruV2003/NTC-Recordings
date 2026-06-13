@@ -41,6 +41,7 @@ AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac"}
 DEFAULT_MESSAGE_RECORDING_DIR = "/mnt/MainRecordings/Recordings/MessageRecordings"
 DEFAULT_WORSHIP_RECORDING_DIR = "/mnt/MainRecordings/Recordings/WorshipRecordings"
 DEFAULT_TESTIMONY_RECORDING_DIR = "/mnt/MainRecordings/Recordings/TestimonyRecordings"
+DEFAULT_TESTIMONY_REJECTED_DIR = "/mnt/MainRecordings/Recordings/TestimonyReviewRejected"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "identified", "not_testimony", "duplicate", "all"}
@@ -260,6 +261,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             or str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R")
         ),
         NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR=os.getenv("NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR", DEFAULT_TESTIMONY_RECORDING_DIR),
+        NTC_RECORDINGS_TESTIMONY_REJECTED_DIR=os.getenv("NTC_RECORDINGS_TESTIMONY_REJECTED_DIR", DEFAULT_TESTIMONY_REJECTED_DIR),
         NTC_RECORDINGS_MAX_SCAN_FILES=int(os.getenv("NTC_RECORDINGS_MAX_SCAN_FILES", "4000")),
         NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT", "80")),
         NTC_RECORDINGS_TESTIMONY_MIN_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_MIN_SECONDS", "45")),
@@ -274,7 +276,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             "This is a church testimony. The speaker may introduce themselves by saying my name is, I am, or I'm.",
         ),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS", "240")),
-        NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS", "768")),
+        NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS", "384")),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT", "30")),
         NTC_RECORDINGS_INDEX_REFRESH_SECONDS=float(
             os.getenv(
@@ -659,6 +661,36 @@ def create_app(test_config: dict | None = None) -> Flask:
         if guard:
             return guard
         return jsonify(_testimony_transcript_job_status(app))
+
+    @app.post("/admin/testimonies/quarantine")
+    def quarantine_testimony_reviews():
+        guard = _require_admin()
+        if guard:
+            return guard
+        current_filter = (request.form.get("status") or "not_testimony").strip().lower()
+        if current_filter == "already_named":
+            current_filter = "identified"
+        if current_filter not in TESTIMONY_REVIEW_FILTERS:
+            current_filter = "not_testimony"
+        if current_filter in {"not_testimony", "duplicate"}:
+            statuses = {current_filter}
+        else:
+            statuses = {"not_testimony", "duplicate"}
+        moved, skipped, errors = _quarantine_testimony_reviews(app, statuses)
+        if len(statuses) == 1 and "duplicate" in statuses:
+            label = "duplicate file"
+        elif len(statuses) == 1 and "not_testimony" in statuses:
+            label = "not-testimony file"
+        else:
+            label = "rejected file"
+        message = f"Moved {moved} {label}{'s' if moved != 1 else ''} to quarantine; skipped {skipped}; errors {errors}."
+        return _redirect_to(
+            app,
+            "testimony_review",
+            status=current_filter,
+            sort=request.form.get("sort") or "shortest",
+            message=message,
+        )
 
     @app.post("/admin/testimonies/<recording_id>/suggest")
     def suggest_testimony_speaker(recording_id: str):
@@ -1050,6 +1082,9 @@ def _init_db(db_path: str) -> None:
                 transcript_source TEXT NOT NULL DEFAULT '',
                 transcript_error TEXT NOT NULL DEFAULT '',
                 transcript_updated_at TEXT NOT NULL DEFAULT '',
+                quarantined_from_path TEXT NOT NULL DEFAULT '',
+                quarantined_path TEXT NOT NULL DEFAULT '',
+                quarantined_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             )
             """
@@ -1062,6 +1097,9 @@ def _init_db(db_path: str) -> None:
         _ensure_column(connection, "testimony_reviews", "transcript_source", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "transcript_error", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "transcript_updated_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "quarantined_from_path", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "quarantined_path", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "quarantined_at", "TEXT NOT NULL DEFAULT ''")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_status ON testimony_reviews(status)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_source_path ON testimony_reviews(source_path)")
 
@@ -1348,7 +1386,8 @@ def _path_allowed(app: Flask, path: Path) -> bool:
         resolved = path.resolve()
     except FileNotFoundError:
         resolved = path.absolute()
-    for root in _library_dirs(app):
+    allowed_roots = _library_dirs(app) + [_testimony_rejected_root(app)]
+    for root in allowed_roots:
         try:
             resolved.relative_to(root.resolve())
             return True
@@ -1864,6 +1903,10 @@ def _testimony_recording_root(app: Flask) -> Path:
     return configured
 
 
+def _testimony_rejected_root(app: Flask) -> Path:
+    return Path(str(app.config.get("NTC_RECORDINGS_TESTIMONY_REJECTED_DIR") or DEFAULT_TESTIMONY_REJECTED_DIR)).expanduser()
+
+
 def _relative_to_first_root(path: Path, roots: Iterable[Path]) -> str:
     for root in roots:
         try:
@@ -1877,7 +1920,7 @@ def _testimony_source_candidates(app: Flask) -> list[RecordingCandidate]:
     root = _testimony_source_root(app)
     if not root.exists() or not root.is_dir():
         return []
-    known_roots = [_testimony_recording_root(app), _message_recording_root(app), root]
+    known_roots = [_testimony_recording_root(app), _message_recording_root(app), root, _testimony_rejected_root(app)]
     candidates = []
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
@@ -1914,7 +1957,13 @@ def _testimony_source_candidate_from_path(app: Flask, path: Path) -> RecordingCa
     root = _testimony_source_root(app)
     message_root = _message_recording_root(app)
     testimony_root = _testimony_recording_root(app)
-    if not _path_within(path, root) and not _path_within(path, message_root) and not _path_within(path, testimony_root):
+    rejected_root = _testimony_rejected_root(app)
+    if not (
+        _path_within(path, root)
+        or _path_within(path, message_root)
+        or _path_within(path, testimony_root)
+        or _path_within(path, rejected_root)
+    ):
         return None
     if not path.exists() or not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
         return None
@@ -1926,7 +1975,7 @@ def _testimony_source_candidate_from_path(app: Flask, path: Path) -> RecordingCa
         return None
     recording_date = _extract_recording_date(" ".join(path.parts)) or _date_from_file_metadata(stat) or ""
     try:
-        relative_path = _relative_to_first_root(path, [testimony_root, message_root, root])
+        relative_path = _relative_to_first_root(path, [testimony_root, message_root, root, rejected_root])
     except ValueError:
         relative_path = path.name
     kind = "testimony" if _raw_testimony_name(path) else "message"
@@ -1950,9 +1999,18 @@ def _testimony_source_recording_by_id(app: Flask, recording_id: str) -> Recordin
 
 def _testimony_source_recording_from_form(app: Flask, recording_id: str) -> RecordingCandidate | None:
     form_path = (request.form.get("source_path") or "").strip()
+    row = _testimony_review_row(app, recording_id)
     if form_path:
         candidate = _testimony_source_candidate_from_path(app, Path(form_path))
         if candidate and candidate.id == recording_id:
+            return candidate
+        if candidate and row:
+            row_paths = {str(row["source_path"] or ""), str(row["proposed_path"] or "")}
+            if candidate.path in row_paths:
+                return candidate
+    if row:
+        candidate = _testimony_candidate_from_review_row(app, row)
+        if candidate:
             return candidate
     return _testimony_source_recording_by_id(app, recording_id)
 
@@ -2010,6 +2068,9 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     transcript_source = _row_optional_text(row, "transcript_source")
     transcript_error = _row_optional_text(row, "transcript_error")
     transcript_updated_at = _row_optional_text(row, "transcript_updated_at")
+    quarantined_from_path = _row_optional_text(row, "quarantined_from_path")
+    quarantined_path = _row_optional_text(row, "quarantined_path")
+    quarantined_at = _row_optional_text(row, "quarantined_at")
     if not suggested_speaker and not speaker_name:
         suggested_speaker = _testimony_filename_speaker_suggestion(Path(candidate.path))
         if suggested_speaker:
@@ -2025,8 +2086,11 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
             speaker_name,
             testimony_title,
         )
+    display_id = str(row["recording_id"] or "") if row else candidate.id
+    if not display_id:
+        display_id = candidate.id
     return {
-        "id": candidate.id,
+        "id": display_id,
         "title": candidate.title,
         "source_path": candidate.path,
         "source_label": Path(candidate.path).name,
@@ -2048,6 +2112,11 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "transcript_error": transcript_error,
         "transcript_updated_at": transcript_updated_at,
         "transcript_updated_label": _format_datetime(transcript_updated_at),
+        "quarantined": bool(quarantined_path or quarantined_at),
+        "quarantined_from_path": quarantined_from_path,
+        "quarantined_path": quarantined_path,
+        "quarantined_at": quarantined_at,
+        "quarantined_label": _format_datetime(quarantined_at),
         "duration_seconds": duration_seconds,
         "duration_label": _format_duration(duration_seconds),
         "size_label": _human_size(candidate.size_bytes),
@@ -2055,7 +2124,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "modified_label": _format_datetime(candidate.modified_at),
         "status": status,
         "status_label": _testimony_status_label(status),
-        "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=candidate.id),
+        "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=display_id),
         "extension": Path(candidate.path).suffix.lower(),
     }
 
@@ -2582,6 +2651,100 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
         )
 
 
+def _testimony_quarantine_status_folder(status: str) -> str:
+    if status == "duplicate":
+        return "Duplicate"
+    return "Not Testimony"
+
+
+def _quarantine_testimony_destination(app: Flask, candidate: RecordingCandidate, row: sqlite3.Row) -> Path:
+    service_date = _normalize_date(str(row["service_date"] or "")) or candidate.recording_date or ""
+    year = service_date[:4] if service_date else "Unsorted"
+    filename = _sanitize_filename_part(Path(candidate.path).stem) + Path(candidate.path).suffix.lower()
+    return _testimony_rejected_root(app) / _testimony_quarantine_status_folder(str(row["status"] or "")) / year / filename
+
+
+def _save_testimony_quarantine(
+    app: Flask,
+    *,
+    recording_id: str,
+    source_path: str,
+    quarantined_from_path: str,
+    quarantined_path: str,
+) -> None:
+    updated_at = _utc_now()
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute(
+            """
+            UPDATE testimony_reviews
+            SET source_path = ?,
+                quarantined_from_path = ?,
+                quarantined_path = ?,
+                quarantined_at = ?,
+                updated_at = ?
+            WHERE recording_id = ?
+            """,
+            (
+                source_path,
+                quarantined_from_path,
+                quarantined_path,
+                updated_at,
+                updated_at,
+                recording_id,
+            ),
+        )
+
+
+def _quarantine_testimony_reviews(app: Flask, statuses: set[str]) -> tuple[int, int, int]:
+    allowed_statuses = {"not_testimony", "duplicate"}
+    target_statuses = statuses & allowed_statuses
+    if not target_statuses:
+        return 0, 0, 0
+    rows = _testimony_review_rows(app)
+    moved = skipped = errors = 0
+    rejected_root = _testimony_rejected_root(app)
+    for row in rows.values():
+        row_status = str(row["status"] or "")
+        if row_status not in target_statuses:
+            continue
+        candidate = _testimony_candidate_from_review_row(app, row)
+        if not candidate:
+            skipped += 1
+            continue
+        source_path = Path(candidate.path)
+        if _path_within(source_path, rejected_root):
+            skipped += 1
+            if not _row_optional_text(row, "quarantined_path"):
+                _save_testimony_quarantine(
+                    app,
+                    recording_id=str(row["recording_id"]),
+                    source_path=str(source_path),
+                    quarantined_from_path=_row_optional_text(row, "quarantined_from_path") or str(source_path),
+                    quarantined_path=str(source_path),
+                )
+            continue
+        if not source_path.exists() or not source_path.is_file():
+            skipped += 1
+            continue
+        destination = _unique_destination_path(_quarantine_testimony_destination(app, candidate, row))
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source_path), str(destination))
+        except OSError:
+            app.logger.exception("failed to quarantine testimony review file %s", source_path)
+            errors += 1
+            continue
+        _save_testimony_quarantine(
+            app,
+            recording_id=str(row["recording_id"]),
+            source_path=str(destination),
+            quarantined_from_path=str(source_path),
+            quarantined_path=str(destination),
+        )
+        moved += 1
+    return moved, skipped, errors
+
+
 def _delete_testimony_review(app: Flask, recording_id: str) -> None:
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute("DELETE FROM testimony_reviews WHERE recording_id = ?", (recording_id,))
@@ -2884,10 +3047,10 @@ def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple
         seconds = 240
     seconds = min(max(seconds, 30), 900)
     try:
-        max_tokens = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS") or 768)
+        max_tokens = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS") or 384)
     except (TypeError, ValueError):
-        max_tokens = 768
-    max_tokens = min(max(max_tokens, 128), 2048)
+        max_tokens = 384
+    max_tokens = min(max(max_tokens, 128), 384)
     timeout = float(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT") or 120)
     prompt = str(
         app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_PROMPT")
@@ -5224,6 +5387,19 @@ TESTIMONY_REVIEW_TEMPLATE = """
           <input type="hidden" name="sort" value="{{ sort }}">
           <button type="submit" data-process-transcripts-button {% if transcript_job.state == "running" %}disabled{% endif %}>Process Transcripts</button>
         </form>
+        <form class="probe-form" method="post" action="{{ recordings_url_for('quarantine_testimony_reviews') }}">
+          <input type="hidden" name="status" value="{{ status_filter }}">
+          <input type="hidden" name="sort" value="{{ sort }}">
+          <button type="submit">
+            {% if status_filter == "not_testimony" %}
+              Quarantine Not Testimony
+            {% elif status_filter == "duplicate" %}
+              Quarantine Duplicates
+            {% else %}
+              Quarantine Rejected
+            {% endif %}
+          </button>
+        </form>
       </div>
       <div class="job-panel" data-suggestion-job data-status-url="{{ recordings_url_for('testimony_suggestion_status') }}" data-state="{{ suggestion_job.state }}" {% if suggestion_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
         <div>
@@ -5376,6 +5552,15 @@ TESTIMONY_REVIEW_TEMPLATE = """
                             <span>Transcript</span>
                             <strong>Not processed yet</strong>
                             <small>Use Process Transcripts to store an excerpt for naming cleanup.</small>
+                          </div>
+                        </div>
+                      {% endif %}
+                      {% if item.quarantined %}
+                        <div class="suggestion-panel subdued transcript-panel">
+                          <div>
+                            <span>Quarantine</span>
+                            <strong>Moved to rejected holding folder</strong>
+                            {% if item.quarantined_label %}<small>{{ item.quarantined_label }}</small>{% endif %}
                           </div>
                         </div>
                       {% endif %}

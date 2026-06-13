@@ -31,6 +31,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.worship_root.mkdir(parents=True)
         self.testimony_root = Path(self.tempdir.name) / "TestimonyRecordings"
         self.testimony_root.mkdir(parents=True)
+        self.rejected_root = Path(self.tempdir.name) / "TestimonyReviewRejected"
+        self.rejected_root.mkdir(parents=True)
         self.recording = self.root / "20260419 - Jesus Is Our Peace - Bro Blessen.mp3"
         self.recording.write_bytes(b"fake-mp3-audio")
         (self.testimony_root / "February 8, 2026 - Brother Paul's Testimony.mp3").write_bytes(b"fake-testimony-audio")
@@ -49,6 +51,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
                 "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(self.root / "DN300R"),
                 "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
+                "NTC_RECORDINGS_TESTIMONY_REJECTED_DIR": str(self.rejected_root),
                 "NTC_RECORDINGS_PUBLIC_BASE_URL": "https://recordings.example.test",
                 "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
                 "NTC_RECORDINGS_EMAIL_ENABLED": "0",
@@ -649,6 +652,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Suggest Speaker", review.data)
         self.assertIn(b"Process Suggestions", review.data)
         self.assertIn(b"Process Transcripts", review.data)
+        self.assertIn(b"Quarantine Rejected", review.data)
         self.assertIn(b'data-suggestion-job', review.data)
         self.assertIn(b'data-status-url="/admin/testimonies/suggest-status"', review.data)
         self.assertIn(b'data-transcript-job', review.data)
@@ -807,6 +811,61 @@ class RecordingRequestPanelTests(unittest.TestCase):
         all_items = self.client.get("/admin/testimonies?status=all").data
         self.assertIn(b"REC00198", all_items)
         self.assertIn(b"REC10199", all_items)
+
+    def test_testimony_review_quarantines_rejected_recordings(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        duplicate_recording = testimony_source_root / "REC10199.wav"
+        duplicate_recording.write_bytes(b"same-testimony-content-duplicate")
+        service_timestamp = datetime(2025, 8, 3, 12, tzinfo=timezone.utc).timestamp()
+        os.utime(duplicate_recording, (service_timestamp, service_timestamp))
+        duplicate_id = _recording_id(duplicate_recording)
+
+        self._login()
+        marked = self.client.post(
+            f"/admin/testimonies/{duplicate_id}/review",
+            data={
+                "status": "duplicate",
+                "status_filter": "needs_review",
+                "source_path": str(duplicate_recording),
+                "service_date": "2025-08-03",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+        self.assertEqual(marked.status_code, 200)
+
+        quarantined = self.client.post(
+            "/admin/testimonies/quarantine",
+            data={"status": "duplicate", "sort": "shortest"},
+            follow_redirects=True,
+        )
+
+        self.assertEqual(quarantined.status_code, 200)
+        self.assertIn(b"Moved 1 duplicate file to quarantine", quarantined.data)
+        self.assertIn(b"Moved to rejected holding folder", quarantined.data)
+        quarantine_path = self.rejected_root / "Duplicate" / "2025" / "REC10199.wav"
+        self.assertFalse(duplicate_recording.exists())
+        self.assertTrue(quarantine_path.exists())
+        self.assertEqual(quarantine_path.read_bytes(), b"same-testimony-content-duplicate")
+
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT status, source_path, quarantined_from_path, quarantined_path, quarantined_at
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (duplicate_id,),
+            ).fetchone()
+        self.assertEqual(row[0], "duplicate")
+        self.assertEqual(row[1], str(quarantine_path))
+        self.assertEqual(row[2], str(duplicate_recording))
+        self.assertEqual(row[3], str(quarantine_path))
+        self.assertTrue(row[4])
+
+        audio = self.client.get(f"/admin/testimonies/audio/{duplicate_id}")
+        self.assertEqual(audio.status_code, 200)
+        self.assertEqual(audio.data, b"same-testimony-content-duplicate")
 
     def test_testimony_review_supports_json_row_updates(self):
         testimony_source_root = self.root / "DN300R"
