@@ -44,14 +44,18 @@ DEFAULT_TESTIMONY_RECORDING_DIR = "/mnt/MainRecordings/Recordings/TestimonyRecor
 DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rejected"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
-TESTIMONY_REVIEW_FILTERS = {"needs_review", "identified", "not_testimony", "duplicate", "all"}
-TESTIMONY_REVIEW_STATUSES = {"needs_review", "identified", "not_testimony", "duplicate", "already_named"}
-TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "identified", "not_testimony", "duplicate"}
+TESTIMONY_REVIEW_FILTERS = {"needs_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
+TESTIMONY_REVIEW_STATUSES = {"needs_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"}
+TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "identified", "grouped", "not_testimony", "duplicate"}
 TESTIMONY_EVENT_FOLDERS = {
     "2025-04-11": ("Funeral Testimonies", "April 11-12, 2025 - Sister Marykutty's Funeral"),
     "2025-04-12": ("Funeral Testimonies", "April 11-12, 2025 - Sister Marykutty's Funeral"),
     "2025-04-20": ("Funeral Testimonies", "April 20-21, 2025 - Brother K.T. Varghese's Funeral"),
     "2025-04-21": ("Funeral Testimonies", "April 20-21, 2025 - Brother K.T. Varghese's Funeral"),
+    "2025-04-22": ("Funeral Testimonies", "April 22-23, 2025 - Sister Kathy's Funeral"),
+    "2025-04-23": ("Funeral Testimonies", "April 22-23, 2025 - Sister Kathy's Funeral"),
+    "2022-11-22": ("Funeral Testimonies", "November 22-23, 2022 - Sister Olinka's Funeral Service"),
+    "2022-11-23": ("Funeral Testimonies", "November 22-23, 2022 - Sister Olinka's Funeral Service"),
 }
 TESTIMONY_MESSAGE_INTRO_PATTERNS = [
     r"\bshall\s+we\s+turn\s+to\b",
@@ -797,7 +801,12 @@ def create_app(test_config: dict | None = None) -> Flask:
             or ""
         )
         speaker_name = (request.form.get("speaker_name") or "").strip()
-        testimony_title = _testimony_title_for_speaker(speaker_name)
+        group_title = (request.form.get("group_title") or "").strip()
+        if status == "grouped":
+            speaker_name = ""
+            testimony_title = group_title or "Testimonies"
+        else:
+            testimony_title = _testimony_title_for_speaker(speaker_name)
         notes = str(existing["notes"] or "") if existing else ""
         duration_seconds = _row_duration(existing) if existing else None
         suggested_speaker = _valid_person_name_suggestion(str(existing["suggested_speaker"] or "") if existing else "", _testimony_known_speakers(app))
@@ -808,7 +817,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         transcript_error = _row_optional_text(existing, "transcript_error")
         proposed_path = ""
         save_message = "Testimony review saved."
-        if status == "identified":
+        if status in {"identified", "grouped"}:
             proposed_path = _proposed_testimony_path(app, Path(candidate.path), service_date, speaker_name, testimony_title)
             renamed_candidate, proposed_path, rename_error = _rename_testimony_recording(
                 app,
@@ -2084,7 +2093,8 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
             suggestion_text = Path(candidate.path).name
     if not service_date:
         service_date = candidate.recording_date
-    if not proposed_path and status == "identified":
+    event_folder = _testimony_event_folder(service_date)
+    if not proposed_path and status in {"identified", "grouped"}:
         proposed_path = _proposed_testimony_path(
             app,
             Path(candidate.path),
@@ -2105,6 +2115,8 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "service_date": service_date,
         "speaker_name": speaker_name,
         "testimony_title": testimony_title,
+        "group_title": testimony_title if status == "grouped" else "",
+        "event_group": event_folder[1] if event_folder else "",
         "notes": notes,
         "proposed_path": proposed_path,
         "suggested_speaker": suggested_speaker,
@@ -2177,7 +2189,7 @@ def _row_optional_text(row: sqlite3.Row | None, key: str) -> str:
 
 
 def _testimony_status_counts(items: Iterable[dict]) -> dict[str, int]:
-    counts = {"needs_review": 0, "identified": 0, "not_testimony": 0, "duplicate": 0, "already_named": 0, "all": 0}
+    counts = {"needs_review": 0, "identified": 0, "grouped": 0, "not_testimony": 0, "duplicate": 0, "already_named": 0, "all": 0}
     for item in items:
         status = item.get("status") if item.get("status") in counts else "needs_review"
         counts[status] += 1
@@ -2208,6 +2220,7 @@ def _testimony_status_label(status: str) -> str:
     labels = {
         "needs_review": "Needs Review",
         "identified": "Identified",
+        "grouped": "Grouped",
         "not_testimony": "Not Testimony",
         "duplicate": "Duplicate",
         "already_named": "Already Named",
@@ -2529,7 +2542,7 @@ def _testimony_transcript_targets(app: Flask, limit: int | None = None) -> list[
     targets = []
     skipped = 0
     for row in rows.values():
-        if str(row["status"] or "") not in {"identified", "already_named"}:
+        if str(row["status"] or "") not in {"identified", "grouped", "already_named"}:
             continue
         if _row_optional_text(row, "transcript_text"):
             skipped += 1
@@ -2875,7 +2888,7 @@ def _testimony_status_for_candidate(
     duration_seconds: float | None,
 ) -> str:
     status = str(row["status"] or "") if row else ""
-    if status in {"identified", "not_testimony", "duplicate", "already_named"}:
+    if status in {"identified", "grouped", "not_testimony", "duplicate", "already_named"}:
         return status
     if status not in TESTIMONY_REVIEW_STATUSES:
         status = "already_named" if _raw_testimony_name(Path(candidate.path)) else "needs_review"
@@ -5050,7 +5063,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .banner-stack:empty { display:none; }
       .metrics {
         display:grid;
-        grid-template-columns:repeat(5,minmax(0,1fr));
+        grid-template-columns:repeat(6,minmax(0,1fr));
         gap:.65rem;
         margin:.65rem 0 1rem;
       }
@@ -5219,6 +5232,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
       .pill.needs_review { color:var(--warn); border-color:rgba(255,200,117,.35); background:var(--warn-soft); }
       .pill.identified, .pill.already_named { color:var(--good); border-color:rgba(116,221,180,.34); background:var(--good-soft); }
+      .pill.grouped { color:var(--accent); border-color:rgba(143,211,255,.34); background:rgba(143,211,255,.08); }
       .pill.not_testimony { color:var(--bad); border-color:rgba(255,170,168,.35); background:var(--bad-soft); }
       .pill.duplicate { color:var(--accent); border-color:rgba(143,211,255,.34); background:rgba(143,211,255,.08); }
       .review-body {
@@ -5382,13 +5396,14 @@ TESTIMONY_REVIEW_TEMPLATE = """
       <section class="metrics" aria-label="Testimony review status">
         <div class="metric"><span>Needs Review</span><strong data-count="needs_review">{{ counts.needs_review }}</strong><small>Awaiting identification</small></div>
         <div class="metric"><span>Identified</span><strong data-count="identified">{{ counts.identified }}</strong><small>Speaker confirmed or already named</small></div>
+        <div class="metric"><span>Grouped</span><strong data-count="grouped">{{ counts.grouped }}</strong><small>Event testimony sets</small></div>
         <div class="metric"><span>Not Testimony</span><strong data-count="not_testimony">{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
         <div class="metric"><span>Duplicates</span><strong data-count="duplicate">{{ counts.duplicate }}</strong><small>Already covered by another file</small></div>
         <div class="metric"><span>Files Found</span><strong data-count="all">{{ counts.all }}</strong><small>Folder connected</small></div>
       </section>
       <div class="toolbar">
         <nav class="tabs" aria-label="Testimony review filters">
-          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("not_testimony", "Not Testimony"), ("duplicate", "Duplicate"), ("all", "All")] %}
+          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("grouped", "Grouped"), ("not_testimony", "Not Testimony"), ("duplicate", "Duplicate"), ("all", "All")] %}
             <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ recordings_url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong data-count="{{ key }}">{{ counts[key] }}</strong></a>
           {% endfor %}
         </nav>
@@ -5531,7 +5546,20 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           <span>Speaker</span>
                           <input name="speaker_name" value="{{ item.speaker_name }}" placeholder="Sister Rachel" list="speaker-name-options">
                         </label>
+                        <label>
+                          <span>Group Title</span>
+                          <input name="group_title" value="{{ item.group_title }}" placeholder="Testimonies Part 1">
+                        </label>
                       </div>
+                      {% if item.event_group %}
+                        <div class="suggestion-panel subdued">
+                          <div>
+                            <span>Event Folder</span>
+                            <strong>{{ item.event_group }}</strong>
+                            <small>Grouped clips save into this event when marked grouped.</small>
+                          </div>
+                        </div>
+                      {% endif %}
                       {% if not item.speaker_name and item.suggested_speaker %}
                         <div class="suggestion-panel speaker-assist-panel">
                           <div>
@@ -5578,7 +5606,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           </div>
                           <p>{{ item.transcript_error }}</p>
                         </div>
-                      {% elif item.status in ["identified", "already_named"] %}
+                      {% elif item.status in ["identified", "grouped", "already_named"] %}
                         <div class="suggestion-panel subdued transcript-panel">
                           <div>
                             <span>Transcript</span>
@@ -5601,6 +5629,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                       <button class="secondary" type="submit" name="status" value="needs_review">Needs Review</button>
                       <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Testimony</button>
                       <button class="secondary" type="submit" name="status" value="duplicate">Mark Duplicate</button>
+                      <button class="secondary" type="submit" name="status" value="grouped">Save Grouped</button>
                       <button class="save" type="submit" name="status" value="identified">Save Speaker</button>
                     </div>
                   </form>
@@ -5615,7 +5644,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
     </main>
     <script>
       const openCardsKey = "ntc-testimony-open-cards";
-      const statusClasses = ["needs_review", "identified", "not_testimony", "duplicate", "already_named"];
+      const statusClasses = ["needs_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"];
       const bannerStack = document.querySelector("[data-banner-stack]");
       const reviewList = document.querySelector("[data-review-list]");
       const activeReviewFilter = reviewList ? reviewList.dataset.activeFilter || "needs_review" : "needs_review";

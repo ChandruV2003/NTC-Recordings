@@ -651,6 +651,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b'preload="metadata" src="/admin/testimonies/audio/', review.data)
         self.assertIn(b"Suggest Speaker", review.data)
         self.assertIn(b"Process Suggestions", review.data)
+        self.assertIn(b"Group Title", review.data)
+        self.assertIn(b"Grouped", review.data)
         self.assertNotIn(b"Process Transcripts", review.data)
         self.assertNotIn(b"Quarantine Rejected", review.data)
         self.assertIn(b'data-suggestion-job', review.data)
@@ -856,6 +858,49 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(row[0], str(funeral_path))
         self.assertIn("Funeral Testimonies", row[1])
         self.assertIn("Brother K.T. Varghese", row[1])
+
+    def test_funeral_date_grouped_testimony_saves_part_title(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "REC00088.mp3"
+        raw_recording.write_bytes(b"grouped-funeral-testimony-audio")
+        recording_id = _recording_id(raw_recording)
+
+        self._login()
+        response = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "status": "grouped",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2025-04-20",
+                "group_title": "Brother K.T. Varghese Memorial Service Testimonies Part 1",
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        grouped_path = (
+            self.testimony_root
+            / "2025"
+            / "Funeral Testimonies"
+            / "April 20-21, 2025 - Brother K.T. Varghese's Funeral"
+            / "April 20, 2025 - Brother K.T. Varghese Memorial Service Testimonies Part 1.mp3"
+        )
+        self.assertFalse(raw_recording.exists())
+        self.assertTrue(grouped_path.exists())
+        self.assertEqual(grouped_path.read_bytes(), b"grouped-funeral-testimony-audio")
+
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT status, speaker_name, testimony_title, source_path FROM testimony_reviews WHERE recording_id = ?",
+                (_recording_id(grouped_path),),
+            ).fetchone()
+
+        self.assertEqual(row, ("grouped", "", "Brother K.T. Varghese Memorial Service Testimonies Part 1", str(grouped_path)))
+        grouped = self.client.get("/admin/testimonies?status=grouped").data
+        self.assertIn(b"Testimonies Part 1", grouped)
+        self.assertIn(b"Grouped", grouped)
 
     def test_testimony_review_quarantines_rejected_recordings(self):
         testimony_source_root = self.root / "DN300R"
