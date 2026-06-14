@@ -901,6 +901,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         grouped = self.client.get("/admin/testimonies?status=grouped").data
         self.assertIn(b"Testimonies Part 1", grouped)
         self.assertIn(b"Grouped", grouped)
+        self.assertIn(b"Process Transcripts", grouped)
 
     def test_testimony_review_quarantines_rejected_recordings(self):
         testimony_source_root = self.root / "DN300R"

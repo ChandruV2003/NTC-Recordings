@@ -5424,7 +5424,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
               <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
             </form>
           {% endif %}
-          {% if status_filter in ["identified", "all"] %}
+          {% if status_filter in ["identified", "grouped", "all"] %}
             <form class="probe-form" method="post" action="{{ recordings_url_for('transcribe_identified_testimonies') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
               <input type="hidden" name="sort" value="{{ sort }}">
