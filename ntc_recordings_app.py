@@ -807,7 +807,6 @@ def create_app(test_config: dict | None = None) -> Flask:
             speaker_name = ""
             testimony_title = group_title or "Testimonies"
         elif status == "needs_review":
-            speaker_name = ""
             testimony_title = ""
         else:
             testimony_title = _testimony_title_for_speaker(speaker_name)
