@@ -806,6 +806,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         if status == "grouped":
             speaker_name = ""
             testimony_title = group_title or "Testimonies"
+        elif status == "needs_review":
+            speaker_name = ""
+            testimony_title = ""
         else:
             testimony_title = _testimony_title_for_speaker(speaker_name)
         notes = str(existing["notes"] or "") if existing else ""
@@ -876,9 +879,14 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "service_date": service_date,
                     "service_date_label": _format_date(service_date),
                     "speaker_name": speaker_name,
+                    "group_title": testimony_title if status == "grouped" else "",
                     "title": candidate.title,
                     "source_label": Path(candidate.path).name,
                     "source_path": candidate.path,
+                    "suggested_speaker": suggested_speaker,
+                    "suggestion_source": suggestion_source,
+                    "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
+                    "suggestion_text": suggestion_text,
                     "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=recording_id),
                     "review_url": _recordings_url_for(app, "update_testimony_review", recording_id=recording_id),
                 }
@@ -5705,6 +5713,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
       }
 
+      function setInputValue(card, name, value) {
+        const input = card.querySelector(`[name="${name}"]`);
+        if (input && value !== undefined && value !== null) {
+          input.value = value || "";
+        }
+      }
+
       function countStatus(status) {
         return status === "already_named" ? "identified" : status;
       }
@@ -5731,6 +5746,20 @@ TESTIMONY_REVIEW_TEMPLATE = """
         if (activeReviewFilter === "all") return true;
         if (activeReviewFilter === "identified") return key === "identified";
         return key === activeReviewFilter;
+      }
+
+      function setFormBusy(form, isBusy) {
+        if (!form) return;
+        form.setAttribute("aria-busy", isBusy ? "true" : "false");
+        form.querySelectorAll("button").forEach((button) => {
+          if (isBusy) {
+            button.dataset.wasDisabled = button.disabled ? "1" : "0";
+            button.disabled = true;
+          } else {
+            button.disabled = button.dataset.wasDisabled === "1";
+            delete button.dataset.wasDisabled;
+          }
+        });
       }
 
       function replaceEmptyReviewList() {
@@ -5777,6 +5806,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         if (serviceDate && data.service_date) {
           serviceDate.value = data.service_date;
         }
+        setInputValue(card, "speaker_name", data.speaker_name || "");
+        setInputValue(card, "group_title", data.group_title || "");
 
         const audio = card.querySelector("audio[data-src]");
         if (audio && data.audio_url && audio.dataset.src !== data.audio_url) {
@@ -5900,7 +5931,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
 
         card.classList.add("is-saving");
-        if (submitter) submitter.disabled = true;
+        setFormBusy(form, true);
         try {
           const response = await fetch(url, {
             method: "POST",
@@ -5912,16 +5943,15 @@ TESTIMONY_REVIEW_TEMPLATE = """
             throw new Error(data.error || data.message || "The testimony update failed.");
           }
           showBanner(data.message || "Testimony review updated.");
-          if (data.suggested_speaker !== undefined || data.suggestion_text !== undefined) {
+          updateReviewCard(card, data);
+          if (!data.speaker_name && (data.suggested_speaker || data.suggestion_source || data.suggestion_text)) {
             renderSuggestion(card, data);
-          } else {
-            updateReviewCard(card, data);
           }
         } catch (error) {
           showBanner(error.message || "The testimony update failed.", true);
         } finally {
           card.classList.remove("is-saving");
-          if (submitter) submitter.disabled = false;
+          setFormBusy(form, false);
         }
       });
 
