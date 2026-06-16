@@ -653,11 +653,12 @@ def create_app(test_config: dict | None = None) -> Flask:
             limit = int(request.form.get("limit") or app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT") or 30)
         except ValueError:
             limit = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT") or 30)
-        started = _start_testimony_transcript_job(app, min(max(limit, 1), 100))
+        target_statuses = _testimony_transcript_statuses_for_filter(current_filter)
+        started = _start_testimony_transcript_job(app, min(max(limit, 1), 100), statuses=target_statuses)
         if started:
-            message = "Started identified testimony transcript processing."
+            message = "Started testimony transcript processing."
         else:
-            message = "Identified testimony transcript processing is already running."
+            message = "Testimony transcript processing is already running."
         return _redirect_to(
             app,
             "testimony_review",
@@ -2486,7 +2487,7 @@ def _update_testimony_transcript_job(app: Flask, **updates) -> None:
         app.testimony_transcript_job = state
 
 
-def _start_testimony_transcript_job(app: Flask, limit: int | None = None) -> bool:
+def _start_testimony_transcript_job(app: Flask, limit: int | None = None, statuses: set[str] | None = None) -> bool:
     with app.testimony_transcript_job_lock:
         if app.testimony_transcript_job.get("state") == "running":
             return False
@@ -2496,16 +2497,16 @@ def _start_testimony_transcript_job(app: Flask, limit: int | None = None) -> boo
             "started_at": _utc_now(),
             "message": "Scanning identified testimonies.",
         }
-    thread = threading.Thread(target=_run_testimony_transcript_job, args=(app, limit), name="testimony-transcript-job", daemon=True)
+    thread = threading.Thread(target=_run_testimony_transcript_job, args=(app, limit, statuses), name="testimony-transcript-job", daemon=True)
     thread.start()
     return True
 
 
-def _run_testimony_transcript_job(app: Flask, limit: int | None = None) -> None:
+def _run_testimony_transcript_job(app: Flask, limit: int | None = None, statuses: set[str] | None = None) -> None:
     try:
         with app.app_context():
-            targets = _testimony_transcript_targets(app, limit)
-            _update_testimony_transcript_job(app, total=len(targets), message=f"Processing {len(targets)} identified testimonies.")
+            targets = _testimony_transcript_targets(app, limit, statuses=statuses)
+            _update_testimony_transcript_job(app, total=len(targets), message=f"Processing {len(targets)} testimony transcripts.")
             processed = saved = errors = 0
             for target in targets:
                 row = target["row"]
@@ -2537,7 +2538,7 @@ def _run_testimony_transcript_job(app: Flask, limit: int | None = None) -> None:
                     processed=processed,
                     saved=saved,
                     errors=errors,
-                    message=f"Processed {processed} of {len(targets)} identified testimonies.",
+                    message=f"Processed {processed} of {len(targets)} testimony transcripts.",
                 )
             _update_testimony_transcript_job(
                 app,
@@ -2558,12 +2559,24 @@ def _run_testimony_transcript_job(app: Flask, limit: int | None = None) -> None:
         )
 
 
-def _testimony_transcript_targets(app: Flask, limit: int | None = None) -> list[dict]:
+def _testimony_transcript_statuses_for_filter(status_filter: str) -> set[str]:
+    status_filter = (status_filter or "").strip().lower()
+    if status_filter == "needs_review":
+        return {"needs_review"}
+    if status_filter == "grouped":
+        return {"grouped"}
+    if status_filter in {"all", ""}:
+        return {"needs_review", "identified", "grouped", "already_named"}
+    return {"identified", "already_named"}
+
+
+def _testimony_transcript_targets(app: Flask, limit: int | None = None, statuses: set[str] | None = None) -> list[dict]:
     rows = _testimony_review_rows(app)
     targets = []
     skipped = 0
+    target_statuses = statuses or {"identified", "grouped", "already_named"}
     for row in rows.values():
-        if str(row["status"] or "") not in {"identified", "grouped", "already_named"}:
+        if str(row["status"] or "") not in target_statuses:
             continue
         if _row_optional_text(row, "transcript_text"):
             skipped += 1
@@ -5460,7 +5473,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
               <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
             </form>
           {% endif %}
-          {% if status_filter in ["identified", "grouped", "all"] %}
+          {% if status_filter in ["needs_review", "identified", "grouped", "all"] %}
             <form class="probe-form" method="post" action="{{ recordings_url_for('transcribe_identified_testimonies') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
               <input type="hidden" name="sort" value="{{ sort }}">

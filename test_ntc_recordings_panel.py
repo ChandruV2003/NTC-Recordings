@@ -15,6 +15,7 @@ from ntc_recordings_app import (
     _recording_id,
     _testimony_looks_like_message_recording,
     _testimony_suggestion_targets,
+    _testimony_transcript_statuses_for_filter,
     _testimony_transcript_targets,
     _save_testimony_transcript,
     _valid_person_name_suggestion,
@@ -653,7 +654,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Process Suggestions", review.data)
         self.assertIn(b"Group Title", review.data)
         self.assertIn(b"Grouped", review.data)
-        self.assertNotIn(b"Process Transcripts", review.data)
+        self.assertIn(b"Process Transcripts", review.data)
         self.assertNotIn(b"Quarantine Rejected", review.data)
         self.assertIn(b'data-suggestion-job', review.data)
         self.assertIn(b'data-status-url="/admin/testimonies/suggest-status"', review.data)
@@ -1059,12 +1060,50 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(started.status_code, 200)
-        self.assertIn(b"Started identified testimony transcript processing", started.data)
+        self.assertIn(b"Started testimony transcript processing", started.data)
         starter.assert_called_once()
 
         status = self.client.get("/admin/testimonies/transcript-status")
         self.assertEqual(status.status_code, 200)
         self.assertIn("state", status.get_json())
+
+    def test_needs_review_testimony_transcript_route_targets_needs_review_rows(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        recording = testimony_source_root / "REC00203.mp3"
+        recording.write_bytes(b"needs-review-testimony-audio")
+        recording_id = _recording_id(recording)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    updated_at
+                )
+                VALUES (?, ?, 'needs_review', '2026-05-24', ?)
+                """,
+                (recording_id, str(recording), datetime.now(timezone.utc).isoformat()),
+            )
+
+        statuses = _testimony_transcript_statuses_for_filter("needs_review")
+        targets = _testimony_transcript_targets(self.app, statuses=statuses)
+        self.assertEqual([Path(item["candidate"].path).name for item in targets], ["REC00203.mp3"])
+
+        self._login()
+        with patch("ntc_recordings_app._start_testimony_transcript_job", return_value=True) as starter:
+            started = self.client.post(
+                "/admin/testimonies/transcribe-identified",
+                data={"status": "needs_review", "sort": "shortest"},
+                follow_redirects=True,
+            )
+
+        self.assertEqual(started.status_code, 200)
+        self.assertIn(b"Started testimony transcript processing", started.data)
+        starter.assert_called_once()
+        self.assertEqual(starter.call_args.kwargs["statuses"], {"needs_review"})
 
     def test_identified_testimony_transcripts_are_saved_and_skipped_afterwards(self):
         testimony_source_root = self.root / "DN300R"
