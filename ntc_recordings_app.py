@@ -818,6 +818,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         transcript_error = _row_optional_text(existing, "transcript_error")
         proposed_path = ""
         save_message = "Testimony review saved."
+        review_error = ""
         if status in {"identified", "grouped"}:
             proposed_path = _proposed_testimony_path(app, Path(candidate.path), service_date, speaker_name, testimony_title)
             renamed_candidate, proposed_path, rename_error = _rename_testimony_recording(
@@ -834,7 +835,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                 _replace_indexed_recording(app, recording_id, candidate)
             recording_id = candidate.id
             if rename_error:
-                save_message = f"Testimony review saved. {rename_error}"
+                status = "needs_review"
+                review_error = rename_error
+                save_message = f"Testimony review was not completed. {rename_error}"
             else:
                 save_message = f"Testimony review saved and renamed to {Path(proposed_path).name}."
         _save_testimony_review(
@@ -861,10 +864,11 @@ def create_app(test_config: dict | None = None) -> Flask:
                 transcript_error=transcript_error,
             )
         if _wants_json_response():
-            return jsonify(
+            response = jsonify(
                 {
-                    "ok": True,
+                    "ok": not bool(review_error),
                     "message": save_message,
+                    "error": review_error,
                     "recording_id": recording_id,
                     "previous_recording_id": original_recording_id,
                     "status": status,
@@ -878,6 +882,15 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=recording_id),
                     "review_url": _recordings_url_for(app, "update_testimony_review", recording_id=recording_id),
                 }
+            )
+            return (response, 500) if review_error else response
+        if review_error:
+            return _redirect_to(
+                app,
+                "testimony_review",
+                status=current_filter,
+                sort=request.form.get("sort") or "shortest",
+                error=save_message,
             )
         return _redirect_to(
             app,
