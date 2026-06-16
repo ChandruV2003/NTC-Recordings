@@ -5840,7 +5840,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           audio.load();
           if (card.open) hydrateReviewAudio(card);
         }
-        if (data.speaker_name) {
+        if (!(data.suggested_speaker || data.suggestion_source || data.suggestion_text)) {
           card.querySelectorAll(".speaker-assist-panel").forEach((panel) => panel.remove());
         }
         if (data.status) {
@@ -5875,7 +5875,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
         panel.appendChild(textWrap);
 
-        if (data.suggested_speaker) {
+        if (data.suggested_speaker && data.suggested_speaker !== data.speaker_name) {
           const button = document.createElement("button");
           button.className = "secondary apply-suggestion";
           button.type = "button";
@@ -5967,7 +5967,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           }
           showBanner(data.message || "Testimony review updated.");
           updateReviewCard(card, data);
-          if (!data.speaker_name && (data.suggested_speaker || data.suggestion_source || data.suggestion_text)) {
+          if (data.suggested_speaker || data.suggestion_source || data.suggestion_text) {
             renderSuggestion(card, data);
           }
         } catch (error) {
