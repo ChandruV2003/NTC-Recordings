@@ -5358,6 +5358,21 @@ TESTIMONY_REVIEW_TEMPLATE = """
         max-height:10.5rem;
         overflow:auto;
       }
+      .transcript-full {
+        grid-column:1 / -1;
+        border-top:1px solid rgba(143,211,255,.16);
+        padding-top:.7rem;
+      }
+      .transcript-full summary {
+        cursor:pointer;
+        color:#c6d3e2;
+        font-weight:800;
+      }
+      .transcript-full[open] summary { margin-bottom:.55rem; }
+      .transcript-full p {
+        white-space:pre-wrap;
+        max-height:22rem;
+      }
       .empty {
         border:1px dashed rgba(143,211,255,.25);
         border-radius:18px;
@@ -5582,17 +5597,19 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           </div>
                         </div>
                       {% endif %}
-                      {% if not item.speaker_name and item.suggested_speaker %}
+                      {% if item.suggested_speaker %}
                         <div class="suggestion-panel speaker-assist-panel">
                           <div>
                             <span>Suggested Speaker</span>
                             <strong>{{ item.suggested_speaker }}</strong>
                             {% if item.suggestion_source_label %}<small>{{ item.suggestion_source_label }}</small>{% endif %}
                           </div>
-                          <button class="secondary apply-suggestion" type="button" data-speaker="{{ item.suggested_speaker }}">Use Suggestion</button>
+                          {% if item.suggested_speaker != item.speaker_name %}
+                            <button class="secondary apply-suggestion" type="button" data-speaker="{{ item.suggested_speaker }}">Use Suggestion</button>
+                          {% endif %}
                           {% if item.suggestion_text %}<p>{{ item.suggestion_text }}</p>{% endif %}
                         </div>
-                      {% elif not item.speaker_name and item.suggestion_source %}
+                      {% elif item.suggestion_source %}
                         <div class="suggestion-panel subdued speaker-assist-panel">
                           <div>
                             <span>Intro Checked</span>
@@ -5619,6 +5636,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
                             {% if item.transcript_updated_label %}<small>{{ item.transcript_updated_label }}</small>{% endif %}
                           </div>
                           <p>{{ item.transcript_excerpt }}</p>
+                          {% if item.transcript_text %}
+                            <details class="transcript-full">
+                              <summary>View full transcript</summary>
+                              <p>{{ item.transcript_text }}</p>
+                            </details>
+                          {% endif %}
                         </div>
                       {% elif item.transcript_error %}
                         <div class="suggestion-panel subdued transcript-panel">
