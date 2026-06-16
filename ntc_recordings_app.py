@@ -48,6 +48,7 @@ TESTIMONY_REVIEW_FILTERS = {"needs_review", "identified", "grouped", "not_testim
 TESTIMONY_REVIEW_STATUSES = {"needs_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"}
 TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "identified", "grouped", "not_testimony", "duplicate"}
 TESTIMONY_EVENT_FOLDERS = {
+    "2021-08-30": ("Funeral Testimonies", "August 30, 2021 - Sister Marg's Funeral"),
     "2025-04-11": ("Funeral Testimonies", "April 11-12, 2025 - Sister Marykutty's Funeral"),
     "2025-04-12": ("Funeral Testimonies", "April 11-12, 2025 - Sister Marykutty's Funeral"),
     "2025-04-20": ("Funeral Testimonies", "April 20-21, 2025 - Brother K.T. Varghese's Funeral"),
