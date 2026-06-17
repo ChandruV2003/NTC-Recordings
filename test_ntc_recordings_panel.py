@@ -702,6 +702,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Kevin", suggested.data)
         self.assertIn(b"from intro transcript", suggested.data)
         self.assertIn(b"Use Suggestion", suggested.data)
+        self.assertIn(b"Type speaker name", suggested.data)
 
         with sqlite3.connect(self.db_path) as connection:
             suggestion_row = connection.execute(
@@ -714,6 +715,24 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(suggestion_row[1], "Kevin")
         self.assertEqual(suggestion_row[2], "transcript_intro")
         self.assertIn("my name is Kevin", suggestion_row[3])
+
+        with patch("ntc_recordings_app._probe_audio_duration", return_value=65):
+            probed = self.client.post(
+                "/admin/testimonies/probe",
+                data={"status": "needs_review", "sort": "shortest", "limit": "1"},
+                follow_redirects=True,
+            )
+
+        self.assertEqual(probed.status_code, 200)
+        with sqlite3.connect(self.db_path) as connection:
+            preserved_suggestion_row = connection.execute(
+                "SELECT suggested_speaker, suggestion_source, suggestion_text, duration_seconds FROM testimony_reviews WHERE recording_id = ?",
+                (recording_id,),
+            ).fetchone()
+        self.assertEqual(preserved_suggestion_row[0], "Kevin")
+        self.assertEqual(preserved_suggestion_row[1], "transcript_intro")
+        self.assertIn("my name is Kevin", preserved_suggestion_row[2])
+        self.assertEqual(preserved_suggestion_row[3], 65)
 
         with patch("os.rename", side_effect=OSError(errno.EXDEV, "Invalid cross-device link")):
             saved = self.client.post(
@@ -996,6 +1015,40 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertFalse(raw_recording.exists())
         self.assertTrue(Path(payload["source_path"]).exists())
         self.assertIn("TestimonyRecordings", payload["source_path"])
+
+    def test_testimony_review_converts_wav_to_mp3_when_saving_speaker(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "REC00078.wav"
+        raw_recording.write_bytes(b"fake-wav-audio")
+        recording_id = _recording_id(raw_recording)
+
+        def fake_ffmpeg(args, **kwargs):
+            output = Path(args[-1])
+            output.write_bytes(b"fake-mp3-audio")
+            return Mock(returncode=0, stdout="", stderr="")
+
+        self._login()
+        with patch("ntc_recordings_app.subprocess.run", side_effect=fake_ffmpeg):
+            response = self.client.post(
+                f"/admin/testimonies/{recording_id}/review",
+                data={
+                    "status": "identified",
+                    "status_filter": "needs_review",
+                    "source_path": str(raw_recording),
+                    "service_date": "2026-07-23",
+                    "speaker_name": "Kevin",
+                },
+                headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["source_path"].endswith(".mp3"))
+        self.assertTrue(payload["source_label"].endswith(".mp3"))
+        self.assertFalse(raw_recording.exists())
+        self.assertEqual(Path(payload["source_path"]).read_bytes(), b"fake-mp3-audio")
 
     def test_testimony_review_ajax_auth_failure_returns_json(self):
         response = self.client.post(

@@ -47,6 +47,7 @@ DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFA
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
 TESTIMONY_REVIEW_STATUSES = {"needs_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"}
 TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "identified", "grouped", "not_testimony", "duplicate"}
+TESTIMONY_FINAL_AUDIO_EXTENSION = ".mp3"
 TESTIMONY_EVENT_FOLDERS = {
     "2021-08-30": ("Funeral Testimonies", "August 30, 2021 - Sister Marg's Funeral"),
     "2025-04-11": ("Funeral Testimonies", "April 11-12, 2025 - Sister Marykutty's Funeral"),
@@ -2621,11 +2622,15 @@ def _save_testimony_review(
     notes: str,
     proposed_path: str,
     duration_seconds: float | None,
-    suggested_speaker: str = "",
-    suggestion_source: str = "",
-    suggestion_text: str = "",
+    suggested_speaker: str | None = None,
+    suggestion_source: str | None = None,
+    suggestion_text: str | None = None,
 ) -> None:
-    suggestion_updated_at = _utc_now() if (suggested_speaker or suggestion_source or suggestion_text) else ""
+    update_suggestion = suggested_speaker is not None or suggestion_source is not None or suggestion_text is not None
+    suggested_speaker_value = suggested_speaker or ""
+    suggestion_source_value = suggestion_source or ""
+    suggestion_text_value = suggestion_text or ""
+    suggestion_updated_at = _utc_now() if update_suggestion and (suggested_speaker_value or suggestion_source_value or suggestion_text_value) else ""
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute(
             """
@@ -2655,10 +2660,10 @@ def _save_testimony_review(
                 notes = excluded.notes,
                 proposed_path = excluded.proposed_path,
                 duration_seconds = excluded.duration_seconds,
-                suggested_speaker = excluded.suggested_speaker,
-                suggestion_source = excluded.suggestion_source,
-                suggestion_text = excluded.suggestion_text,
-                suggestion_updated_at = excluded.suggestion_updated_at,
+                suggested_speaker = CASE WHEN ? THEN excluded.suggested_speaker ELSE suggested_speaker END,
+                suggestion_source = CASE WHEN ? THEN excluded.suggestion_source ELSE suggestion_source END,
+                suggestion_text = CASE WHEN ? THEN excluded.suggestion_text ELSE suggestion_text END,
+                suggestion_updated_at = CASE WHEN ? THEN excluded.suggestion_updated_at ELSE suggestion_updated_at END,
                 updated_at = excluded.updated_at
             """,
             (
@@ -2671,11 +2676,15 @@ def _save_testimony_review(
                 notes,
                 proposed_path,
                 duration_seconds,
-                suggested_speaker,
-                suggestion_source,
-                suggestion_text,
+                suggested_speaker_value,
+                suggestion_source_value,
+                suggestion_text_value,
                 suggestion_updated_at,
                 _utc_now(),
+                1 if update_suggestion else 0,
+                1 if update_suggestion else 0,
+                1 if update_suggestion else 0,
+                1 if update_suggestion else 0,
             ),
         )
 
@@ -2813,6 +2822,50 @@ def _unique_destination_path(path: Path) -> Path:
     raise FileExistsError(f"No available filename near {path}")
 
 
+def _testimony_final_suffix(source_path: Path) -> str:
+    suffix = source_path.suffix.lower()
+    if suffix == ".wav":
+        return TESTIMONY_FINAL_AUDIO_EXTENSION
+    return suffix
+
+
+def _write_final_testimony_audio(source_path: Path, target_path: Path) -> None:
+    if source_path.suffix.lower() != ".wav" or target_path.suffix.lower() != TESTIMONY_FINAL_AUDIO_EXTENSION:
+        shutil.move(str(source_path), str(target_path))
+        return
+    temporary_target = target_path.with_name(f".{target_path.stem}.tmp-{secrets.token_hex(6)}{target_path.suffix}")
+    try:
+        completed = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-i",
+                str(source_path),
+                "-codec:a",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                str(temporary_target),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if completed.returncode != 0 or not temporary_target.exists() or temporary_target.stat().st_size <= 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise OSError(f"WAV to MP3 conversion failed{': ' + detail[:180] if detail else ''}")
+        os.replace(temporary_target, target_path)
+        source_path.unlink()
+    finally:
+        if temporary_target.exists():
+            temporary_target.unlink()
+
+
 def _rename_testimony_recording(
     app: Flask,
     candidate: RecordingCandidate,
@@ -2840,7 +2893,7 @@ def _rename_testimony_recording(
     try:
         proposed_path.parent.mkdir(parents=True, exist_ok=True)
         target_path = _unique_destination_path(proposed_path)
-        shutil.move(str(source_path), str(target_path))
+        _write_final_testimony_audio(source_path, target_path)
     except OSError as exc:
         return candidate, str(proposed_path), f"File move failed: {exc}"
     renamed = _testimony_source_candidate_from_path(app, target_path)
@@ -3317,7 +3370,7 @@ def _proposed_testimony_path(
         title = f"{speaker}'s Testimony"
     if not title:
         title = "Testimony"
-    filename = _sanitize_filename_part(f"{date_prefix} - {title}") + source_path.suffix.lower()
+    filename = _sanitize_filename_part(f"{date_prefix} - {title}") + _testimony_final_suffix(source_path)
     event_folder = _testimony_event_folder(service_date)
     if event_folder:
         category, folder_name = event_folder
@@ -5593,7 +5646,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                         </label>
                         <label>
                           <span>Speaker</span>
-                          <input name="speaker_name" value="{{ item.speaker_name }}" placeholder="Sister Rachel" list="speaker-name-options">
+                          <input name="speaker_name" value="{{ item.speaker_name }}" placeholder="Type speaker name" list="speaker-name-options">
                         </label>
                         <label>
                           <span>Group Title</span>
@@ -5620,6 +5673,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
                             <button class="secondary apply-suggestion" type="button" data-speaker="{{ item.suggested_speaker }}">Use Suggestion</button>
                           {% endif %}
                           {% if item.suggestion_text %}<p>{{ item.suggestion_text }}</p>{% endif %}
+                          {% if item.suggestion_source == "transcript_intro" and item.transcript_text %}
+                            <details class="transcript-full">
+                              <summary>View full transcript</summary>
+                              <p>{{ item.transcript_text }}</p>
+                            </details>
+                          {% endif %}
                         </div>
                       {% elif item.suggestion_source %}
                         <div class="suggestion-panel subdued speaker-assist-panel">
@@ -5640,7 +5699,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           <button class="secondary" type="submit" formaction="{{ recordings_url_for('suggest_testimony_speaker', recording_id=item.id) }}" formmethod="post">Suggest Speaker</button>
                         </div>
                       {% endif %}
-                      {% if item.transcript_excerpt %}
+                      {% if item.transcript_excerpt and not (item.suggested_speaker and item.suggestion_source == "transcript_intro") %}
                         <div class="suggestion-panel subdued transcript-panel">
                           <div>
                             <span>Transcript</span>
