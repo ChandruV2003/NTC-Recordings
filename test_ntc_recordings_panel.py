@@ -13,6 +13,7 @@ from ntc_recordings_app import (
     _extract_intro_speaker,
     _normalize_recording_email_message,
     _recording_id,
+    _testimony_filename_speaker_suggestion,
     _testimony_looks_like_message_recording,
     _testimony_suggestion_targets,
     _testimony_transcript_statuses_for_filter,
@@ -707,6 +708,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Kevin", suggested.data)
         self.assertIn(b"from intro transcript", suggested.data)
         self.assertIn(b"Use Suggestion", suggested.data)
+        self.assertIn(b"Intro transcript", suggested.data)
+        self.assertLess(
+            suggested.data.index(b"<span>Suggested Speaker</span>"),
+            suggested.data.index(b"<span>Transcript</span>"),
+        )
         self.assertIn(b"Type speaker name", suggested.data)
 
         with sqlite3.connect(self.db_path) as connection:
@@ -840,6 +846,38 @@ class RecordingRequestPanelTests(unittest.TestCase):
         all_items = self.client.get("/admin/testimonies?status=all").data
         self.assertIn(b"REC00198", all_items)
         self.assertIn(b"REC10199", all_items)
+
+    def test_testimony_review_requires_speaker_before_identifying(self):
+        testimony_source_root = self.root / "DN300R"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "REC00088.mp3"
+        raw_recording.write_bytes(b"raw-testimony-audio")
+        recording_id = _recording_id(raw_recording)
+
+        self._login()
+        response = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "status": "identified",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2026-03-15",
+                "speaker_name": "",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertFalse(payload["ok"])
+        self.assertIn("Enter a speaker name", payload["error"])
+        self.assertTrue(raw_recording.exists())
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT status FROM testimony_reviews WHERE recording_id = ?",
+                (recording_id,),
+            ).fetchone()
+        self.assertIsNone(row)
 
     def test_funeral_date_testimony_saves_to_funeral_folder(self):
         testimony_source_root = self.root / "DN300R"
@@ -1349,6 +1387,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(_extract_intro_speaker("I am deeply thankful for what God has done.", []), "")
         self.assertEqual(_extract_intro_speaker("Praise the Lord. I am happening to me in this situation.", []), "")
         self.assertEqual(_valid_person_name_suggestion("Happening To Me", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Testimony", []), "")
+        self.assertEqual(_testimony_filename_speaker_suggestion(Path("March 15, 2026 - Testimony.mp3")), "")
+        self.assertEqual(
+            _testimony_filename_speaker_suggestion(Path("March 15, 2026 - Sister Shirley's Testimony.mp3")),
+            "Sister Shirley",
+        )
 
     def test_email_message_normalizes_escaped_newlines(self):
         message = "Praise the Lord,\\n\\nYour recording is ready.\\n\\nGod bless,\\nNTC Newark"

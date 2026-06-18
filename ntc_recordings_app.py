@@ -826,6 +826,20 @@ def create_app(test_config: dict | None = None) -> Flask:
         )
         speaker_name = (request.form.get("speaker_name") or "").strip()
         group_title = (request.form.get("group_title") or "").strip()
+        known_speakers = _testimony_known_speakers(app)
+        if status == "identified":
+            speaker_name = _valid_person_name_suggestion(speaker_name, known_speakers)
+            if not speaker_name:
+                review_error = "Enter a speaker name before saving a testimony speaker."
+                if _wants_json_response():
+                    return jsonify({"ok": False, "error": review_error}), 400
+                return _redirect_to(
+                    app,
+                    "testimony_review",
+                    status=current_filter,
+                    sort=request.form.get("sort") or "shortest",
+                    error=review_error,
+                )
         if status == "grouped":
             speaker_name = ""
             testimony_title = group_title or "Testimonies"
@@ -3114,7 +3128,10 @@ def _testimony_filename_speaker_suggestion(path: Path) -> str:
         return ""
     name = re.sub(r"(?i)'s\s+testimony$", "", name).strip()
     name = re.sub(r"(?i)\s+testimony$", "", name).strip()
-    return _clean_speaker_name(name)
+    candidate = _clean_speaker_name(name)
+    if not _person_name_candidate(candidate, []):
+        return ""
+    return candidate
 
 
 def _strip_audio_extensions(filename: str) -> str:
@@ -5748,6 +5765,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           </div>
                         </div>
                       {% endif %}
+                      {% set has_intro_transcript = item.suggestion_source == "transcript_intro" and item.suggestion_text %}
+                      {% set has_stored_transcript = item.transcript_excerpt %}
                       {% if item.suggested_speaker %}
                         <div class="suggestion-panel speaker-assist-panel">
                           <div>
@@ -5758,24 +5777,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           {% if item.suggested_speaker != item.speaker_name %}
                             <button class="secondary apply-suggestion" type="button" data-speaker="{{ item.suggested_speaker }}">Use Suggestion</button>
                           {% endif %}
-                          {% if item.suggestion_text %}<p>{{ item.suggestion_text }}</p>{% endif %}
-                          {% if item.suggestion_source == "transcript_intro" and item.transcript_text %}
-                            <details class="transcript-full">
-                              <summary>View full transcript</summary>
-                              <p>{{ item.transcript_text }}</p>
-                            </details>
-                          {% endif %}
+                          {% if item.suggestion_text and item.suggestion_source != "transcript_intro" %}<p>{{ item.suggestion_text }}</p>{% endif %}
                         </div>
-                      {% elif item.suggestion_source %}
-                        <div class="suggestion-panel subdued speaker-assist-panel">
-                          <div>
-                            <span>Intro Checked</span>
-                            <strong>No speaker name found</strong>
-                            {% if item.suggestion_source_label %}<small>{{ item.suggestion_source_label }}</small>{% endif %}
-                          </div>
-                          {% if item.suggestion_text %}<p>{{ item.suggestion_text }}</p>{% endif %}
-                        </div>
-                      {% elif not item.speaker_name %}
+                      {% elif not item.speaker_name and not item.suggestion_source %}
                         <div class="suggestion-panel subdued speaker-assist-panel">
                           <div>
                             <span>Speaker Assist</span>
@@ -5785,20 +5789,35 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           <button class="secondary" type="submit" formaction="{{ recordings_url_for('suggest_testimony_speaker', recording_id=item.id) }}" formmethod="post">Suggest Speaker</button>
                         </div>
                       {% endif %}
-                      {% if item.transcript_excerpt and not (item.suggested_speaker and item.suggestion_source == "transcript_intro") %}
-                        <div class="suggestion-panel subdued transcript-panel">
+                      {% if has_intro_transcript or has_stored_transcript %}
+                        <div class="suggestion-panel subdued transcript-panel speaker-transcript-panel">
                           <div>
                             <span>Transcript</span>
-                            <strong>Stored testimony excerpt</strong>
+                            <strong>{% if has_stored_transcript %}Stored testimony excerpt{% else %}Intro checked{% endif %}</strong>
                             {% if item.transcript_updated_label %}<small>{{ item.transcript_updated_label }}</small>{% endif %}
                           </div>
-                          <p>{{ item.transcript_excerpt }}</p>
+                          {% if has_intro_transcript %}
+                            <small>Intro transcript</small>
+                            <p>{{ item.suggestion_text }}</p>
+                          {% endif %}
+                          {% if has_stored_transcript %}
+                            <small>Stored transcript</small>
+                            <p>{{ item.transcript_excerpt }}</p>
+                          {% endif %}
                           {% if item.transcript_text %}
                             <details class="transcript-full">
                               <summary>View full transcript</summary>
                               <p>{{ item.transcript_text }}</p>
                             </details>
                           {% endif %}
+                        </div>
+                      {% elif item.suggestion_source %}
+                        <div class="suggestion-panel subdued transcript-panel speaker-transcript-panel">
+                          <div>
+                            <span>Transcript</span>
+                            <strong>No speaker name found</strong>
+                            {% if item.suggestion_source_label %}<small>{{ item.suggestion_source_label }}</small>{% endif %}
+                          </div>
                         </div>
                       {% elif item.transcript_error %}
                         <div class="suggestion-panel subdued transcript-panel">
@@ -6028,37 +6047,64 @@ TESTIMONY_REVIEW_TEMPLATE = """
         const editPanel = form ? form.querySelector(".edit-panel") : null;
         if (!editPanel) return;
         editPanel.querySelectorAll(".speaker-assist-panel").forEach((panel) => panel.remove());
+        editPanel.querySelectorAll(".speaker-transcript-panel").forEach((panel) => panel.remove());
 
-        const panel = document.createElement("div");
-        panel.className = `suggestion-panel speaker-assist-panel${data.suggested_speaker ? "" : " subdued"}`;
-
-        const textWrap = document.createElement("div");
-        const label = document.createElement("span");
-        label.textContent = data.suggested_speaker ? "Suggested Speaker" : "Intro Checked";
-        const strong = document.createElement("strong");
-        strong.textContent = data.suggested_speaker || "No speaker name found";
-        textWrap.append(label, strong);
-        if (data.suggestion_source_label) {
-          const small = document.createElement("small");
-          small.textContent = data.suggestion_source_label;
-          textWrap.appendChild(small);
+        if (data.suggested_speaker) {
+          const panel = document.createElement("div");
+          panel.className = "suggestion-panel speaker-assist-panel";
+          const textWrap = document.createElement("div");
+          const label = document.createElement("span");
+          label.textContent = "Suggested Speaker";
+          const strong = document.createElement("strong");
+          strong.textContent = data.suggested_speaker;
+          textWrap.append(label, strong);
+          if (data.suggestion_source_label) {
+            const small = document.createElement("small");
+            small.textContent = data.suggestion_source_label;
+            textWrap.appendChild(small);
+          }
+          panel.appendChild(textWrap);
+          if (data.suggested_speaker !== data.speaker_name) {
+            const button = document.createElement("button");
+            button.className = "secondary apply-suggestion";
+            button.type = "button";
+            button.dataset.speaker = data.suggested_speaker;
+            button.textContent = "Use Suggestion";
+            panel.appendChild(button);
+          }
+          if (data.suggestion_text && data.suggestion_source !== "transcript_intro") {
+            const paragraph = document.createElement("p");
+            paragraph.textContent = data.suggestion_text;
+            panel.appendChild(paragraph);
+          }
+          editPanel.appendChild(panel);
         }
-        panel.appendChild(textWrap);
 
-        if (data.suggested_speaker && data.suggested_speaker !== data.speaker_name) {
-          const button = document.createElement("button");
-          button.className = "secondary apply-suggestion";
-          button.type = "button";
-          button.dataset.speaker = data.suggested_speaker;
-          button.textContent = "Use Suggestion";
-          panel.appendChild(button);
-        }
-        if (data.suggestion_text) {
+        if (data.suggestion_source === "transcript_intro") {
+          const transcriptPanel = document.createElement("div");
+          transcriptPanel.className = "suggestion-panel subdued transcript-panel speaker-transcript-panel";
+          const textWrap = document.createElement("div");
+          const label = document.createElement("span");
+          label.textContent = "Transcript";
+          const strong = document.createElement("strong");
+          strong.textContent = data.suggestion_text ? "Intro checked" : "No speaker name found";
+          textWrap.append(label, strong);
+          if (data.suggestion_source_label) {
+            const small = document.createElement("small");
+            small.textContent = data.suggestion_source_label;
+            textWrap.appendChild(small);
+          }
+          transcriptPanel.appendChild(textWrap);
+          if (data.suggestion_text) {
+            const transcriptLabel = document.createElement("small");
+            transcriptLabel.textContent = "Intro transcript";
+            transcriptPanel.appendChild(transcriptLabel);
+          }
           const paragraph = document.createElement("p");
           paragraph.textContent = data.suggestion_text;
-          panel.appendChild(paragraph);
+          if (data.suggestion_text) transcriptPanel.appendChild(paragraph);
+          editPanel.appendChild(transcriptPanel);
         }
-        editPanel.appendChild(panel);
       }
 
       async function readJsonResponse(response) {
