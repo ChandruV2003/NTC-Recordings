@@ -6003,6 +6003,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         if (data.status) {
           updateStatusCounts(previousStatus, data.status);
           if (!belongsInActiveFilter(data.status)) {
+            pauseCardAudio(card);
             card.remove();
             renumberReviewRows();
             replaceEmptyReviewList();
@@ -6082,10 +6083,37 @@ TESTIMONY_REVIEW_TEMPLATE = """
         audio.src = audio.dataset.src || "";
         audio.preload = "metadata";
       }
+
+      function pauseCardAudio(card) {
+        if (!card) return;
+        card.querySelectorAll("audio").forEach((audio) => {
+          if (!audio.paused) {
+            audio.pause();
+          }
+        });
+      }
+
+      function pauseOtherReviewAudio(activeAudio) {
+        document.querySelectorAll(".review-card audio").forEach((audio) => {
+          if (audio !== activeAudio && !audio.paused) {
+            audio.pause();
+          }
+        });
+      }
+
+      document.addEventListener("play", (event) => {
+        const audio = event.target;
+        if (!audio || !audio.matches || !audio.matches(".review-card audio")) return;
+        pauseOtherReviewAudio(audio);
+      }, true);
+
       document.addEventListener("toggle", (event) => {
         const card = event.target;
         if (card.matches && card.matches(".review-card") && card.open) {
           hydrateReviewAudio(card);
+        }
+        if (card.matches && card.matches(".review-card") && !card.open) {
+          pauseCardAudio(card);
         }
         if (card.matches && card.matches(".review-card")) {
           saveOpenCards();
