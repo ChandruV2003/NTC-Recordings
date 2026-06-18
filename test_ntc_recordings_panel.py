@@ -1359,12 +1359,46 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "You may be seated. Shall we turn to Philippians chapter 2 in verses 12 and 13.",
             )
         )
+        self.assertTrue(
+            _testimony_looks_like_message_recording(
+                self.app,
+                1916,
+                "Praise God. It is wonderful to see the wonderful work that God has done in our children. "
+                "Shall we pray? Thank you for your word helping us, guiding us, directing us daily.",
+                Path("/mnt/MainRecordings/Recordings/MessageRecordings/DN300R/REC00500.mp3"),
+            )
+        )
+        self.assertTrue(
+            _testimony_looks_like_message_recording(
+                self.app,
+                3548,
+                "Oh, hallelujah. Those are wonderful words. Soon our Lord shall come in glory. "
+                "Hallelujah. Are you ready, Brother Gerald? There is a pure river.",
+                Path("/mnt/MainRecordings/Recordings/MessageRecordings/DN300R/REC00499.mp3"),
+            )
+        )
         self.assertTrue(_testimony_looks_like_message_recording(self.app, 15000, "Thank you."))
         self.assertFalse(
             _testimony_looks_like_message_recording(
                 self.app,
                 980,
                 "Praise the Lord. My name is Nancy and I want to testify.",
+            )
+        )
+        self.assertFalse(
+            _testimony_looks_like_message_recording(
+                self.app,
+                3600,
+                "Praise the Lord. My name is Cyril Joshua, husband to Sister Jenny.",
+                Path("/mnt/MainRecordings/Recordings/TestimonyRecordings/2026/June 7, 2026 - Brother Cyril's Testimony.mp3"),
+            )
+        )
+        self.assertFalse(
+            _testimony_looks_like_message_recording(
+                self.app,
+                3700,
+                "Praise the Lord. We thank God for each person sharing what the Lord has done.",
+                Path("/mnt/MainRecordings/Recordings/TestimonyRecordings/2021/Funeral Testimonies/August 30, 2021 - Sister Marg's Funeral/Testimonies Part 1.mp3"),
             )
         )
 

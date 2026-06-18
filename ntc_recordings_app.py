@@ -81,6 +81,18 @@ TESTIMONY_MESSAGE_INTRO_PATTERNS = [
     r"\bplease\s+be\s+seated\b",
     r"\bbe\s+seated\b",
     r"\bword\s+of\s+god\s+says\b",
+    r"\bshall\s+we\s+pray\b",
+    r"\bthank\s+you\s+for\s+your\s+word\b",
+    r"\bspeak(?:ing)?\s+to\s+us\s+from\s+your\s+word\b",
+    r"\bwonderful\s+work\s+that\s+god\s+has\s+done\s+in\s+our\s+children\b",
+]
+TESTIMONY_EXPLICIT_INTRO_PATTERNS = [
+    r"\bmy\s+name\s+is\b",
+    r"\bfor\s+those\s+of\s+you\s+who\s+do\s+not\s+know\s+me\b",
+    r"\bi\s+am\s+here\s+to\s+testify\b",
+    r"\bi\s+want\s+to\s+(?:thank|praise)\s+(?:and\s+)?(?:thank\s+)?god\b",
+    r"\bmy\s+testimony\b",
+    r"\btestimony\s+is\b",
 ]
 MONTHS = {
     "jan": 1,
@@ -2333,7 +2345,12 @@ def _run_testimony_suggestion_job(app: Flask) -> None:
                     if (
                         status == "needs_review"
                         and not suggested_speaker
-                        and _testimony_looks_like_message_recording(app, duration_seconds, suggestion_text)
+                        and _testimony_looks_like_message_recording(
+                            app,
+                            duration_seconds,
+                            suggestion_text,
+                            Path(candidate.path),
+                        )
                     ):
                         status = "not_testimony"
                         suggestion_source = suggestion_source or "transcript_intro"
@@ -2432,7 +2449,12 @@ def _testimony_suggestion_targets(app: Flask) -> list[dict]:
         if status == "needs_review" and _duration_is_too_short_for_testimony(app, duration_seconds):
             status = "not_testimony"
             not_testimony_text = not_testimony_text or "Too short to be a testimony recording."
-        if status == "needs_review" and _testimony_looks_like_message_recording(app, duration_seconds, str(row["suggestion_text"] or "") if row else ""):
+        if status == "needs_review" and _testimony_looks_like_message_recording(
+            app,
+            duration_seconds,
+            str(row["suggestion_text"] or "") if row else "",
+            Path(candidate.path),
+        ):
             status = "not_testimony"
             not_testimony_text = not_testimony_text or "Likely message recording based on duration and intro."
         if status == "not_testimony" and (not row or str(row["status"] or "") != "not_testimony" or _row_duration(row) is None):
@@ -3009,7 +3031,12 @@ def _duration_is_too_short_for_testimony(app: Flask, duration_seconds: float | N
     return 0 < duration_seconds < max(1, minimum)
 
 
-def _testimony_looks_like_message_recording(app: Flask, duration_seconds: float | None, intro_text: str) -> bool:
+def _testimony_looks_like_message_recording(
+    app: Flask,
+    duration_seconds: float | None,
+    intro_text: str,
+    source_path: Path | None = None,
+) -> bool:
     if duration_seconds is None:
         return False
     try:
@@ -3027,7 +3054,16 @@ def _testimony_looks_like_message_recording(app: Flask, duration_seconds: float 
     text = " ".join((intro_text or "").split()).lower()
     if not text:
         return False
-    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in TESTIMONY_MESSAGE_INTRO_PATTERNS)
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in TESTIMONY_EXPLICIT_INTRO_PATTERNS):
+        return False
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in TESTIMONY_MESSAGE_INTRO_PATTERNS):
+        return True
+    try:
+        long_service_minimum = int(app.config.get("NTC_RECORDINGS_TESTIMONY_LONG_SERVICE_SECONDS") or 2700)
+    except (TypeError, ValueError):
+        long_service_minimum = 2700
+    source_is_labeled_testimony = bool(source_path and _raw_testimony_name(Path(source_path)))
+    return duration_seconds >= max(message_minimum, long_service_minimum) and not source_is_labeled_testimony
 
 
 def _testimony_title_for_speaker(speaker_name: str) -> str:
