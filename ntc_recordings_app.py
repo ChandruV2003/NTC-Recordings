@@ -5336,9 +5336,21 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .review-card[open] summary { border-bottom:1px solid var(--line); background:rgba(143,211,255,.035); }
       .review-row {
         display:grid;
-        grid-template-columns:minmax(16rem,1.3fr) minmax(7rem,.42fr) minmax(7rem,.42fr) minmax(10rem,.6fr) minmax(8rem,.42fr);
+        grid-template-columns:minmax(2.4rem,.16fr) minmax(16rem,1.3fr) minmax(7rem,.42fr) minmax(7rem,.42fr) minmax(10rem,.6fr) minmax(8rem,.42fr);
         align-items:center;
         gap:.78rem;
+      }
+      .row-number {
+        display:grid;
+        place-items:center;
+        width:2.1rem;
+        height:2.1rem;
+        border:1px solid rgba(143,211,255,.26);
+        border-radius:999px;
+        background:rgba(143,211,255,.075);
+        color:#cce4f7;
+        font:850 .78rem var(--mono);
+        letter-spacing:.02em;
       }
       .cell { min-width:0; }
       .cell-label {
@@ -5510,7 +5522,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .toolbar, .review-body { grid-template-columns:1fr; }
         .toolbar-actions, .probe-form { justify-content:flex-start; }
         .job-panel { flex-direction:column; align-items:flex-start; }
-        .review-row { grid-template-columns:minmax(0,1fr) minmax(0,1fr); align-items:start; }
+        .review-row { grid-template-columns:2.3rem minmax(0,1fr) minmax(0,1fr); align-items:start; }
+        .row-number { align-self:center; }
       }
       @media (max-width:760px) {
         main { width:min(100vw - 24px, 1120px); padding-top:18px; }
@@ -5525,7 +5538,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.54rem .52rem; font-size:.78rem; border-radius:12px; }
         .tabs { width:100%; border-radius:22px; }
         .tab { width:100%; justify-content:space-between; }
-        .metrics, .review-row, .file-facts, .form-grid { grid-template-columns:1fr; }
+        .metrics, .file-facts, .form-grid { grid-template-columns:1fr; }
+        .review-row { grid-template-columns:2.3rem minmax(0,1fr); }
         .wide { grid-column:auto; }
         .suggestion-panel { grid-template-columns:1fr; }
         .button-row, .button-row button, .toolbar-actions, .probe-form, .probe-form input, .probe-form button { width:100%; }
@@ -5661,6 +5675,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
               <details class="review-card {{ item.status }}" data-review-id="{{ item.id }}" data-status="{{ item.status }}">
                 <summary>
                   <div class="review-row">
+                    <span class="row-number" data-row-number aria-label="Row {{ loop.index }}">#{{ loop.index }}</span>
                     <div class="cell">
                       <span class="cell-label">Recording</span>
                       <span class="cell-value" data-field="title">{{ item.title }}</span>
@@ -5924,6 +5939,17 @@ TESTIMONY_REVIEW_TEMPLATE = """
         reviewList.replaceWith(empty);
       }
 
+      function renumberReviewRows() {
+        if (!reviewList) return;
+        reviewList.querySelectorAll(".review-card").forEach((card, index) => {
+          const number = card.querySelector("[data-row-number]");
+          if (!number) return;
+          const value = index + 1;
+          number.textContent = `#${value}`;
+          number.setAttribute("aria-label", `Row ${value}`);
+        });
+      }
+
       function updateReviewCard(card, data) {
         const previousStatus = card.dataset.status || "";
         setText(card, "title", data.title);
@@ -5978,6 +6004,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           updateStatusCounts(previousStatus, data.status);
           if (!belongsInActiveFilter(data.status)) {
             card.remove();
+            renumberReviewRows();
             replaceEmptyReviewList();
           }
         }

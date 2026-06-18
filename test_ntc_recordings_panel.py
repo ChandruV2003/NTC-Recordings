@@ -661,6 +661,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b'data-transcript-job', review.data)
         self.assertIn(b'data-status-url="/admin/testimonies/transcript-status"', review.data)
         self.assertIn(b'data-review-id="', review.data)
+        self.assertIn(b'data-row-number aria-label="Row 1">#1</span>', review.data)
+        self.assertIn(b"renumberReviewRows", review.data)
         self.assertIn(b"ntc-testimony-open-cards", review.data)
         self.assertIn(b"X-Requested-With", review.data)
         self.assertIn(b'id="speaker-name-options"', review.data)
