@@ -958,7 +958,6 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(quarantined.status_code, 200)
         self.assertIn(b"Moved 1 duplicate file to quarantine", quarantined.data)
-        self.assertIn(b"Moved to rejected holding folder", quarantined.data)
         quarantine_path = self.rejected_root / "Duplicate" / "2025" / "REC10199.wav"
         self.assertFalse(duplicate_recording.exists())
         self.assertTrue(quarantine_path.exists())
@@ -978,6 +977,9 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(row[2], str(duplicate_recording))
         self.assertEqual(row[3], str(quarantine_path))
         self.assertTrue(row[4])
+
+        duplicate = self.client.get("/admin/testimonies?status=duplicate").data
+        self.assertNotIn(b"REC10199", duplicate)
 
         audio = self.client.get(f"/admin/testimonies/audio/{duplicate_id}")
         self.assertEqual(audio.status_code, 200)

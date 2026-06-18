@@ -2195,6 +2195,11 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     }
 
 
+def _testimony_review_row_is_quarantined(row: sqlite3.Row) -> bool:
+    status = str(row["status"] or "")
+    return status in {"duplicate", "not_testimony"} and bool(_row_optional_text(row, "quarantined_path"))
+
+
 def _testimony_review_items(app: Flask) -> list[dict]:
     rows = _testimony_review_rows(app)
     known_speakers = _testimony_known_speakers(app)
@@ -2203,6 +2208,10 @@ def _testimony_review_items(app: Flask) -> list[dict]:
     seen_paths = set()
     for candidate in _testimony_source_candidates(app):
         row = rows.get(candidate.id)
+        if row and _testimony_review_row_is_quarantined(row):
+            seen_row_ids.add(str(row["recording_id"]))
+            seen_paths.add(candidate.path)
+            continue
         if row:
             seen_row_ids.add(str(row["recording_id"]))
         seen_paths.add(candidate.path)
@@ -2210,6 +2219,8 @@ def _testimony_review_items(app: Flask) -> list[dict]:
 
     for row_id, row in rows.items():
         if row_id in seen_row_ids:
+            continue
+        if _testimony_review_row_is_quarantined(row):
             continue
         candidate = _testimony_candidate_from_review_row(app, row)
         if not candidate or candidate.path in seen_paths:
