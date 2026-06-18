@@ -5227,11 +5227,22 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .probe-form {
         display:flex;
         justify-content:flex-end;
-        align-items:center;
+        align-items:flex-end;
         gap:.45rem;
         flex-wrap:wrap;
       }
-      .probe-form input { width:5.8rem; }
+      .probe-form label {
+        display:flex;
+        flex-direction:column;
+        justify-content:flex-end;
+        gap:.28rem;
+      }
+      .probe-form input {
+        width:5.8rem;
+        height:3.05rem;
+      }
+      .probe-form button { min-height:3.05rem; }
+      .probe-form.action-only { min-height:3.05rem; }
       .job-panel {
         display:flex;
         align-items:center;
@@ -5520,21 +5531,21 @@ TESTIMONY_REVIEW_TEMPLATE = """
               </label>
               <button type="submit">Check Durations</button>
             </form>
-            <form class="probe-form" method="post" action="{{ recordings_url_for('suggest_all_testimony_speakers') }}">
+            <form class="probe-form action-only" method="post" action="{{ recordings_url_for('suggest_all_testimony_speakers') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
               <input type="hidden" name="sort" value="{{ sort }}">
               <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
             </form>
           {% endif %}
           {% if status_filter in ["needs_review", "identified", "grouped", "all"] %}
-            <form class="probe-form" method="post" action="{{ recordings_url_for('transcribe_identified_testimonies') }}">
+            <form class="probe-form action-only" method="post" action="{{ recordings_url_for('transcribe_identified_testimonies') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
               <input type="hidden" name="sort" value="{{ sort }}">
               <button type="submit" data-process-transcripts-button {% if transcript_job.state == "running" %}disabled{% endif %}>Process Transcripts</button>
             </form>
           {% endif %}
           {% if status_filter in ["not_testimony", "duplicate", "all"] %}
-            <form class="probe-form" method="post" action="{{ recordings_url_for('quarantine_testimony_reviews') }}">
+            <form class="probe-form action-only" method="post" action="{{ recordings_url_for('quarantine_testimony_reviews') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
               <input type="hidden" name="sort" value="{{ sort }}">
               <button type="submit">
