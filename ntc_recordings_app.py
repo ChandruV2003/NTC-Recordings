@@ -38,6 +38,7 @@ install_legacy_env_aliases()
 
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac"}
+LIBRARY_EXCLUDED_DIR_NAMES = {"GoogleMessageTakeout", "_IncomingRecorderIntake", "_ImportAudit", "_RenameAudit"}
 DEFAULT_MESSAGE_RECORDING_DIR = "/mnt/MainRecordings/Recordings/MessageRecordings"
 DEFAULT_WORSHIP_RECORDING_DIR = "/mnt/MainRecordings/Recordings/WorshipRecordings"
 DEFAULT_TESTIMONY_RECORDING_DIR = "/mnt/MainRecordings/Recordings/TestimonyRecordings"
@@ -1451,6 +1452,8 @@ def _folder_audio_items(app: Flask, path: Path) -> list[str]:
             continue
         if item.name.startswith("._") or any(part.startswith(".") for part in item.parts):
             continue
+        if any(part in LIBRARY_EXCLUDED_DIR_NAMES for part in item.parts):
+            continue
         try:
             items.append(str(item.relative_to(path)))
         except ValueError:
@@ -1470,6 +1473,8 @@ def _scan_recordings(app: Flask) -> list[RecordingCandidate]:
             if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
                 continue
             if path.name.startswith("._") or any(part.startswith(".") for part in path.parts):
+                continue
+            if any(part in LIBRARY_EXCLUDED_DIR_NAMES for part in path.parts):
                 continue
             try:
                 stat = path.stat()
