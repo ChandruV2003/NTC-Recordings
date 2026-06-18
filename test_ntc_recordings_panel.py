@@ -706,9 +706,10 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Suggested speaker: Kevin.", suggested.data)
         self.assertIn(b"Suggested Speaker", suggested.data)
         self.assertIn(b"Kevin", suggested.data)
-        self.assertIn(b"from intro transcript", suggested.data)
+        self.assertIn(b"from transcript", suggested.data)
         self.assertIn(b"Use Suggestion", suggested.data)
-        self.assertIn(b"Intro transcript", suggested.data)
+        self.assertNotIn(b"Intro transcript", suggested.data)
+        self.assertNotIn(b"Intro checked", suggested.data)
         self.assertLess(
             suggested.data.index(b"<span>Suggested Speaker</span>"),
             suggested.data.index(b"<span>Transcript</span>"),
@@ -1244,7 +1245,10 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(_testimony_transcript_targets(self.app), [])
         review_after = self.client.get("/admin/testimonies?status=identified")
-        self.assertIn(b"Stored testimony excerpt", review_after.data)
+        self.assertNotIn(b"Stored testimony excerpt", review_after.data)
+        self.assertNotIn(b"Intro checked", review_after.data)
+        self.assertIn(b"<span>Transcript</span>", review_after.data)
+        self.assertIn(b"View full transcript", review_after.data)
         self.assertIn(b"thank God for helping me", review_after.data)
 
     def test_identified_transcript_survives_testimony_rename(self):

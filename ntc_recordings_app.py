@@ -696,6 +696,137 @@ def create_app(test_config: dict | None = None) -> Flask:
             return guard
         return jsonify(_testimony_transcript_job_status(app))
 
+    @app.post("/admin/testimonies/<recording_id>/transcript")
+    def transcribe_testimony_recording(recording_id: str):
+        guard = _require_admin()
+        if guard:
+            return guard
+        current_filter = (request.form.get("status_filter") or "needs_review").strip().lower()
+        if current_filter == "already_named":
+            current_filter = "identified"
+        if current_filter not in TESTIMONY_REVIEW_FILTERS:
+            current_filter = "needs_review"
+        candidate = _testimony_source_recording_from_form(app, recording_id)
+        if not candidate:
+            if _wants_json_response():
+                return jsonify({"ok": False, "error": "Testimony source recording was not found."}), 404
+            return _redirect_to(app, "testimony_review", status=current_filter, error="Testimony source recording was not found.")
+
+        existing = _testimony_review_row(app, recording_id)
+        duration_seconds = _row_duration(existing) if existing else _probe_audio_duration(Path(candidate.path))
+        service_date = (
+            _normalize_date((request.form.get("service_date") or "").strip())
+            or (str(existing["service_date"] or "") if existing else "")
+            or candidate.recording_date
+            or ""
+        )
+        speaker_name = (request.form.get("speaker_name") or "").strip() or (str(existing["speaker_name"] or "") if existing else "")
+        group_title = (request.form.get("group_title") or "").strip() or (str(existing["testimony_title"] or "") if existing else "")
+        status = str(existing["status"] or "") if existing else _testimony_status_for_candidate(app, candidate, None, duration_seconds)
+        if status not in TESTIMONY_REVIEW_STATUSES:
+            status = "needs_review"
+        testimony_title = group_title if status == "grouped" else (_testimony_title_for_speaker(speaker_name) if speaker_name else (str(existing["testimony_title"] or "") if existing else ""))
+        notes = str(existing["notes"] or "") if existing else ""
+        proposed_path = str(existing["proposed_path"] or "") if existing else ""
+        suggested_speaker = _valid_person_name_suggestion(str(existing["suggested_speaker"] or "") if existing else "", _testimony_known_speakers(app))
+        suggestion_source = str(existing["suggestion_source"] or "") if existing else ""
+        suggestion_text = str(existing["suggestion_text"] or "") if existing else ""
+
+        _save_testimony_review(
+            app,
+            recording_id=recording_id,
+            source_path=candidate.path,
+            status="identified" if status == "already_named" else status,
+            service_date=service_date,
+            speaker_name=speaker_name,
+            testimony_title=testimony_title,
+            notes=notes,
+            proposed_path=proposed_path,
+            duration_seconds=duration_seconds,
+        )
+
+        transcript_text = ""
+        transcript_error = ""
+        try:
+            transcript_text, transcript_error = _transcribe_testimony_review_excerpt(app, Path(candidate.path))
+            if not transcript_text:
+                transcript_error = transcript_error or "Transcript was empty."
+        except Exception as exc:
+            transcript_error = f"Transcript failed: {exc}"
+            app.logger.exception("testimony row transcript failed for %s", candidate.path)
+        transcript_source = "transcript_excerpt" if transcript_text else ""
+        _save_testimony_transcript(
+            app,
+            recording_id,
+            transcript_text=transcript_text,
+            transcript_source=transcript_source,
+            transcript_error=transcript_error,
+        )
+
+        if transcript_text:
+            known_speakers = _testimony_known_speakers(app)
+            transcript_speaker = _valid_person_name_suggestion(_extract_intro_speaker(transcript_text, known_speakers), known_speakers)
+            if transcript_speaker:
+                suggested_speaker = transcript_speaker
+            if transcript_speaker or not suggestion_source:
+                suggestion_source = "transcript_excerpt"
+                suggestion_text = _compact_transcript_excerpt(transcript_text)
+                _save_testimony_review(
+                    app,
+                    recording_id=recording_id,
+                    source_path=candidate.path,
+                    status="identified" if status == "already_named" else status,
+                    service_date=service_date,
+                    speaker_name=speaker_name,
+                    testimony_title=testimony_title,
+                    notes=notes,
+                    proposed_path=proposed_path,
+                    duration_seconds=duration_seconds,
+                    suggested_speaker=suggested_speaker,
+                    suggestion_source=suggestion_source,
+                    suggestion_text=suggestion_text,
+                )
+
+        message = "Transcript processed." if transcript_text else transcript_error or "Transcript was not saved."
+        if _wants_json_response():
+            response = jsonify(
+                {
+                    "ok": bool(transcript_text),
+                    "message": message,
+                    "error": "" if transcript_text else message,
+                    "recording_id": recording_id,
+                    "status": "identified" if status == "already_named" else status,
+                    "status_label": _testimony_status_label(status),
+                    "service_date": service_date,
+                    "service_date_label": _format_date(service_date),
+                    "speaker_name": speaker_name,
+                    "group_title": testimony_title if status == "grouped" else "",
+                    "title": candidate.title,
+                    "source_label": Path(candidate.path).name,
+                    "source_path": candidate.path,
+                    "suggested_speaker": suggested_speaker,
+                    "suggestion_source": suggestion_source,
+                    "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
+                    "suggestion_text": suggestion_text,
+                    "transcript_text": transcript_text,
+                    "transcript_excerpt": _compact_transcript_excerpt(transcript_text, 900),
+                    "transcript_preview": _testimony_display_transcript_preview(transcript_text, suggestion_source, suggestion_text, 900),
+                    "transcript_error": transcript_error,
+                    "transcript_updated_label": _format_datetime(_utc_now()),
+                    "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=recording_id),
+                    "review_url": _recordings_url_for(app, "update_testimony_review", recording_id=recording_id),
+                }
+            )
+            return (response, 200 if transcript_text else 500)
+        return _redirect_to(
+            app,
+            "testimony_review",
+            status=current_filter,
+            sort=request.form.get("sort") or "shortest",
+            message=message if transcript_text else None,
+            error=None if transcript_text else message,
+        )
+
     @app.post("/admin/testimonies/quarantine")
     def quarantine_testimony_reviews():
         guard = _require_admin()
@@ -788,6 +919,11 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "suggestion_source": suggestion_source,
                     "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
                     "suggestion_text": suggestion_text,
+                    "transcript_text": (transcript_text := _row_optional_text(existing, "transcript_text")),
+                    "transcript_excerpt": _compact_transcript_excerpt(transcript_text, 900),
+                    "transcript_preview": _testimony_display_transcript_preview(transcript_text, suggestion_source, suggestion_text, 900),
+                    "transcript_error": _row_optional_text(existing, "transcript_error"),
+                    "transcript_updated_label": _format_datetime(_row_optional_text(existing, "transcript_updated_at")),
                 }
             )
         return _redirect_to(
@@ -923,6 +1059,11 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "suggestion_source": suggestion_source,
                     "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
                     "suggestion_text": suggestion_text,
+                    "transcript_text": transcript_text,
+                    "transcript_excerpt": _compact_transcript_excerpt(transcript_text, 900),
+                    "transcript_preview": _testimony_display_transcript_preview(transcript_text, suggestion_source, suggestion_text, 900),
+                    "transcript_error": transcript_error,
+                    "transcript_updated_label": _format_datetime(_row_optional_text(existing, "transcript_updated_at")),
                     "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=recording_id),
                     "review_url": _recordings_url_for(app, "update_testimony_review", recording_id=recording_id),
                 }
@@ -2187,6 +2328,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "suggestion_text": suggestion_text,
         "transcript_text": transcript_text,
         "transcript_excerpt": _compact_transcript_excerpt(transcript_text, 900),
+        "transcript_preview": _testimony_display_transcript_preview(transcript_text, suggestion_source, suggestion_text, 900),
         "transcript_source": transcript_source,
         "transcript_source_label": _testimony_transcript_source_label(transcript_source),
         "transcript_error": transcript_error,
@@ -2586,13 +2728,34 @@ def _run_testimony_transcript_job(app: Flask, limit: int | None = None, statuses
                     errors += 1
                     transcript_error = f"Transcript failed: {exc}"
                     app.logger.exception("testimony transcript failed for %s", candidate.path)
+                recording_id = str(row["recording_id"])
                 _save_testimony_transcript(
                     app,
-                    recording_id=str(row["recording_id"]),
+                    recording_id=recording_id,
                     transcript_text=transcript_text,
                     transcript_source="transcript_excerpt" if transcript_text else "",
                     transcript_error=transcript_error,
                 )
+                if transcript_text and not str(row["speaker_name"] or ""):
+                    known_speakers = _testimony_known_speakers(app)
+                    transcript_speaker = _valid_person_name_suggestion(_extract_intro_speaker(transcript_text, known_speakers), known_speakers)
+                    existing_suggestion = _valid_person_name_suggestion(str(row["suggested_speaker"] or ""), known_speakers)
+                    if transcript_speaker or not str(row["suggestion_source"] or ""):
+                        _save_testimony_review(
+                            app,
+                            recording_id=recording_id,
+                            source_path=str(row["source_path"] or candidate.path),
+                            status=str(row["status"] or "needs_review"),
+                            service_date=str(row["service_date"] or candidate.recording_date or ""),
+                            speaker_name=str(row["speaker_name"] or ""),
+                            testimony_title=str(row["testimony_title"] or ""),
+                            notes=str(row["notes"] or ""),
+                            proposed_path=str(row["proposed_path"] or ""),
+                            duration_seconds=_row_duration(row),
+                            suggested_speaker=transcript_speaker or existing_suggestion,
+                            suggestion_source="transcript_excerpt",
+                            suggestion_text=_compact_transcript_excerpt(transcript_text),
+                        )
                 processed += 1
                 _update_testimony_transcript_job(
                     app,
@@ -2657,10 +2820,20 @@ def _testimony_transcript_targets(app: Flask, limit: int | None = None, statuses
 def _testimony_suggestion_source_label(source: str) -> str:
     labels = {
         "filename": "from filename",
-        "transcript_intro": "from intro transcript",
+        "transcript_intro": "from transcript",
+        "transcript_excerpt": "from transcript",
         "history": "from confirmed history",
     }
     return labels.get(source, source.replace("_", " ") if source else "")
+
+
+def _testimony_display_transcript_preview(transcript_text: str, suggestion_source: str, suggestion_text: str, limit: int = 900) -> str:
+    transcript_excerpt = _compact_transcript_excerpt(transcript_text, limit)
+    if transcript_excerpt:
+        return transcript_excerpt
+    if suggestion_source in {"transcript_intro", "transcript_excerpt"}:
+        return _compact_transcript_excerpt(suggestion_text, limit)
+    return ""
 
 
 def _testimony_transcript_source_label(source: str) -> str:
@@ -5765,8 +5938,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           </div>
                         </div>
                       {% endif %}
-                      {% set has_intro_transcript = item.suggestion_source == "transcript_intro" and item.suggestion_text %}
-                      {% set has_stored_transcript = item.transcript_excerpt %}
                       {% if item.suggested_speaker %}
                         <div class="suggestion-panel speaker-assist-panel">
                           <div>
@@ -5777,32 +5948,36 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           {% if item.suggested_speaker != item.speaker_name %}
                             <button class="secondary apply-suggestion" type="button" data-speaker="{{ item.suggested_speaker }}">Use Suggestion</button>
                           {% endif %}
-                          {% if item.suggestion_text and item.suggestion_source != "transcript_intro" %}<p>{{ item.suggestion_text }}</p>{% endif %}
+                          {% if item.suggestion_text and item.suggestion_source not in ["transcript_intro", "transcript_excerpt"] %}<p>{{ item.suggestion_text }}</p>{% endif %}
                         </div>
-                      {% elif not item.speaker_name and not item.suggestion_source %}
+                      {% elif not item.speaker_name and item.suggestion_source %}
                         <div class="suggestion-panel subdued speaker-assist-panel">
                           <div>
-                            <span>Speaker Assist</span>
+                            <span>Suggested Speaker</span>
+                            <strong>No suggested speaker</strong>
+                          </div>
+                        </div>
+                      {% elif not item.speaker_name %}
+                        <div class="suggestion-panel subdued speaker-assist-panel">
+                          <div>
+                            <span>Suggested Speaker</span>
                             <strong>No suggestion yet</strong>
-                            <small>Checks the filename first, then the configured intro transcription.</small>
+                            <small>Use Suggest Speaker or Process Transcript for this row.</small>
                           </div>
                           <button class="secondary" type="submit" formaction="{{ recordings_url_for('suggest_testimony_speaker', recording_id=item.id) }}" formmethod="post">Suggest Speaker</button>
                         </div>
                       {% endif %}
-                      {% if has_intro_transcript or has_stored_transcript %}
+                      {% if item.transcript_preview or item.transcript_text or item.transcript_error or item.status in ["identified", "grouped", "already_named"] %}
                         <div class="suggestion-panel subdued transcript-panel speaker-transcript-panel">
                           <div>
                             <span>Transcript</span>
-                            <strong>{% if has_stored_transcript %}Stored testimony excerpt{% else %}Intro checked{% endif %}</strong>
-                            {% if item.transcript_updated_label %}<small>{{ item.transcript_updated_label }}</small>{% endif %}
                           </div>
-                          {% if has_intro_transcript %}
-                            <small>Intro transcript</small>
-                            <p>{{ item.suggestion_text }}</p>
-                          {% endif %}
-                          {% if has_stored_transcript %}
-                            <small>Stored transcript</small>
-                            <p>{{ item.transcript_excerpt }}</p>
+                          {% if item.transcript_preview %}
+                            <p>{{ item.transcript_preview }}</p>
+                          {% elif item.transcript_error %}
+                            <p>{{ item.transcript_error }}</p>
+                          {% else %}
+                            <small>Not processed yet.</small>
                           {% endif %}
                           {% if item.transcript_text %}
                             <details class="transcript-full">
@@ -5810,30 +5985,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
                               <p>{{ item.transcript_text }}</p>
                             </details>
                           {% endif %}
-                        </div>
-                      {% elif item.suggestion_source %}
-                        <div class="suggestion-panel subdued transcript-panel speaker-transcript-panel">
-                          <div>
-                            <span>Transcript</span>
-                            <strong>No speaker name found</strong>
-                            {% if item.suggestion_source_label %}<small>{{ item.suggestion_source_label }}</small>{% endif %}
-                          </div>
-                        </div>
-                      {% elif item.transcript_error %}
-                        <div class="suggestion-panel subdued transcript-panel">
-                          <div>
-                            <span>Transcript</span>
-                            <strong>Transcript not saved</strong>
-                          </div>
-                          <p>{{ item.transcript_error }}</p>
-                        </div>
-                      {% elif item.status in ["identified", "grouped", "already_named"] %}
-                        <div class="suggestion-panel subdued transcript-panel">
-                          <div>
-                            <span>Transcript</span>
-                            <strong>Not processed yet</strong>
-                            <small>Use Process Transcripts to store an excerpt for naming cleanup.</small>
-                          </div>
                         </div>
                       {% endif %}
                       {% if item.quarantined %}
@@ -5850,6 +6001,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                       <button class="secondary" type="submit" name="status" value="needs_review">Needs Review</button>
                       <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Testimony</button>
                       <button class="secondary" type="submit" name="status" value="duplicate">Mark Duplicate</button>
+                      <button class="secondary" type="submit" formaction="{{ recordings_url_for('transcribe_testimony_recording', recording_id=item.id) }}" formmethod="post">Process Transcript</button>
                       <button class="secondary" type="submit" name="status" value="grouped">Save Grouped</button>
                       <button class="save" type="submit" name="status" value="identified">Save Speaker</button>
                     </div>
@@ -6049,22 +6201,25 @@ TESTIMONY_REVIEW_TEMPLATE = """
         editPanel.querySelectorAll(".speaker-assist-panel").forEach((panel) => panel.remove());
         editPanel.querySelectorAll(".speaker-transcript-panel").forEach((panel) => panel.remove());
 
-        if (data.suggested_speaker) {
+        const speakerInput = form.querySelector('input[name="speaker_name"]');
+        const currentSpeaker = speakerInput ? speakerInput.value : (data.speaker_name || "");
+        const hasSuggestionState = Boolean(data.suggested_speaker || data.suggestion_source || data.suggestion_text);
+        if (data.suggested_speaker || (!currentSpeaker && hasSuggestionState)) {
           const panel = document.createElement("div");
-          panel.className = "suggestion-panel speaker-assist-panel";
+          panel.className = data.suggested_speaker ? "suggestion-panel speaker-assist-panel" : "suggestion-panel subdued speaker-assist-panel";
           const textWrap = document.createElement("div");
           const label = document.createElement("span");
           label.textContent = "Suggested Speaker";
           const strong = document.createElement("strong");
-          strong.textContent = data.suggested_speaker;
+          strong.textContent = data.suggested_speaker || "No suggested speaker";
           textWrap.append(label, strong);
-          if (data.suggestion_source_label) {
+          if (data.suggested_speaker && data.suggestion_source_label) {
             const small = document.createElement("small");
             small.textContent = data.suggestion_source_label;
             textWrap.appendChild(small);
           }
           panel.appendChild(textWrap);
-          if (data.suggested_speaker !== data.speaker_name) {
+          if (data.suggested_speaker && data.suggested_speaker !== currentSpeaker) {
             const button = document.createElement("button");
             button.className = "secondary apply-suggestion";
             button.type = "button";
@@ -6072,7 +6227,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
             button.textContent = "Use Suggestion";
             panel.appendChild(button);
           }
-          if (data.suggestion_text && data.suggestion_source !== "transcript_intro") {
+          if (data.suggestion_text && !["transcript_intro", "transcript_excerpt"].includes(data.suggestion_source || "")) {
             const paragraph = document.createElement("p");
             paragraph.textContent = data.suggestion_text;
             panel.appendChild(paragraph);
@@ -6080,29 +6235,28 @@ TESTIMONY_REVIEW_TEMPLATE = """
           editPanel.appendChild(panel);
         }
 
-        if (data.suggestion_source === "transcript_intro") {
+        const transcriptPreview = data.transcript_preview || data.transcript_excerpt || (["transcript_intro", "transcript_excerpt"].includes(data.suggestion_source || "") ? data.suggestion_text : "");
+        if (transcriptPreview || data.transcript_text || data.transcript_error) {
           const transcriptPanel = document.createElement("div");
           transcriptPanel.className = "suggestion-panel subdued transcript-panel speaker-transcript-panel";
           const textWrap = document.createElement("div");
           const label = document.createElement("span");
           label.textContent = "Transcript";
-          const strong = document.createElement("strong");
-          strong.textContent = data.suggestion_text ? "Intro checked" : "No speaker name found";
-          textWrap.append(label, strong);
-          if (data.suggestion_source_label) {
-            const small = document.createElement("small");
-            small.textContent = data.suggestion_source_label;
-            textWrap.appendChild(small);
-          }
+          textWrap.appendChild(label);
           transcriptPanel.appendChild(textWrap);
-          if (data.suggestion_text) {
-            const transcriptLabel = document.createElement("small");
-            transcriptLabel.textContent = "Intro transcript";
-            transcriptPanel.appendChild(transcriptLabel);
-          }
           const paragraph = document.createElement("p");
-          paragraph.textContent = data.suggestion_text;
-          if (data.suggestion_text) transcriptPanel.appendChild(paragraph);
+          paragraph.textContent = transcriptPreview || data.transcript_error || "Not processed yet.";
+          transcriptPanel.appendChild(paragraph);
+          if (data.transcript_text) {
+            const details = document.createElement("details");
+            details.className = "transcript-full";
+            const summary = document.createElement("summary");
+            summary.textContent = "View full transcript";
+            const full = document.createElement("p");
+            full.textContent = data.transcript_text;
+            details.append(summary, full);
+            transcriptPanel.appendChild(details);
+          }
           editPanel.appendChild(transcriptPanel);
         }
       }
@@ -6210,7 +6364,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           }
           showBanner(data.message || "Testimony review updated.");
           updateReviewCard(card, data);
-          if (data.suggested_speaker || data.suggestion_source || data.suggestion_text) {
+          if (data.suggested_speaker || data.suggestion_source || data.suggestion_text || data.transcript_preview || data.transcript_text || data.transcript_error) {
             renderSuggestion(card, data);
           }
         } catch (error) {
