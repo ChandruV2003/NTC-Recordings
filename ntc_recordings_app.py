@@ -38,7 +38,15 @@ install_legacy_env_aliases()
 
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".aac"}
-LIBRARY_EXCLUDED_DIR_NAMES = {"GoogleMessageTakeout", "_IncomingRecorderIntake", "_ImportAudit", "_RenameAudit", "DN300R", "_NeedsDate"}
+LIBRARY_EXCLUDED_DIR_NAMES = {
+    "GoogleMessageTakeout",
+    "_IncomingRecorderIntake",
+    "_ImportAudit",
+    "_RenameAudit",
+    "DN300R",
+    "_NeedsDate",
+    "Diagnostics",
+}
 DEFAULT_MESSAGE_RECORDING_DIR = "/mnt/MainRecordings/Recordings/MessageRecordings"
 DEFAULT_WORSHIP_RECORDING_DIR = "/mnt/MainRecordings/Recordings/WorshipRecordings"
 DEFAULT_TESTIMONY_RECORDING_DIR = "/mnt/MainRecordings/Recordings/TestimonyRecordings"
