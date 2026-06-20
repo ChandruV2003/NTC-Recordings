@@ -168,7 +168,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         testimony_source_root.mkdir(exist_ok=True)
         (testimony_source_root / "REC00123.mp3").write_bytes(b"prefix-testimony-audio")
 
-        review = self.client.get("/admin/testimonies", base_url="https://ntcnas.myftp.org")
+        review = self.client.get("/admin/recorder-review", base_url="https://ntcnas.myftp.org")
 
         self.assertEqual(review.status_code, 200)
         self.assertIn(b'href="/recordings/admin/panel"', review.data)
@@ -176,6 +176,9 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b'action="/recordings/admin/testimonies/', review.data)
         self.assertIn(b'formaction="/recordings/admin/testimonies/', review.data)
         self.assertIn(b'data-src="/recordings/admin/testimonies/audio/', review.data)
+        legacy_review = self.client.get("/admin/testimonies?status=all", base_url="https://ntcnas.myftp.org")
+        self.assertEqual(legacy_review.status_code, 302)
+        self.assertEqual(legacy_review.headers["Location"], "/recordings/admin/recorder-review?status=all")
 
     def test_worship_request_matches_worship_recording(self):
         created = self.client.post(
@@ -636,11 +639,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
         os.utime(raw_recording, (service_timestamp, service_timestamp))
         (testimony_source_root / "20250413 - Sister Rachel's Testimony.mp3").write_bytes(b"named-testimony-audio")
 
-        denied = self.client.get("/admin/testimonies")
+        denied = self.client.get("/admin/recorder-review")
         self.assertEqual(denied.status_code, 302)
 
         self._login()
-        review = self.client.get("/admin/testimonies")
+        review = self.client.get("/admin/recorder-review")
 
         self.assertEqual(review.status_code, 200)
         self.assertIn(b"Recorder Review", review.data)
@@ -677,7 +680,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b"Already Named", review.data)
         self.assertNotIn(b"20250413 - Sister Rachel", review.data)
 
-        identified = self.client.get("/admin/testimonies?status=identified")
+        identified = self.client.get("/admin/recorder-review?status=identified")
         self.assertEqual(identified.status_code, 200)
         self.assertIn(b"20250413 - Sister Rachel", identified.data)
         self.assertIn(b"Process Transcripts", identified.data)
@@ -788,7 +791,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("TestimonyRecordings", row[2])
         self.assertTrue(row[2].endswith("April 19, 2026 - Sister Test's Testimony.mp3"))
 
-        identified_after_save = self.client.get("/admin/testimonies?status=identified")
+        identified_after_save = self.client.get("/admin/recorder-review?status=identified")
         self.assertEqual(identified_after_save.status_code, 200)
         self.assertIn(b"Sister Test", identified_after_save.data)
         self.assertIn(b"April 19, 2026 - Sister Test", identified_after_save.data)
@@ -835,16 +838,16 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row, ("duplicate", "2025-08-03", ""))
 
-        needs_review = self.client.get("/admin/testimonies?status=needs_review").data
+        needs_review = self.client.get("/admin/recorder-review?status=needs_review").data
         self.assertIn(b"REC00198", needs_review)
         self.assertNotIn(b"REC10199", needs_review)
 
-        duplicate = self.client.get("/admin/testimonies?status=duplicate").data
+        duplicate = self.client.get("/admin/recorder-review?status=duplicate").data
         self.assertIn(b"REC10199", duplicate)
         self.assertIn(b"Duplicate", duplicate)
         self.assertIn(b"Quarantine Duplicates", duplicate)
 
-        all_items = self.client.get("/admin/testimonies?status=all").data
+        all_items = self.client.get("/admin/recorder-review?status=all").data
         self.assertIn(b"REC00198", all_items)
         self.assertIn(b"REC10199", all_items)
 
@@ -962,7 +965,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchone()
 
         self.assertEqual(row, ("grouped", "", "Brother K.T. Varghese Memorial Service Testimonies Part 1", str(grouped_path)))
-        grouped = self.client.get("/admin/testimonies?status=grouped").data
+        grouped = self.client.get("/admin/recorder-review?status=grouped").data
         self.assertIn(b"Testimonies Part 1", grouped)
         self.assertIn(b"Grouped", grouped)
         self.assertIn(b"Process Transcripts", grouped)
@@ -1017,7 +1020,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(row[3], str(quarantine_path))
         self.assertTrue(row[4])
 
-        duplicate = self.client.get("/admin/testimonies?status=duplicate").data
+        duplicate = self.client.get("/admin/recorder-review?status=duplicate").data
         self.assertNotIn(b"REC10199", duplicate)
 
         audio = self.client.get(f"/admin/testimonies/audio/{duplicate_id}")
@@ -1117,7 +1120,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         (testimony_source_root / "REC00088.mp3").write_bytes(b"async-testimony-audio")
 
         self._login()
-        response = self.client.get("/admin/testimonies")
+        response = self.client.get("/admin/recorder-review")
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"function submissionUrl(form, submitter)", response.data)
@@ -1231,7 +1234,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual([Path(item["candidate"].path).name for item in targets], ["REC00201.mp3"])
 
         self._login()
-        review_before = self.client.get("/admin/testimonies?status=identified")
+        review_before = self.client.get("/admin/recorder-review?status=identified")
         self.assertEqual(review_before.status_code, 200)
         self.assertIn(b"Not processed yet", review_before.data)
 
@@ -1244,7 +1247,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         )
 
         self.assertEqual(_testimony_transcript_targets(self.app), [])
-        review_after = self.client.get("/admin/testimonies?status=identified")
+        review_after = self.client.get("/admin/recorder-review?status=identified")
         self.assertNotIn(b"Stored testimony excerpt", review_after.data)
         self.assertNotIn(b"Intro checked", review_after.data)
         self.assertIn(b"<span>Transcript</span>", review_after.data)
@@ -1476,7 +1479,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         client = app.test_client()
         client.post("/admin/login", data={"password": "admin-password"})
 
-        review = client.get("/admin/testimonies")
+        review = client.get("/admin/recorder-review")
 
         self.assertEqual(review.status_code, 200)
         self.assertIn(b"REC00099", review.data)

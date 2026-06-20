@@ -558,8 +558,16 @@ def create_app(test_config: dict | None = None) -> Flask:
             format_datetime=_format_datetime,
         )
 
-    @app.get("/admin/recorder-review")
     @app.get("/admin/testimonies")
+    def legacy_testimony_review_redirect():
+        values = {}
+        for key in ("status", "sort", "limit", "message", "error"):
+            value = request.args.get(key)
+            if value is not None:
+                values[key] = value
+        return _redirect_to(app, "testimony_review", **values)
+
+    @app.get("/admin/recorder-review")
     def testimony_review():
         guard = _require_admin()
         if guard:
