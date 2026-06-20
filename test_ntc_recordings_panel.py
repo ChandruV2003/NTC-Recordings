@@ -643,7 +643,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         review = self.client.get("/admin/testimonies")
 
         self.assertEqual(review.status_code, 200)
-        self.assertIn(b"Testimony Review", review.data)
+        self.assertIn(b"Recorder Review", review.data)
         self.assertIn(b"REC00042", review.data)
         self.assertIn(b"Check Durations", review.data)
         self.assertIn(b"Save Speaker", review.data)
@@ -653,7 +653,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b'preload="metadata" src="/admin/testimonies/audio/', review.data)
         self.assertIn(b"Suggest Speaker", review.data)
         self.assertIn(b"Process Suggestions", review.data)
-        self.assertIn(b"Group Title", review.data)
+        self.assertIn(b"Group / Event Title", review.data)
         self.assertIn(b"Grouped", review.data)
         self.assertIn(b"Process Transcripts", review.data)
         self.assertNotIn(b"Quarantine Rejected", review.data)
@@ -667,7 +667,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"pauseCardAudio", review.data)
         self.assertIn(b"pauseOtherReviewAudio", review.data)
         self.assertIn(b'document.addEventListener("play"', review.data)
-        self.assertIn(b"ntc-testimony-open-cards", review.data)
+        self.assertIn(b"ntc-recorder-review-open-cards", review.data)
         self.assertIn(b"X-Requested-With", review.data)
         self.assertIn(b'id="speaker-name-options"', review.data)
         self.assertNotIn(b"DN300R folder", review.data)
@@ -759,7 +759,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(saved.status_code, 200)
-        self.assertIn(b"Testimony review saved and renamed", saved.data)
+        self.assertIn(b"Recorder review saved and renamed", saved.data)
         self.assertIn(b"Needs Review", saved.data)
         self.assertNotIn(b"20260419 - Sister Test&#39;s Testimony.mp3", saved.data)
         self.assertNotIn(b"Sunday Testimonies", saved.data)
@@ -1138,7 +1138,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(started.status_code, 200)
-        self.assertIn(b"Started testimony speaker suggestion processing", started.data)
+        self.assertIn(b"Started recorder suggestion processing", started.data)
         starter.assert_called_once()
 
         status = self.client.get("/admin/testimonies/suggest-status")
@@ -1159,7 +1159,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(started.status_code, 200)
-        self.assertIn(b"Started testimony transcript processing", started.data)
+        self.assertIn(b"Started recorder transcript processing", started.data)
         starter.assert_called_once()
 
         status = self.client.get("/admin/testimonies/transcript-status")
@@ -1200,7 +1200,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(started.status_code, 200)
-        self.assertIn(b"Started testimony transcript processing", started.data)
+        self.assertIn(b"Started recorder transcript processing", started.data)
         starter.assert_called_once()
         self.assertEqual(starter.call_args.kwargs["statuses"], {"needs_review"})
 
@@ -1323,7 +1323,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchone()
 
         self.assertIsNotNone(named_row)
-        self.assertEqual(named_row[0], "not_testimony")
+        self.assertEqual(named_row[0], "message_review")
 
     def test_bulk_testimony_suggestions_mark_long_message_like_rows(self):
         testimony_source_root = self.root / "DN300R"
@@ -1369,7 +1369,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "SELECT status, suggestion_text FROM testimony_reviews WHERE recording_id = ?",
                 (recording_id,),
             ).fetchone()
-        self.assertEqual(row[0], "not_testimony")
+        self.assertEqual(row[0], "message_review")
         self.assertIn("Shall we turn", row[1])
 
     def test_intro_speaker_suggestions_require_person_names(self):
@@ -1480,7 +1480,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(review.status_code, 200)
         self.assertIn(b"REC00099", review.data)
-        self.assertIn(b"Testimony Review", review.data)
+        self.assertIn(b"Recorder Review", review.data)
 
     def test_metadata_dates_use_local_church_day(self):
         raw_recording = self.root / "REC00494.mp3"

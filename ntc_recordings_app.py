@@ -53,9 +53,9 @@ DEFAULT_TESTIMONY_RECORDING_DIR = "/mnt/MainRecordings/Recordings/TestimonyRecor
 DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rejected"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
-TESTIMONY_REVIEW_FILTERS = {"needs_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
-TESTIMONY_REVIEW_STATUSES = {"needs_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"}
-TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "identified", "grouped", "not_testimony", "duplicate"}
+TESTIMONY_REVIEW_FILTERS = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
+TESTIMONY_REVIEW_STATUSES = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"}
+TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate"}
 TESTIMONY_FINAL_AUDIO_EXTENSION = ".mp3"
 TESTIMONY_EVENT_FOLDERS = {
     "2021-08-30": ("Funeral Testimonies", "August 30, 2021 - Sister Marg's Funeral"),
@@ -558,6 +558,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             format_datetime=_format_datetime,
         )
 
+    @app.get("/admin/recorder-review")
     @app.get("/admin/testimonies")
     def testimony_review():
         guard = _require_admin()
@@ -628,7 +629,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             "testimony_review",
             status=current_filter,
             sort=request.form.get("sort") or "shortest",
-            message=f"Checked {probed + skipped} testimony source file{'s' if probed + skipped != 1 else ''}; saved {probed} duration{'s' if probed != 1 else ''}.",
+            message=f"Checked {probed + skipped} recorder source file{'s' if probed + skipped != 1 else ''}; saved {probed} duration{'s' if probed != 1 else ''}.",
         )
 
     @app.post("/admin/testimonies/suggest-all")
@@ -643,9 +644,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             current_filter = "needs_review"
         started = _start_testimony_suggestion_job(app)
         if started:
-            message = "Started testimony speaker suggestion processing."
+            message = "Started recorder suggestion processing."
         else:
-            message = "Testimony speaker suggestion processing is already running."
+            message = "Recorder suggestion processing is already running."
         return _redirect_to(
             app,
             "testimony_review",
@@ -678,9 +679,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         target_statuses = _testimony_transcript_statuses_for_filter(current_filter)
         started = _start_testimony_transcript_job(app, min(max(limit, 1), 100), statuses=target_statuses)
         if started:
-            message = "Started testimony transcript processing."
+            message = "Started recorder transcript processing."
         else:
-            message = "Testimony transcript processing is already running."
+            message = "Recorder transcript processing is already running."
         return _redirect_to(
             app,
             "testimony_review",
@@ -709,8 +710,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         candidate = _testimony_source_recording_from_form(app, recording_id)
         if not candidate:
             if _wants_json_response():
-                return jsonify({"ok": False, "error": "Testimony source recording was not found."}), 404
-            return _redirect_to(app, "testimony_review", status=current_filter, error="Testimony source recording was not found.")
+                return jsonify({"ok": False, "error": "Recorder source file was not found."}), 404
+            return _redirect_to(app, "testimony_review", status=current_filter, error="Recorder source file was not found.")
 
         existing = _testimony_review_row(app, recording_id)
         duration_seconds = _row_duration(existing) if existing else _probe_audio_duration(Path(candidate.path))
@@ -800,7 +801,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "service_date": service_date,
                     "service_date_label": _format_date(service_date),
                     "speaker_name": speaker_name,
-                    "group_title": testimony_title if status == "grouped" else "",
+                    "group_title": testimony_title if status in {"grouped", "message_review"} else "",
                     "title": candidate.title,
                     "source_label": Path(candidate.path).name,
                     "source_path": candidate.path,
@@ -870,8 +871,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         candidate = _testimony_source_recording_from_form(app, recording_id)
         if not candidate:
             if _wants_json_response():
-                return jsonify({"ok": False, "error": "Testimony source recording was not found."}), 404
-            return _redirect_to(app, "testimony_review", status=current_filter, error="Testimony source recording was not found.")
+                return jsonify({"ok": False, "error": "Recorder source file was not found."}), 404
+            return _redirect_to(app, "testimony_review", status=current_filter, error="Recorder source file was not found.")
 
         existing = _testimony_review_row(app, recording_id)
         duration_seconds = _row_duration(existing) if existing else _probe_audio_duration(Path(candidate.path))
@@ -947,8 +948,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         candidate = _testimony_source_recording_from_form(app, recording_id)
         if not candidate:
             if _wants_json_response():
-                return jsonify({"ok": False, "error": "Testimony source recording was not found."}), 404
-            return _redirect_to(app, "testimony_review", status=current_filter, error="Testimony source recording was not found.")
+                return jsonify({"ok": False, "error": "Recorder source file was not found."}), 404
+            return _redirect_to(app, "testimony_review", status=current_filter, error="Recorder source file was not found.")
         original_recording_id = recording_id
         status = (request.form.get("status") or "identified").strip().lower()
         if status not in TESTIMONY_REVIEW_EDITABLE_STATUSES:
@@ -966,7 +967,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if status == "identified":
             speaker_name = _valid_person_name_suggestion(speaker_name, known_speakers)
             if not speaker_name:
-                review_error = "Enter a speaker name before saving a testimony speaker."
+                review_error = "Enter a speaker name before saving a speaker."
                 if _wants_json_response():
                     return jsonify({"ok": False, "error": review_error}), 400
                 return _redirect_to(
@@ -979,6 +980,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         if status == "grouped":
             speaker_name = ""
             testimony_title = group_title or "Testimonies"
+        elif status == "message_review":
+            speaker_name = ""
+            testimony_title = group_title or "Message / Event Needs Review"
         elif status == "needs_review":
             testimony_title = ""
         else:
@@ -992,7 +996,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         transcript_source = _row_optional_text(existing, "transcript_source")
         transcript_error = _row_optional_text(existing, "transcript_error")
         proposed_path = ""
-        save_message = "Testimony review saved."
+        save_message = "Recorder review saved."
         review_error = ""
         if status in {"identified", "grouped"}:
             proposed_path = _proposed_testimony_path(app, Path(candidate.path), service_date, speaker_name, testimony_title)
@@ -1012,9 +1016,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             if rename_error:
                 status = "needs_review"
                 review_error = rename_error
-                save_message = f"Testimony review was not completed. {rename_error}"
+                save_message = f"Recorder review was not completed. {rename_error}"
             else:
-                save_message = f"Testimony review saved and renamed to {Path(proposed_path).name}."
+                save_message = f"Recorder review saved and renamed to {Path(proposed_path).name}."
         _save_testimony_review(
             app,
             recording_id=recording_id,
@@ -1051,7 +1055,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "service_date": service_date,
                     "service_date_label": _format_date(service_date),
                     "speaker_name": speaker_name,
-                    "group_title": testimony_title if status == "grouped" else "",
+                    "group_title": testimony_title if status in {"grouped", "message_review"} else "",
                     "title": candidate.title,
                     "source_label": Path(candidate.path).name,
                     "source_path": candidate.path,
@@ -1314,6 +1318,20 @@ def _init_db(db_path: str) -> None:
         _ensure_column(connection, "testimony_reviews", "quarantined_from_path", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "quarantined_path", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "quarantined_at", "TEXT NOT NULL DEFAULT ''")
+        connection.execute(
+            """
+            UPDATE testimony_reviews
+            SET status = 'message_review',
+                testimony_title = CASE
+                    WHEN COALESCE(testimony_title, '') = '' THEN 'Message / Event Needs Review'
+                    ELSE testimony_title
+                END,
+                updated_at = ?
+            WHERE status = 'not_testimony'
+              AND LOWER(COALESCE(suggestion_text, '')) LIKE '%likely message recording%'
+            """,
+            (_utc_now(),),
+        )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_status ON testimony_reviews(status)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_source_path ON testimony_reviews(source_path)")
 
@@ -1405,6 +1423,8 @@ def _wants_json_response() -> bool:
 
 def _recordings_url_for(app: Flask, endpoint: str, **values) -> str:
     generated = url_for(endpoint, **values)
+    if endpoint == "testimony_review" and generated.startswith("/admin/testimonies"):
+        generated = f"/admin/recorder-review{generated[len('/admin/testimonies'):]}"
     if values.get("_external") or not generated.startswith("/") or re.match(r"^[a-z][a-z0-9+.-]*://", generated, flags=re.IGNORECASE):
         return generated
     prefix = _public_mount_prefix(app)
@@ -2318,7 +2338,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "service_date": service_date,
         "speaker_name": speaker_name,
         "testimony_title": testimony_title,
-        "group_title": testimony_title if status == "grouped" else "",
+        "group_title": testimony_title if status in {"grouped", "message_review"} else "",
         "event_group": event_folder[1] if event_folder else "",
         "notes": notes,
         "proposed_path": proposed_path,
@@ -2404,7 +2424,7 @@ def _row_optional_text(row: sqlite3.Row | None, key: str) -> str:
 
 
 def _testimony_status_counts(items: Iterable[dict]) -> dict[str, int]:
-    counts = {"needs_review": 0, "identified": 0, "grouped": 0, "not_testimony": 0, "duplicate": 0, "already_named": 0, "all": 0}
+    counts = {"needs_review": 0, "message_review": 0, "identified": 0, "grouped": 0, "not_testimony": 0, "duplicate": 0, "already_named": 0, "all": 0}
     for item in items:
         status = item.get("status") if item.get("status") in counts else "needs_review"
         counts[status] += 1
@@ -2434,9 +2454,10 @@ def _sort_testimony_items(items: list[dict], sort: str) -> None:
 def _testimony_status_label(status: str) -> str:
     labels = {
         "needs_review": "Needs Review",
+        "message_review": "Message/Event Review",
         "identified": "Identified",
         "grouped": "Grouped",
-        "not_testimony": "Not Testimony",
+        "not_testimony": "Not Needed",
         "duplicate": "Duplicate",
         "already_named": "Already Named",
         "all": "All",
@@ -2483,7 +2504,7 @@ def _start_testimony_suggestion_job(app: Flask) -> bool:
             **_initial_testimony_suggestion_job_state(),
             "state": "running",
             "started_at": _utc_now(),
-            "message": "Scanning testimony review queue.",
+            "message": "Scanning recorder review queue.",
         }
     thread = threading.Thread(target=_run_testimony_suggestion_job, args=(app,), name="testimony-suggestion-job", daemon=True)
     thread.start()
@@ -2519,7 +2540,8 @@ def _run_testimony_suggestion_job(app: Flask) -> None:
                             Path(candidate.path),
                         )
                     ):
-                        status = "not_testimony"
+                        status = "message_review"
+                        testimony_title = testimony_title or "Message / Event Needs Review"
                         suggestion_source = suggestion_source or "transcript_intro"
                         suggestion_text = suggestion_text or "Likely message recording based on duration and intro."
                     if suggested_speaker:
@@ -2612,19 +2634,20 @@ def _testimony_suggestion_targets(app: Flask) -> list[dict]:
         suggestion_source = str(row["suggestion_source"] or "") if row else ""
         if not service_date:
             service_date = candidate.recording_date
-        not_testimony_text = str(row["suggestion_text"] or "") if row else ""
+        review_note_text = str(row["suggestion_text"] or "") if row else ""
         if status == "needs_review" and _duration_is_too_short_for_testimony(app, duration_seconds):
             status = "not_testimony"
-            not_testimony_text = not_testimony_text or "Too short to be a testimony recording."
+            review_note_text = review_note_text or "Too short to be useful recorder material."
         if status == "needs_review" and _testimony_looks_like_message_recording(
             app,
             duration_seconds,
             str(row["suggestion_text"] or "") if row else "",
             Path(candidate.path),
         ):
-            status = "not_testimony"
-            not_testimony_text = not_testimony_text or "Likely message recording based on duration and intro."
-        if status == "not_testimony" and (not row or str(row["status"] or "") != "not_testimony" or _row_duration(row) is None):
+            status = "message_review"
+            testimony_title = testimony_title or "Message / Event Needs Review"
+            review_note_text = review_note_text or "Likely message recording based on duration and intro."
+        if status in {"not_testimony", "message_review"} and (not row or str(row["status"] or "") != status or _row_duration(row) is None):
             _save_testimony_review(
                 app,
                 recording_id=candidate.id,
@@ -2638,7 +2661,7 @@ def _testimony_suggestion_targets(app: Flask) -> list[dict]:
                 duration_seconds=duration_seconds,
                 suggested_speaker=suggested_speaker,
                 suggestion_source=suggestion_source,
-                suggestion_text=not_testimony_text,
+                suggestion_text=review_note_text,
             )
         if status != "needs_review" or speaker_name or suggested_speaker or suggestion_source:
             skipped += 1
@@ -2789,8 +2812,10 @@ def _testimony_transcript_statuses_for_filter(status_filter: str) -> set[str]:
         return {"needs_review"}
     if status_filter == "grouped":
         return {"grouped"}
+    if status_filter == "message_review":
+        return {"message_review"}
     if status_filter in {"all", ""}:
-        return {"needs_review", "identified", "grouped", "already_named"}
+        return {"needs_review", "message_review", "identified", "grouped", "already_named"}
     return {"identified", "already_named"}
 
 
@@ -2798,7 +2823,7 @@ def _testimony_transcript_targets(app: Flask, limit: int | None = None, statuses
     rows = _testimony_review_rows(app)
     targets = []
     skipped = 0
-    target_statuses = statuses or {"identified", "grouped", "already_named"}
+    target_statuses = statuses or {"message_review", "identified", "grouped", "already_named"}
     for row in rows.values():
         if str(row["status"] or "") not in target_statuses:
             continue
@@ -3208,12 +3233,12 @@ def _testimony_status_for_candidate(
     duration_seconds: float | None,
 ) -> str:
     status = str(row["status"] or "") if row else ""
-    if status in {"identified", "grouped", "not_testimony", "duplicate", "already_named"}:
+    if status in {"identified", "grouped", "message_review", "not_testimony", "duplicate", "already_named"}:
         return status
     if status not in TESTIMONY_REVIEW_STATUSES:
         status = "already_named" if _raw_testimony_name(Path(candidate.path)) else "needs_review"
     if status == "needs_review" and _named_non_testimony_recording(candidate):
-        return "not_testimony"
+        return "message_review"
     if status == "needs_review" and _duration_is_too_short_for_testimony(app, duration_seconds):
         return "not_testimony"
     return status
@@ -5112,7 +5137,7 @@ RECORDING_ADMIN_TEMPLATE = """
           <p class="muted">Approve message, worship, and testimony recording requests.</p>
         </div>
         <div class="actions">
-          <a href="{{ recordings_url_for('testimony_review') }}">Testimony Review</a>
+          <a href="{{ recordings_url_for('testimony_review') }}">Recorder Review</a>
           <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
           <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
         </div>
@@ -5311,7 +5336,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ title }} Testimony Review</title>
+    <title>{{ title }} Recorder Review</title>
     <style>
       :root {
         color-scheme:dark;
@@ -5400,7 +5425,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .banner-stack:empty { display:none; }
       .metrics {
         display:grid;
-        grid-template-columns:repeat(6,minmax(0,1fr));
+        grid-template-columns:repeat(7,minmax(0,1fr));
         gap:.65rem;
         margin:.65rem 0 1rem;
       }
@@ -5593,6 +5618,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .pill.needs_review { color:var(--warn); border-color:rgba(255,200,117,.35); background:var(--warn-soft); }
       .pill.identified, .pill.already_named { color:var(--good); border-color:rgba(116,221,180,.34); background:var(--good-soft); }
       .pill.grouped { color:var(--accent); border-color:rgba(143,211,255,.34); background:rgba(143,211,255,.08); }
+      .pill.message_review { color:var(--accent); border-color:rgba(143,211,255,.34); background:rgba(143,211,255,.08); }
       .pill.not_testimony { color:var(--bad); border-color:rgba(255,170,168,.35); background:var(--bad-soft); }
       .pill.duplicate { color:var(--accent); border-color:rgba(143,211,255,.34); background:rgba(143,211,255,.08); }
       .review-body {
@@ -5752,8 +5778,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
       <header>
         <div>
           <div class="eyebrow">NTC Newark</div>
-          <h1>Testimony Review</h1>
-          <p class="muted">Listen through service recordings and identify testimony speakers.</p>
+          <h1>Recorder Review</h1>
+          <p class="muted">Review recorder pulls, identify speakers, and flag message or event recordings that need filing.</p>
         </div>
         <div class="actions">
           <a href="{{ recordings_url_for('admin_panel') }}">Requests</a>
@@ -5770,17 +5796,18 @@ TESTIMONY_REVIEW_TEMPLATE = """
         {% if message %}<div class="banner">{{ message }}</div>{% endif %}
         {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
       </div>
-      <section class="metrics" aria-label="Testimony review status">
+      <section class="metrics" aria-label="Recorder review status">
         <div class="metric"><span>Needs Review</span><strong data-count="needs_review">{{ counts.needs_review }}</strong><small>Awaiting identification</small></div>
+        <div class="metric"><span>Message/Event</span><strong data-count="message_review">{{ counts.message_review }}</strong><small>Needs title or event filing</small></div>
         <div class="metric"><span>Identified</span><strong data-count="identified">{{ counts.identified }}</strong><small>Speaker confirmed or already named</small></div>
         <div class="metric"><span>Grouped</span><strong data-count="grouped">{{ counts.grouped }}</strong><small>Event testimony sets</small></div>
-        <div class="metric"><span>Not Testimony</span><strong data-count="not_testimony">{{ counts.not_testimony }}</strong><small>Keep out of testimony list</small></div>
+        <div class="metric"><span>Not Needed</span><strong data-count="not_testimony">{{ counts.not_testimony }}</strong><small>Reject junk or unusable clips</small></div>
         <div class="metric"><span>Duplicates</span><strong data-count="duplicate">{{ counts.duplicate }}</strong><small>Already covered by another file</small></div>
         <div class="metric"><span>Files Found</span><strong data-count="all">{{ counts.all }}</strong><small>Folder connected</small></div>
       </section>
       <div class="toolbar">
-        <nav class="tabs" aria-label="Testimony review filters">
-          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("grouped", "Grouped"), ("not_testimony", "Not Testimony"), ("duplicate", "Duplicate"), ("all", "All")] %}
+        <nav class="tabs" aria-label="Recorder review filters">
+          {% for key, label in [("needs_review", "Needs Review"), ("message_review", "Message/Event"), ("identified", "Identified"), ("grouped", "Grouped"), ("not_testimony", "Not Needed"), ("duplicate", "Duplicate"), ("all", "All")] %}
             <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ recordings_url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong data-count="{{ key }}">{{ counts[key] }}</strong></a>
           {% endfor %}
         </nav>
@@ -5801,7 +5828,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
               <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
             </form>
           {% endif %}
-          {% if status_filter in ["needs_review", "identified", "grouped", "all"] %}
+          {% if status_filter in ["needs_review", "message_review", "identified", "grouped", "all"] %}
             <form class="probe-form action-only" method="post" action="{{ recordings_url_for('transcribe_identified_testimonies') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
               <input type="hidden" name="sort" value="{{ sort }}">
@@ -5814,7 +5841,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
               <input type="hidden" name="sort" value="{{ sort }}">
               <button type="submit">
                 {% if status_filter == "not_testimony" %}
-                  Quarantine Not Testimony
+                  Quarantine Not Needed
                 {% elif status_filter == "duplicate" %}
                   Quarantine Duplicates
                 {% else %}
@@ -5827,7 +5854,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       </div>
       <div class="job-panel" data-suggestion-job data-status-url="{{ recordings_url_for('testimony_suggestion_status') }}" data-state="{{ suggestion_job.state }}" {% if suggestion_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
         <div>
-          <span>Speaker Suggestions</span>
+          <span>Recorder Suggestions</span>
           <strong data-job-message>{{ suggestion_job.message or "Idle." }}</strong>
           <div data-job-counts>
             {{ suggestion_job.processed }} / {{ suggestion_job.total }} processed · {{ suggestion_job.found }} suggested · {{ suggestion_job.checked }} checked · {{ suggestion_job.errors }} errors
@@ -5837,7 +5864,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       </div>
       <div class="job-panel" data-transcript-job data-status-url="{{ recordings_url_for('testimony_transcript_status') }}" data-state="{{ transcript_job.state }}" {% if transcript_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
         <div>
-          <span>Identified Transcripts</span>
+          <span>Recorder Transcripts</span>
           <strong data-job-message>{{ transcript_job.message or "Idle." }}</strong>
           <div data-job-counts>
             {{ transcript_job.processed }} / {{ transcript_job.total }} processed · {{ transcript_job.saved }} saved · {{ transcript_job.errors }} errors
@@ -5849,7 +5876,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div class="panel-head">
           <div>
             <h2>{{ status_label(status_filter) }}</h2>
-            <p class="muted">Listen, confirm the service date, then save the speaker or mark clips that are not testimonies.</p>
+            <p class="muted">Listen, confirm the service date, then save the speaker, group an event, or flag message recordings that need title/event filing.</p>
           </div>
           <form class="probe-form" method="get" action="{{ recordings_url_for('testimony_review') }}">
             <input type="hidden" name="status" value="{{ status_filter }}">
@@ -5869,7 +5896,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           </form>
         </div>
         {% if not testimony_source_exists %}
-          <div class="empty">Testimony source folder is not connected.</div>
+          <div class="empty">Recorder source folder is not connected.</div>
         {% elif items %}
           <div class="review-list" data-review-list data-active-filter="{{ status_filter }}" data-empty-message="No recordings match this filter.">
             {% for item in items %}
@@ -5925,8 +5952,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           <input name="speaker_name" value="{{ item.speaker_name }}" placeholder="Type speaker name" list="speaker-name-options">
                         </label>
                         <label>
-                          <span>Group Title</span>
-                          <input name="group_title" value="{{ item.group_title }}" placeholder="Testimonies Part 1">
+                          <span>Group / Event Title</span>
+                          <input name="group_title" value="{{ item.group_title }}" placeholder="Testimonies Part 1 or Closing Program">
                         </label>
                       </div>
                       {% if item.event_group %}
@@ -5999,9 +6026,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
                     </section>
                     <div class="button-row">
                       <button class="secondary" type="submit" name="status" value="needs_review">Needs Review</button>
-                      <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Testimony</button>
+                      <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Needed</button>
                       <button class="secondary" type="submit" name="status" value="duplicate">Mark Duplicate</button>
                       <button class="secondary" type="submit" formaction="{{ recordings_url_for('transcribe_testimony_recording', recording_id=item.id) }}" formmethod="post">Process Transcript</button>
+                      <button class="secondary" type="submit" name="status" value="message_review">Save Message/Event</button>
                       <button class="secondary" type="submit" name="status" value="grouped">Save Grouped</button>
                       <button class="save" type="submit" name="status" value="identified">Save Speaker</button>
                     </div>
@@ -6016,8 +6044,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
       </section>
     </main>
     <script>
-      const openCardsKey = "ntc-testimony-open-cards";
-      const statusClasses = ["needs_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"];
+      const openCardsKey = "ntc-recorder-review-open-cards";
+      const statusClasses = ["needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"];
       const bannerStack = document.querySelector("[data-banner-stack]");
       const reviewList = document.querySelector("[data-review-list]");
       const activeReviewFilter = reviewList ? reviewList.dataset.activeFilter || "needs_review" : "needs_review";
@@ -6362,7 +6390,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           if (!response.ok || !data.ok) {
             throw new Error(data.error || data.message || "The testimony update failed.");
           }
-          showBanner(data.message || "Testimony review updated.");
+          showBanner(data.message || "Recorder review updated.");
           updateReviewCard(card, data);
           if (data.suggested_speaker || data.suggestion_source || data.suggestion_text || data.transcript_preview || data.transcript_text || data.transcript_error) {
             renderSuggestion(card, data);
