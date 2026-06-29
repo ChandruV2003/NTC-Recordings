@@ -50,6 +50,9 @@ LIBRARY_EXCLUDED_DIR_NAMES = {
 DEFAULT_MESSAGE_RECORDING_DIR = "/mnt/MainRecordings/Recordings/MessageRecordings"
 DEFAULT_WORSHIP_RECORDING_DIR = "/mnt/MainRecordings/Recordings/WorshipRecordings"
 DEFAULT_TESTIMONY_RECORDING_DIR = "/mnt/MainRecordings/Recordings/TestimonyRecordings"
+DEFAULT_RECORDER_INTAKE_DIR = "/mnt/MainRecordings/Recordings/_IncomingRecorderIntake"
+DEFAULT_TESTIMONY_LEGACY_REVIEW_DIR = f"{DEFAULT_RECORDER_INTAKE_DIR}/LegacyDN300RReview"
+DEFAULT_TESTIMONY_RECORDER_MANIFESTS = "/app/data/autosyncmix/recorders/DN700R/manifest.sqlite3"
 DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rejected"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
@@ -292,6 +295,12 @@ def create_app(test_config: dict | None = None) -> Flask:
             os.getenv("NTC_RECORDINGS_TESTIMONY_SOURCE_DIR")
             or os.getenv("NTC_RECORDINGS_DN300R_DIR")
             or str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R")
+        ),
+        NTC_RECORDINGS_TESTIMONY_SOURCE_DIRS=os.getenv("NTC_RECORDINGS_TESTIMONY_SOURCE_DIRS", ""),
+        NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS=os.getenv("NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS", DEFAULT_RECORDER_INTAKE_DIR),
+        NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS=os.getenv(
+            "NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS",
+            DEFAULT_TESTIMONY_RECORDER_MANIFESTS,
         ),
         NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR=os.getenv("NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR", DEFAULT_TESTIMONY_RECORDING_DIR),
         NTC_RECORDINGS_TESTIMONY_REJECTED_DIR=os.getenv("NTC_RECORDINGS_TESTIMONY_REJECTED_DIR", DEFAULT_TESTIMONY_REJECTED_DIR),
@@ -2126,6 +2135,48 @@ def _testimony_source_root(app: Flask) -> Path:
     return configured
 
 
+def _configured_path_list(value: str) -> list[Path]:
+    paths = []
+    for part in re.split(r"[;,]", str(value or "")):
+        part = part.strip()
+        if part:
+            paths.append(Path(part).expanduser())
+    return _unique_paths(paths)
+
+
+def _unique_paths(paths: Iterable[Path]) -> list[Path]:
+    unique = []
+    seen = set()
+    for path in paths:
+        path = Path(path).expanduser()
+        key = str(path)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _testimony_source_roots(app: Flask) -> list[Path]:
+    configured_roots = _configured_path_list(str(app.config.get("NTC_RECORDINGS_TESTIMONY_SOURCE_DIRS") or ""))
+    if configured_roots:
+        return configured_roots
+    return _unique_paths([_testimony_source_root(app)])
+
+
+def _testimony_allowed_roots(app: Flask) -> list[Path]:
+    configured_allowed = _configured_path_list(str(app.config.get("NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS") or ""))
+    return _unique_paths(
+        [
+            *_testimony_source_roots(app),
+            *configured_allowed,
+            _testimony_recording_root(app),
+            _message_recording_root(app),
+            _testimony_rejected_root(app),
+        ]
+    )
+
+
 def _message_recording_root(app: Flask) -> Path:
     roots = _library_roots(app)
     for kind, root in roots:
@@ -2163,53 +2214,50 @@ def _relative_to_first_root(path: Path, roots: Iterable[Path]) -> str:
 
 
 def _testimony_source_candidates(app: Flask) -> list[RecordingCandidate]:
-    root = _testimony_source_root(app)
-    if not root.exists() or not root.is_dir():
+    roots = [root for root in _testimony_source_roots(app) if root.exists() and root.is_dir()]
+    if not roots:
         return []
-    known_roots = [_testimony_recording_root(app), _message_recording_root(app), root, _testimony_rejected_root(app)]
+    known_roots = _testimony_allowed_roots(app)
     candidates = []
-    for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
-            continue
-        if path.name.startswith("._") or any(part.startswith(".") for part in path.parts):
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        recording_date = _extract_recording_date(" ".join(path.parts)) or _date_from_file_metadata(stat) or ""
-        try:
-            relative_path = _relative_to_first_root(path, known_roots)
-        except ValueError:
-            relative_path = path.name
-        kind = "testimony" if _raw_testimony_name(path) else "message"
-        candidates.append(
-            RecordingCandidate(
-                id=_recording_id(path),
-                path=str(path),
-                title=_display_title(path),
-                recording_date=recording_date,
-                kind=kind,
-                size_bytes=stat.st_size,
-                modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
-                relative_path=relative_path,
+    seen_paths = set()
+    for root in roots:
+        for path in root.rglob("*"):
+            if str(path) in seen_paths:
+                continue
+            if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+                continue
+            if path.name.startswith("._") or any(part.startswith(".") for part in path.parts):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            seen_paths.add(str(path))
+            recording_date = _extract_recording_date(" ".join(path.parts)) or _date_from_file_metadata(stat) or ""
+            try:
+                relative_path = _relative_to_first_root(path, known_roots)
+            except ValueError:
+                relative_path = path.name
+            kind = "testimony" if _raw_testimony_name(path) else "message"
+            candidates.append(
+                RecordingCandidate(
+                    id=_recording_id(path),
+                    path=str(path),
+                    title=_display_title(path),
+                    recording_date=recording_date,
+                    kind=kind,
+                    size_bytes=stat.st_size,
+                    modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+                    relative_path=relative_path,
+                )
             )
-        )
     candidates.sort(key=lambda item: (item.recording_date or "0000-00-00", item.modified_at, item.title), reverse=True)
     return candidates
 
 
 def _testimony_source_candidate_from_path(app: Flask, path: Path) -> RecordingCandidate | None:
-    root = _testimony_source_root(app)
-    message_root = _message_recording_root(app)
-    testimony_root = _testimony_recording_root(app)
-    rejected_root = _testimony_rejected_root(app)
-    if not (
-        _path_within(path, root)
-        or _path_within(path, message_root)
-        or _path_within(path, testimony_root)
-        or _path_within(path, rejected_root)
-    ):
+    known_roots = _testimony_allowed_roots(app)
+    if not any(_path_within(path, root) for root in known_roots):
         return None
     if not path.exists() or not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
         return None
@@ -2221,7 +2269,7 @@ def _testimony_source_candidate_from_path(app: Flask, path: Path) -> RecordingCa
         return None
     recording_date = _extract_recording_date(" ".join(path.parts)) or _date_from_file_metadata(stat) or ""
     try:
-        relative_path = _relative_to_first_root(path, [testimony_root, message_root, root, rejected_root])
+        relative_path = _relative_to_first_root(path, known_roots)
     except ValueError:
         relative_path = path.name
     kind = "testimony" if _raw_testimony_name(path) else "message"
@@ -2267,7 +2315,8 @@ def _raw_testimony_name(path: Path) -> bool:
 
 
 def _raw_recorder_name(path: Path) -> bool:
-    return bool(re.fullmatch(r"(?i)rec\d+", _strip_audio_extensions(path.name).strip()))
+    stem = _strip_audio_extensions(path.name).strip()
+    return bool(re.fullmatch(r"(?i)(rec\d+|\d{14}[_-]dn-?700r)", stem))
 
 
 def _named_non_testimony_recording(candidate: RecordingCandidate) -> bool:
@@ -2286,6 +2335,88 @@ def _testimony_review_rows(app: Flask) -> dict[str, sqlite3.Row]:
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         rows = connection.execute("SELECT * FROM testimony_reviews").fetchall()
     return {row["recording_id"]: row for row in rows}
+
+
+def _testimony_recorder_manifest_paths(app: Flask) -> list[Path]:
+    return _configured_path_list(str(app.config.get("NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS") or ""))
+
+
+def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
+    known_speakers = _testimony_known_speakers(app)
+    for manifest_path in _testimony_recorder_manifest_paths(app):
+        if not manifest_path.exists() or not manifest_path.is_file():
+            continue
+        manifest = None
+        try:
+            manifest = sqlite3.connect(str(manifest_path))
+            manifest.row_factory = sqlite3.Row
+            rows = manifest.execute(
+                """
+                SELECT staged_path,
+                       duration_seconds,
+                       transcript_text,
+                       transcript_source,
+                       transcript_at,
+                       agent_decision_json,
+                       agent_review_reason
+                FROM recorder_files
+                WHERE classification = 'testimony_candidate'
+                  AND status = 'staged'
+                  AND staged_path <> ''
+                ORDER BY last_seen_at DESC
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            app.logger.exception("Failed to read testimony recorder manifest %s", manifest_path)
+            continue
+        finally:
+            if manifest:
+                try:
+                    manifest.close()
+                except Exception:
+                    pass
+
+        for row in rows:
+            staged_path = Path(str(row["staged_path"] or ""))
+            candidate = _testimony_source_candidate_from_path(app, staged_path)
+            if not candidate:
+                continue
+            existing = _testimony_review_row(app, candidate.id)
+            decision = {}
+            if row["agent_decision_json"]:
+                try:
+                    parsed = json.loads(str(row["agent_decision_json"]))
+                    if isinstance(parsed, dict):
+                        decision = parsed
+                except json.JSONDecodeError:
+                    decision = {}
+            service_date = _normalize_date(str(decision.get("service_date") or "")) or candidate.recording_date
+            suggested_speaker = _valid_person_name_suggestion(str(decision.get("speaker") or ""), known_speakers)
+            if not existing:
+                _save_testimony_review(
+                    app,
+                    recording_id=candidate.id,
+                    source_path=candidate.path,
+                    status="needs_review",
+                    service_date=service_date,
+                    speaker_name="",
+                    testimony_title="",
+                    notes="",
+                    proposed_path="",
+                    duration_seconds=row["duration_seconds"],
+                    suggested_speaker=suggested_speaker,
+                    suggestion_source="recorder_manifest" if suggested_speaker else "",
+                    suggestion_text=_compact_transcript_excerpt(str(row["transcript_text"] or "")) if suggested_speaker else "",
+                )
+                existing = _testimony_review_row(app, candidate.id)
+            if row["transcript_text"] and (not existing or not _row_optional_text(existing, "transcript_text")):
+                _save_testimony_transcript(
+                    app,
+                    candidate.id,
+                    transcript_text=str(row["transcript_text"] or ""),
+                    transcript_source=str(row["transcript_source"] or "recorder_manifest"),
+                    transcript_error="",
+                )
 
 
 def _testimony_candidate_from_review_row(app: Flask, row: sqlite3.Row) -> RecordingCandidate | None:
@@ -2385,6 +2516,7 @@ def _testimony_review_row_is_quarantined(row: sqlite3.Row) -> bool:
 
 
 def _testimony_review_items(app: Flask) -> list[dict]:
+    _sync_testimony_recorder_manifest_reviews(app)
     rows = _testimony_review_rows(app)
     known_speakers = _testimony_known_speakers(app)
     items = []
