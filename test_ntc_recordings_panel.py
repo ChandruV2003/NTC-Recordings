@@ -1460,6 +1460,33 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
         )
 
+    def test_testimony_audio_streams_external_recorder_review_source(self):
+        external_root = Path(self.tempdir.name) / "_IncomingRecorderIntake" / "TestimonyReviewQueue"
+        external_root.mkdir(parents=True)
+        raw_recording = external_root / "REC00999.mp3"
+        raw_recording.write_bytes(b"external-review-audio")
+
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "external-review-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(Path(self.tempdir.name) / "external-review-requests.db"),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(external_root),
+                "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
+                "NTC_RECORDINGS_TESTIMONY_REJECTED_DIR": str(self.rejected_root),
+                "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
+            }
+        )
+        client = app.test_client()
+        client.post("/admin/login", data={"password": "admin-password"})
+
+        audio = client.get(f"/admin/testimonies/audio/{_recording_id(raw_recording)}")
+
+        self.assertEqual(audio.status_code, 200)
+        self.assertEqual(audio.data, b"external-review-audio")
+        audio.close()
+
     def test_legacy_testimony_source_config_still_works(self):
         legacy_root = self.root / "LegacyRecorder"
         legacy_root.mkdir()

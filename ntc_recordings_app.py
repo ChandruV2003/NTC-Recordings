@@ -1119,7 +1119,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if not candidate:
             return jsonify({"error": "recording was not found"}), 404
         path = Path(candidate.path)
-        if not _path_allowed(app, path) or not path.exists() or not path.is_file():
+        if not path.exists() or not path.is_file() or not _testimony_audio_path_allowed(app, path):
             return jsonify({"error": "recording is unavailable"}), 404
         return send_file(path, as_attachment=False, conditional=True)
 
@@ -1653,6 +1653,10 @@ def _path_within(path: Path, root: Path) -> bool:
         return True
     except (FileNotFoundError, ValueError):
         return False
+
+
+def _testimony_audio_path_allowed(app: Flask, path: Path) -> bool:
+    return any(_path_within(path, root) for root in _testimony_allowed_roots(app))
 
 
 def _folder_audio_items(app: Flask, path: Path) -> list[str]:
