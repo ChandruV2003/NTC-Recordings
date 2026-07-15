@@ -43,7 +43,6 @@ LIBRARY_EXCLUDED_DIR_NAMES = {
     "_IncomingRecorderIntake",
     "_ImportAudit",
     "_RenameAudit",
-    "DN300R",
     "_NeedsDate",
     "Diagnostics",
 }
@@ -291,10 +290,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         SECRET_KEY=os.getenv("NTC_RECORDINGS_SECRET_KEY") or os.getenv("NTC_SECRET_KEY") or "change-me",
         NTC_RECORDINGS_DB_PATH=os.getenv("NTC_RECORDINGS_DB_PATH", "data/recording-requests.db"),
         NTC_RECORDINGS_LIBRARY_DIRS=os.getenv("NTC_RECORDINGS_LIBRARY_DIRS", DEFAULT_RECORDING_DIRS),
-        NTC_RECORDINGS_TESTIMONY_SOURCE_DIR=(
-            os.getenv("NTC_RECORDINGS_TESTIMONY_SOURCE_DIR")
-            or os.getenv("NTC_RECORDINGS_DN300R_DIR")
-            or str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R")
+        NTC_RECORDINGS_TESTIMONY_SOURCE_DIR=os.getenv(
+            "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR",
+            DEFAULT_TESTIMONY_REVIEW_QUEUE_DIR,
         ),
         NTC_RECORDINGS_TESTIMONY_SOURCE_DIRS=os.getenv("NTC_RECORDINGS_TESTIMONY_SOURCE_DIRS", ""),
         NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS=os.getenv("NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS", DEFAULT_RECORDER_INTAKE_DIR),
@@ -2125,20 +2123,8 @@ def _request_return_tab(default: str = "pending") -> str:
 
 
 def _testimony_source_root(app: Flask) -> Path:
-    default_source = str(Path(DEFAULT_MESSAGE_RECORDING_DIR) / "DN300R")
-    configured_value = app.config.get("NTC_RECORDINGS_TESTIMONY_SOURCE_DIR") or ""
-    legacy_value = app.config.get("NTC_RECORDINGS_DN300R_DIR") or ""
-    if legacy_value and (not configured_value or configured_value == default_source):
-        configured_value = legacy_value
-    configured = Path(str(configured_value)).expanduser()
-    if configured.exists():
-        return configured
-    message_root = _message_recording_root(app)
-    for folder_name in ("DN300R", "DM300R"):
-        candidate = message_root / folder_name
-        if candidate.exists():
-            return candidate
-    return configured
+    configured_value = app.config.get("NTC_RECORDINGS_TESTIMONY_SOURCE_DIR") or DEFAULT_TESTIMONY_REVIEW_QUEUE_DIR
+    return Path(str(configured_value)).expanduser()
 
 
 def _configured_path_list(value: str) -> list[Path]:
@@ -2316,7 +2302,7 @@ def _testimony_source_recording_from_form(app: Flask, recording_id: str) -> Reco
 
 
 def _raw_testimony_name(path: Path) -> bool:
-    normalized = re.sub(r"[^a-z]+", "", str(path).lower())
+    normalized = re.sub(r"[^a-z]+", "", path.name.lower())
     return "testimony" in normalized or "testimonies" in normalized
 
 

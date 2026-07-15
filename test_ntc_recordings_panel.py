@@ -51,7 +51,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "SECRET_KEY": "test-secret",
                 "NTC_RECORDINGS_DB_PATH": str(self.db_path),
                 "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
-                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(self.root / "DN300R"),
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(self.root / "TestimonyReviewQueue"),
                 "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
                 "NTC_RECORDINGS_TESTIMONY_REJECTED_DIR": str(self.rejected_root),
                 "NTC_RECORDINGS_PUBLIC_BASE_URL": "https://recordings.example.test",
@@ -164,7 +164,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(login.status_code, 302)
         self.assertEqual(login.headers["Location"], "/recordings/admin/panel")
 
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir(exist_ok=True)
         (testimony_source_root / "REC00123.mp3").write_bytes(b"prefix-testimony-audio")
 
@@ -631,7 +631,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("/shares/9753", delete.call_args.args[0])
 
     def test_testimony_review_tracks_source_speaker_identification(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         raw_recording = testimony_source_root / "REC00042.mp3"
         raw_recording.write_bytes(b"raw-testimony-audio")
@@ -673,7 +673,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"ntc-recorder-review-open-cards", review.data)
         self.assertIn(b"X-Requested-With", review.data)
         self.assertIn(b'id="speaker-name-options"', review.data)
-        self.assertNotIn(b"DN300R folder", review.data)
+        self.assertNotIn(b"legacy source folder", review.data)
         self.assertNotIn(b"Final Title", review.data)
         self.assertNotIn(b"Voice / ID Notes", review.data)
         self.assertNotIn(b"Proposed Destination", review.data)
@@ -801,7 +801,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(renamed_audio.data, b"raw-testimony-audio")
 
     def test_testimony_review_can_mark_duplicate_recordings(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         primary_recording = testimony_source_root / "REC00198.wav"
         duplicate_recording = testimony_source_root / "REC10199.wav"
@@ -852,7 +852,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"REC10199", all_items)
 
     def test_testimony_review_requires_speaker_before_identifying(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         raw_recording = testimony_source_root / "REC00088.mp3"
         raw_recording.write_bytes(b"raw-testimony-audio")
@@ -884,7 +884,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIsNone(row)
 
     def test_funeral_date_testimony_saves_to_funeral_folder(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         raw_recording = testimony_source_root / "REC00090.mp3"
         raw_recording.write_bytes(b"funeral-testimony-audio")
@@ -927,7 +927,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("Brother K.T. Varghese", row[1])
 
     def test_funeral_date_grouped_testimony_saves_part_title(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         raw_recording = testimony_source_root / "REC00088.mp3"
         raw_recording.write_bytes(b"grouped-funeral-testimony-audio")
@@ -971,7 +971,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Process Transcripts", grouped)
 
     def test_testimony_review_quarantines_rejected_recordings(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         duplicate_recording = testimony_source_root / "REC10199.wav"
         duplicate_recording.write_bytes(b"same-testimony-content-duplicate")
@@ -1028,7 +1028,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(audio.data, b"same-testimony-content-duplicate")
 
     def test_testimony_review_supports_json_row_updates(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         raw_recording = testimony_source_root / "REC00077.mp3"
         raw_recording.write_bytes(b"async-testimony-audio")
@@ -1066,7 +1066,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("TestimonyRecordings", payload["source_path"])
 
     def test_testimony_review_converts_wav_to_mp3_when_saving_speaker(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         raw_recording = testimony_source_root / "REC00078.wav"
         raw_recording.write_bytes(b"fake-wav-audio")
@@ -1115,7 +1115,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(response.get_json()["error"], "Admin session expired. Sign in again, then retry the testimony update.")
 
     def test_testimony_review_uses_form_action_for_regular_save_buttons(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         (testimony_source_root / "REC00088.mp3").write_bytes(b"async-testimony-audio")
 
@@ -1128,7 +1128,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b"submitter.formAction ? submitter.formAction : form.action", response.data)
 
     def test_bulk_testimony_suggestions_route_starts_background_job(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         (testimony_source_root / "REC00100.mp3").write_bytes(b"raw-testimony-audio")
 
@@ -1149,7 +1149,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("state", status.get_json())
 
     def test_identified_testimony_transcript_route_starts_background_job(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         (testimony_source_root / "REC00200.mp3").write_bytes(b"raw-testimony-audio")
 
@@ -1170,7 +1170,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("state", status.get_json())
 
     def test_needs_review_testimony_transcript_route_targets_needs_review_rows(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         recording = testimony_source_root / "REC00203.mp3"
         recording.write_bytes(b"needs-review-testimony-audio")
@@ -1208,7 +1208,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(starter.call_args.kwargs["statuses"], {"needs_review"})
 
     def test_identified_testimony_transcripts_are_saved_and_skipped_afterwards(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         recording = testimony_source_root / "REC00201.mp3"
         recording.write_bytes(b"identified-testimony-audio")
@@ -1255,7 +1255,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"thank God for helping me", review_after.data)
 
     def test_identified_transcript_survives_testimony_rename(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         recording = testimony_source_root / "REC00202.mp3"
         recording.write_bytes(b"identified-testimony-audio")
@@ -1308,7 +1308,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("transcript should stay", rows[0][1])
 
     def test_bulk_testimony_suggestions_skip_named_message_files(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         raw_recording = testimony_source_root / "REC00101.mp3"
         raw_recording.write_bytes(b"raw-testimony-audio")
@@ -1329,7 +1329,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(named_row[0], "message_review")
 
     def test_bulk_testimony_suggestions_mark_long_message_like_rows(self):
-        testimony_source_root = self.root / "DN300R"
+        testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         message_recording = testimony_source_root / "REC00485.mp3"
         message_recording.write_bytes(b"long-message-audio")
@@ -1423,7 +1423,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 1916,
                 "Praise God. It is wonderful to see the wonderful work that God has done in our children. "
                 "Shall we pray? Thank you for your word helping us, guiding us, directing us daily.",
-                Path("/mnt/MainRecordings/Recordings/MessageRecordings/DN300R/REC00500.mp3"),
+                Path("/mnt/MainRecordings/Recordings/_IncomingRecorderIntake/TestimonyReviewQueue/REC00500.mp3"),
             )
         )
         self.assertTrue(
@@ -1432,7 +1432,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 3548,
                 "Oh, hallelujah. Those are wonderful words. Soon our Lord shall come in glory. "
                 "Hallelujah. Are you ready, Brother Gerald? There is a pure river.",
-                Path("/mnt/MainRecordings/Recordings/MessageRecordings/DN300R/REC00499.mp3"),
+                Path("/mnt/MainRecordings/Recordings/_IncomingRecorderIntake/TestimonyReviewQueue/REC00499.mp3"),
             )
         )
         self.assertTrue(_testimony_looks_like_message_recording(self.app, 15000, "Thank you."))
@@ -1486,32 +1486,6 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(audio.status_code, 200)
         self.assertEqual(audio.data, b"external-review-audio")
         audio.close()
-
-    def test_legacy_testimony_source_config_still_works(self):
-        legacy_root = self.root / "LegacyRecorder"
-        legacy_root.mkdir()
-        raw_recording = legacy_root / "REC00099.mp3"
-        raw_recording.write_bytes(b"legacy-source-audio")
-
-        app = create_app(
-            {
-                "TESTING": True,
-                "SECRET_KEY": "legacy-test-secret",
-                "NTC_RECORDINGS_DB_PATH": str(Path(self.tempdir.name) / "legacy-recording-requests.db"),
-                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root}",
-                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": "",
-                "NTC_RECORDINGS_DN300R_DIR": str(legacy_root),
-                "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
-            }
-        )
-        client = app.test_client()
-        client.post("/admin/login", data={"password": "admin-password"})
-
-        review = client.get("/admin/recorder-review")
-
-        self.assertEqual(review.status_code, 200)
-        self.assertIn(b"REC00099", review.data)
-        self.assertIn(b"Recorder Review", review.data)
 
     def test_metadata_dates_use_local_church_day(self):
         raw_recording = self.root / "REC00494.mp3"
