@@ -1393,7 +1393,9 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(_extract_intro_speaker("I'm not going to give a long testimony today.", []), "")
         self.assertEqual(_extract_intro_speaker("I am deeply thankful for what God has done.", []), "")
         self.assertEqual(_extract_intro_speaker("Praise the Lord. I am happening to me in this situation.", []), "")
+        self.assertEqual(_extract_intro_speaker("Praise the Lord. I'm really, really blessed to testify today.", []), "")
         self.assertEqual(_valid_person_name_suggestion("Happening To Me", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Really", []), "")
         self.assertEqual(_valid_person_name_suggestion("Testimony", []), "")
         self.assertEqual(_testimony_filename_speaker_suggestion(Path("March 15, 2026 - Testimony.mp3")), "")
         self.assertEqual(
