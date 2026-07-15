@@ -1225,8 +1225,10 @@ def create_app(test_config: dict | None = None) -> Flask:
 def _connect(db_path: str) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, factory=ClosingSQLiteConnection)
+    connection = sqlite3.connect(path, timeout=15, factory=ClosingSQLiteConnection)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 15000")
+    connection.execute("PRAGMA journal_mode = WAL")
     return connection
 
 

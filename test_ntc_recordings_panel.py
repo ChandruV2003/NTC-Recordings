@@ -1499,6 +1499,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "SECRET_KEY": "legacy-test-secret",
                 "NTC_RECORDINGS_DB_PATH": str(Path(self.tempdir.name) / "legacy-recording-requests.db"),
                 "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root}",
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": "",
                 "NTC_RECORDINGS_DN300R_DIR": str(legacy_root),
                 "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
             }
