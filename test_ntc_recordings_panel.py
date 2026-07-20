@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from ntc_recordings_app import (
     _date_from_file_metadata,
+    _display_transcript_text,
     _extract_intro_speaker,
     _normalize_recording_email_message,
     _recording_id,
@@ -1253,6 +1254,19 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"<span>Transcript</span>", review_after.data)
         self.assertIn(b"View full transcript", review_after.data)
         self.assertIn(b"thank God for helping me", review_after.data)
+
+    def test_transcript_display_hides_internal_window_markers(self):
+        cleaned = _display_transcript_text(
+            "[start] Praise the Lord. I thank God for His faithfulness.\n\n"
+            "[+158s] [no transcription returned]\n\n"
+            "[+417s] God has helped our family through every season."
+        )
+
+        self.assertEqual(
+            cleaned,
+            "Praise the Lord. I thank God for His faithfulness.\n\n"
+            "God has helped our family through every season.",
+        )
 
     def test_identified_transcript_survives_testimony_rename(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"

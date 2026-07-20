@@ -812,6 +812,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
         message = "Transcript processed." if transcript_text else transcript_error or "Transcript was not saved."
         if _wants_json_response():
+            display_transcript_text = _display_transcript_text(transcript_text)
             response = jsonify(
                 {
                     "ok": bool(transcript_text),
@@ -831,9 +832,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "suggestion_source": suggestion_source,
                     "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
                     "suggestion_text": suggestion_text,
-                    "transcript_text": transcript_text,
-                    "transcript_excerpt": _compact_transcript_excerpt(transcript_text, 900),
-                    "transcript_preview": _testimony_display_transcript_preview(transcript_text, suggestion_source, suggestion_text, 900),
+                    "transcript_text": display_transcript_text,
+                    "transcript_excerpt": _compact_transcript_excerpt(display_transcript_text, 900),
+                    "transcript_preview": _testimony_display_transcript_preview(display_transcript_text, suggestion_source, suggestion_text, 900),
                     "transcript_error": transcript_error,
                     "transcript_updated_label": _format_datetime(_utc_now()),
                     "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=recording_id),
@@ -933,6 +934,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         else:
             message = suggestion_error or "No speaker suggestion found."
         if _wants_json_response():
+            transcript_text = _row_optional_text(existing, "transcript_text")
+            display_transcript_text = _display_transcript_text(transcript_text)
             return jsonify(
                 {
                     "ok": True,
@@ -942,9 +945,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "suggestion_source": suggestion_source,
                     "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
                     "suggestion_text": suggestion_text,
-                    "transcript_text": (transcript_text := _row_optional_text(existing, "transcript_text")),
-                    "transcript_excerpt": _compact_transcript_excerpt(transcript_text, 900),
-                    "transcript_preview": _testimony_display_transcript_preview(transcript_text, suggestion_source, suggestion_text, 900),
+                    "transcript_text": display_transcript_text,
+                    "transcript_excerpt": _compact_transcript_excerpt(display_transcript_text, 900),
+                    "transcript_preview": _testimony_display_transcript_preview(display_transcript_text, suggestion_source, suggestion_text, 900),
                     "transcript_error": _row_optional_text(existing, "transcript_error"),
                     "transcript_updated_label": _format_datetime(_row_optional_text(existing, "transcript_updated_at")),
                 }
@@ -1065,6 +1068,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 transcript_error=transcript_error,
             )
         if _wants_json_response():
+            display_transcript_text = _display_transcript_text(transcript_text)
             response = jsonify(
                 {
                     "ok": not bool(review_error),
@@ -1085,9 +1089,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "suggestion_source": suggestion_source,
                     "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
                     "suggestion_text": suggestion_text,
-                    "transcript_text": transcript_text,
-                    "transcript_excerpt": _compact_transcript_excerpt(transcript_text, 900),
-                    "transcript_preview": _testimony_display_transcript_preview(transcript_text, suggestion_source, suggestion_text, 900),
+                    "transcript_text": display_transcript_text,
+                    "transcript_excerpt": _compact_transcript_excerpt(display_transcript_text, 900),
+                    "transcript_preview": _testimony_display_transcript_preview(display_transcript_text, suggestion_source, suggestion_text, 900),
                     "transcript_error": transcript_error,
                     "transcript_updated_label": _format_datetime(_row_optional_text(existing, "transcript_updated_at")),
                     "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=recording_id),
@@ -2441,6 +2445,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     suggestion_source = str(row["suggestion_source"] or "") if row else ""
     suggestion_text = str(row["suggestion_text"] or "") if row else ""
     transcript_text = _row_optional_text(row, "transcript_text")
+    display_transcript_text = _display_transcript_text(transcript_text)
     transcript_source = _row_optional_text(row, "transcript_source")
     transcript_error = _row_optional_text(row, "transcript_error")
     transcript_updated_at = _row_optional_text(row, "transcript_updated_at")
@@ -2484,9 +2489,9 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "suggestion_source": suggestion_source,
         "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
         "suggestion_text": suggestion_text,
-        "transcript_text": transcript_text,
-        "transcript_excerpt": _compact_transcript_excerpt(transcript_text, 900),
-        "transcript_preview": _testimony_display_transcript_preview(transcript_text, suggestion_source, suggestion_text, 900),
+        "transcript_text": display_transcript_text,
+        "transcript_excerpt": _compact_transcript_excerpt(display_transcript_text, 900),
+        "transcript_preview": _testimony_display_transcript_preview(display_transcript_text, suggestion_source, suggestion_text, 900),
         "transcript_source": transcript_source,
         "transcript_source_label": _testimony_transcript_source_label(transcript_source),
         "transcript_error": transcript_error,
@@ -2992,11 +2997,11 @@ def _testimony_suggestion_source_label(source: str) -> str:
 
 
 def _testimony_display_transcript_preview(transcript_text: str, suggestion_source: str, suggestion_text: str, limit: int = 900) -> str:
-    transcript_excerpt = _compact_transcript_excerpt(transcript_text, limit)
+    transcript_excerpt = _compact_transcript_excerpt(_display_transcript_text(transcript_text), limit)
     if transcript_excerpt:
         return transcript_excerpt
     if suggestion_source in {"transcript_intro", "transcript_excerpt"}:
-        return _compact_transcript_excerpt(suggestion_text, limit)
+        return _compact_transcript_excerpt(_display_transcript_text(suggestion_text), limit)
     return ""
 
 
@@ -3747,10 +3752,23 @@ def _speaker_key(value: str) -> str:
 
 
 def _compact_transcript_excerpt(text: str, limit: int = 360) -> str:
-    excerpt = " ".join((text or "").split())
+    excerpt = " ".join(_display_transcript_text(text).split())
     if len(excerpt) <= limit:
         return excerpt
     return excerpt[: limit - 1].rstrip() + "..."
+
+
+def _display_transcript_text(text: str) -> str:
+    chunks = []
+    for chunk in re.split(r"\n{2,}", str(text or "")):
+        cleaned = re.sub(r"^\[(?:start|\+\d+s)\]\s*", "", chunk.strip())
+        if not cleaned or cleaned == "[no transcription returned]":
+            continue
+        chunks.append(cleaned)
+    if chunks:
+        return "\n\n".join(chunks)
+    cleaned = re.sub(r"(?m)^\[(?:start|\+\d+s)\]\s*", "", str(text or ""))
+    return cleaned.replace("[no transcription returned]", "").strip()
 
 
 def _format_duration(seconds: float | None) -> str:
