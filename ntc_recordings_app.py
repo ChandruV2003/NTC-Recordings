@@ -1346,6 +1346,10 @@ def _init_db(db_path: str) -> None:
         _ensure_column(connection, "testimony_reviews", "quarantined_from_path", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "quarantined_path", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "quarantined_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_agent_kind", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_agent_action", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_agent_reason", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_agent_updated_at", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             """
             UPDATE testimony_reviews
@@ -2360,12 +2364,17 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                        transcript_text,
                        transcript_source,
                        transcript_at,
+                       classification,
+                       status,
                        agent_decision_json,
                        agent_review_reason
                 FROM recorder_files
-                WHERE classification = 'testimony_candidate'
-                  AND status = 'staged'
-                  AND staged_path <> ''
+                WHERE staged_path <> ''
+                  AND status IN ('staged', 'source_cleared')
+                  AND (
+                      classification = 'testimony_candidate'
+                      OR COALESCE(agent_decision_json, '') <> ''
+                  )
                 ORDER BY last_seen_at DESC
                 """
             ).fetchall()
@@ -2393,23 +2402,68 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                         decision = parsed
                 except json.JSONDecodeError:
                     decision = {}
-            service_date = _normalize_date(str(decision.get("service_date") or "")) or candidate.recording_date
+            agent_kind_raw = str(decision.get("recording_kind") or decision.get("kind") or "").strip().lower()
+            agent_kind = _normalize_recording_kind(agent_kind_raw)
+            if agent_kind == "unsure":
+                agent_kind = agent_kind_raw
+            agent_action = str(decision.get("action") or "").strip().lower()
+            agent_reason = str(row["agent_review_reason"] or decision.get("reason") or decision.get("notes") or "").strip()
+            if not agent_kind and str(row["classification"] or "") == "testimony_candidate":
+                agent_kind = "testimony"
+            service_date = _normalize_date(str(decision.get("service_date") or "")) or (str(existing["service_date"] or "") if existing else "") or candidate.recording_date
             suggested_speaker = _valid_person_name_suggestion(str(decision.get("speaker") or ""), known_speakers)
+            existing_status = str(existing["status"] or "") if existing else ""
+            if existing_status in TESTIMONY_REVIEW_STATUSES:
+                review_status = existing_status
+            elif agent_kind in {"message", "worship", "event"}:
+                review_status = "message_review"
+            elif str(row["classification"] or "") == "message_candidate":
+                review_status = "message_review"
+            else:
+                review_status = "needs_review"
+            if existing and str(existing["testimony_title"] or ""):
+                review_title = str(existing["testimony_title"] or "")
+            elif review_status == "message_review" and agent_kind == "worship":
+                review_title = "Worship Recording Needs Review"
+            elif review_status == "message_review":
+                review_title = "Message / Event Needs Review"
+            else:
+                review_title = ""
             if not existing:
                 _save_testimony_review(
                     app,
                     recording_id=candidate.id,
                     source_path=candidate.path,
-                    status="needs_review",
+                    status=review_status,
                     service_date=service_date,
                     speaker_name="",
-                    testimony_title="",
+                    testimony_title=review_title,
                     notes="",
                     proposed_path="",
                     duration_seconds=row["duration_seconds"],
                     suggested_speaker=suggested_speaker,
                     suggestion_source="recorder_manifest" if suggested_speaker else "",
                     suggestion_text=_compact_transcript_excerpt(str(row["transcript_text"] or "")) if suggested_speaker else "",
+                    recorder_agent_kind=agent_kind,
+                    recorder_agent_action=agent_action,
+                    recorder_agent_reason=agent_reason,
+                )
+                existing = _testimony_review_row(app, candidate.id)
+            else:
+                _save_testimony_review(
+                    app,
+                    recording_id=candidate.id,
+                    source_path=candidate.path,
+                    status=review_status,
+                    service_date=service_date,
+                    speaker_name=str(existing["speaker_name"] or ""),
+                    testimony_title=review_title,
+                    notes=str(existing["notes"] or ""),
+                    proposed_path=str(existing["proposed_path"] or ""),
+                    duration_seconds=row["duration_seconds"],
+                    recorder_agent_kind=agent_kind,
+                    recorder_agent_action=agent_action,
+                    recorder_agent_reason=agent_reason,
                 )
                 existing = _testimony_review_row(app, candidate.id)
             if row["transcript_text"] and (not existing or not _row_optional_text(existing, "transcript_text")):
@@ -2452,6 +2506,10 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     quarantined_from_path = _row_optional_text(row, "quarantined_from_path")
     quarantined_path = _row_optional_text(row, "quarantined_path")
     quarantined_at = _row_optional_text(row, "quarantined_at")
+    recorder_agent_kind = _row_optional_text(row, "recorder_agent_kind")
+    recorder_agent_action = _row_optional_text(row, "recorder_agent_action")
+    recorder_agent_reason = _row_optional_text(row, "recorder_agent_reason")
+    recorder_agent_updated_at = _row_optional_text(row, "recorder_agent_updated_at")
     if not suggested_speaker and not speaker_name:
         suggested_speaker = _testimony_filename_speaker_suggestion(Path(candidate.path))
         if suggested_speaker:
@@ -2502,6 +2560,13 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "quarantined_path": quarantined_path,
         "quarantined_at": quarantined_at,
         "quarantined_label": _format_datetime(quarantined_at),
+        "recorder_agent_kind": recorder_agent_kind,
+        "recorder_agent_kind_label": _recorder_agent_kind_label(recorder_agent_kind),
+        "recorder_agent_action": recorder_agent_action,
+        "recorder_agent_action_label": _recorder_agent_action_label(recorder_agent_action),
+        "recorder_agent_reason": recorder_agent_reason,
+        "recorder_agent_updated_at": recorder_agent_updated_at,
+        "recorder_agent_updated_label": _format_datetime(recorder_agent_updated_at),
         "duration_seconds": duration_seconds,
         "duration_label": _format_duration(duration_seconds),
         "size_label": _human_size(candidate.size_bytes),
@@ -2992,6 +3057,7 @@ def _testimony_suggestion_source_label(source: str) -> str:
         "transcript_intro": "from transcript",
         "transcript_excerpt": "from transcript",
         "history": "from confirmed history",
+        "recorder_manifest": "from recorder pipeline",
     }
     return labels.get(source, source.replace("_", " ") if source else "")
 
@@ -3012,6 +3078,29 @@ def _testimony_transcript_source_label(source: str) -> str:
     return labels.get(source, source.replace("_", " ") if source else "")
 
 
+def _recorder_agent_kind_label(kind: str) -> str:
+    normalized = re.sub(r"[^a-z]+", "_", str(kind or "").strip().lower()).strip("_")
+    labels = {
+        "message": "Message",
+        "message_candidate": "Message",
+        "testimony": "Testimony",
+        "testimony_candidate": "Testimony",
+        "worship": "Worship",
+        "worship_candidate": "Worship",
+        "noise": "Noise / Snippet",
+        "noise_or_snippet": "Noise / Snippet",
+        "snippet": "Noise / Snippet",
+        "unknown": "Needs Review",
+        "unsure": "Needs Review",
+    }
+    return labels.get(normalized, normalized.replace("_", " ").title() if normalized else "")
+
+
+def _recorder_agent_action_label(action: str) -> str:
+    normalized = re.sub(r"[^a-z]+", "_", str(action or "").strip().lower()).strip("_")
+    return normalized.replace("_", " ").title() if normalized else ""
+
+
 def _save_testimony_review(
     app: Flask,
     *,
@@ -3027,12 +3116,20 @@ def _save_testimony_review(
     suggested_speaker: str | None = None,
     suggestion_source: str | None = None,
     suggestion_text: str | None = None,
+    recorder_agent_kind: str | None = None,
+    recorder_agent_action: str | None = None,
+    recorder_agent_reason: str | None = None,
 ) -> None:
     update_suggestion = suggested_speaker is not None or suggestion_source is not None or suggestion_text is not None
     suggested_speaker_value = suggested_speaker or ""
     suggestion_source_value = suggestion_source or ""
     suggestion_text_value = suggestion_text or ""
     suggestion_updated_at = _utc_now() if update_suggestion and (suggested_speaker_value or suggestion_source_value or suggestion_text_value) else ""
+    update_agent = recorder_agent_kind is not None or recorder_agent_action is not None or recorder_agent_reason is not None
+    recorder_agent_kind_value = recorder_agent_kind or ""
+    recorder_agent_action_value = recorder_agent_action or ""
+    recorder_agent_reason_value = recorder_agent_reason or ""
+    recorder_agent_updated_at = _utc_now() if update_agent and (recorder_agent_kind_value or recorder_agent_action_value or recorder_agent_reason_value) else ""
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute(
             """
@@ -3050,9 +3147,13 @@ def _save_testimony_review(
                 suggestion_source,
                 suggestion_text,
                 suggestion_updated_at,
+                recorder_agent_kind,
+                recorder_agent_action,
+                recorder_agent_reason,
+                recorder_agent_updated_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(recording_id) DO UPDATE SET
                 source_path = excluded.source_path,
                 status = excluded.status,
@@ -3066,6 +3167,10 @@ def _save_testimony_review(
                 suggestion_source = CASE WHEN ? THEN excluded.suggestion_source ELSE suggestion_source END,
                 suggestion_text = CASE WHEN ? THEN excluded.suggestion_text ELSE suggestion_text END,
                 suggestion_updated_at = CASE WHEN ? THEN excluded.suggestion_updated_at ELSE suggestion_updated_at END,
+                recorder_agent_kind = CASE WHEN ? THEN excluded.recorder_agent_kind ELSE recorder_agent_kind END,
+                recorder_agent_action = CASE WHEN ? THEN excluded.recorder_agent_action ELSE recorder_agent_action END,
+                recorder_agent_reason = CASE WHEN ? THEN excluded.recorder_agent_reason ELSE recorder_agent_reason END,
+                recorder_agent_updated_at = CASE WHEN ? THEN excluded.recorder_agent_updated_at ELSE recorder_agent_updated_at END,
                 updated_at = excluded.updated_at
             """,
             (
@@ -3082,11 +3187,19 @@ def _save_testimony_review(
                 suggestion_source_value,
                 suggestion_text_value,
                 suggestion_updated_at,
+                recorder_agent_kind_value,
+                recorder_agent_action_value,
+                recorder_agent_reason_value,
+                recorder_agent_updated_at,
                 _utc_now(),
                 1 if update_suggestion else 0,
                 1 if update_suggestion else 0,
                 1 if update_suggestion else 0,
                 1 if update_suggestion else 0,
+                1 if update_agent else 0,
+                1 if update_agent else 0,
+                1 if update_agent else 0,
+                1 if update_agent else 0,
             ),
         )
 
@@ -6120,6 +6233,18 @@ TESTIMONY_REVIEW_TEMPLATE = """
                             <strong>{{ item.event_group }}</strong>
                             <small>Grouped clips save into this event when marked grouped.</small>
                           </div>
+                        </div>
+                      {% endif %}
+                      {% if item.recorder_agent_kind %}
+                        <div class="suggestion-panel subdued agent-decision-panel">
+                          <div>
+                            <span>Agent Decision</span>
+                            <strong>{{ item.recorder_agent_kind_label }}</strong>
+                            {% if item.recorder_agent_reason %}<small>{{ item.recorder_agent_reason }}</small>{% endif %}
+                          </div>
+                          {% if item.recorder_agent_action_label %}
+                            <small>{{ item.recorder_agent_action_label }}</small>
+                          {% endif %}
                         </div>
                       {% endif %}
                       {% if item.suggested_speaker %}
