@@ -3200,6 +3200,46 @@ def _json_list(value: str) -> list:
         return []
 
 
+def _humanize_classifier_evidence(value: object) -> str:
+    """Turn internal classifier rules into reviewer-facing explanations."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "No strong signal"
+
+    prefix, separator, rule = raw.partition(":")
+    prefix_key = re.sub(r"[^a-z]+", " ", prefix.lower()).strip()
+    haystack = f"{prefix_key} {rule or raw}".lower()
+
+    labels: list[str] = []
+    if "testimony language" in prefix_key or "testif" in haystack:
+        labels.append("Testimony language detected")
+    if "my testimony" in haystack or "share" in haystack and "testimony" in haystack:
+        labels.append("Speaker refers to sharing a testimony")
+    if "god " in haystack and re.search(r"\b(?:has|had|did|was)\b", haystack):
+        labels.append("Personal experience language detected")
+    if "worship language" in prefix_key or "praise the lord" in haystack:
+        labels.append("Praise or worship language detected")
+    if any(word in haystack for word in ("sing", "song", "chorus", "verse")):
+        labels.append("Singing or song language detected")
+    if "message language" in prefix_key or "we " in haystack and any(word in haystack for word in ("have", "need", "must")):
+        labels.append("Teaching or exhortation language detected")
+    if "duration" in haystack and any(marker in haystack for marker in ("<=", "short", "45")):
+        labels.append("Very short recording")
+    if "existing classifier marked" in haystack:
+        kind = haystack.rsplit("marked", 1)[-1].strip().replace("_", " ")
+        labels.append(f"Initial classifier: {kind.title()}")
+
+    if labels:
+        return "; ".join(dict.fromkeys(labels))
+
+    looks_like_rule = any(token in raw for token in (r"\b", "(?:", "\\d", "|", "[", "]"))
+    if separator and looks_like_rule:
+        return f"{prefix_key.title()} detected"
+    if looks_like_rule:
+        return "Language pattern detected"
+    return re.sub(r"\s+", " ", raw).strip().rstrip(".;")
+
+
 def _recorder_segment_rows(value: str) -> list[dict]:
     rows = []
     for segment in _json_list(value):
@@ -3213,9 +3253,9 @@ def _recorder_segment_rows(value: str) -> list[dict]:
         time_label = _format_duration(start if isinstance(start, (int, float)) else None)
         if isinstance(end, (int, float)):
             time_label = f"{time_label} - {_format_duration(end)}"
-        evidence_label = "; ".join(str(item) for item in evidence[:2]) or "No evidence detail"
+        evidence_label = "; ".join(_humanize_classifier_evidence(item) for item in evidence[:2]) or "No strong signal"
         if isinstance(confidence, (int, float)):
-            evidence_label = f"{round(confidence * 100)}% - {evidence_label}"
+            evidence_label = f"{round(confidence * 100)}% confidence · {evidence_label}"
         rows.append(
             {
                 "kind": kind,
@@ -6476,7 +6516,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                                 <div class="segment-row">
                                   <div><small>Time</small><b>{{ segment.time_label }}</b></div>
                                   <div><small>Kind</small><b>{{ segment.kind_label }}</b></div>
-                                  <div><small>Evidence</small><b>{{ segment.evidence_label }}</b></div>
+                                  <div><small>Signals</small><b>{{ segment.evidence_label }}</b></div>
                                 </div>
                               {% endfor %}
                             </div>

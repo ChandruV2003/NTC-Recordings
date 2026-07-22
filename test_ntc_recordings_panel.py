@@ -12,6 +12,7 @@ from ntc_recordings_app import (
     _date_from_file_metadata,
     _display_transcript_text,
     _extract_intro_speaker,
+    _humanize_classifier_evidence,
     _normalize_recording_email_message,
     _recording_id,
     _testimony_filename_speaker_suggestion,
@@ -1510,6 +1511,28 @@ class RecordingRequestPanelTests(unittest.TestCase):
         os.utime(raw_recording, (service_timestamp, service_timestamp))
 
         self.assertEqual(_date_from_file_metadata(raw_recording.stat()), "2026-06-10")
+
+    def test_classifier_evidence_is_human_readable(self):
+        raw = r"testimony language: \btestif(?:y|ies|ied|ying)\b"
+
+        label = _humanize_classifier_evidence(raw)
+
+        self.assertEqual(label, "Testimony language detected")
+        self.assertNotIn(r"\b", label)
+        self.assertNotIn("(?:", label)
+
+    def test_classifier_evidence_combines_plain_language_signals(self):
+        raw = r"worship language: \bpraise the lord\b"
+
+        self.assertEqual(
+            _humanize_classifier_evidence(raw),
+            "Praise or worship language detected",
+        )
+
+        self.assertEqual(
+            _humanize_classifier_evidence(r"personal experience: \bgod (has|had|did|was)\b"),
+            "Personal experience language detected",
+        )
 
 
 if __name__ == "__main__":
