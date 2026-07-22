@@ -1350,6 +1350,13 @@ def _init_db(db_path: str) -> None:
         _ensure_column(connection, "testimony_reviews", "recorder_agent_action", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "recorder_agent_reason", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "recorder_agent_updated_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_segment_kind", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_segment_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "testimony_reviews", "recorder_segment_likelihood", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(connection, "testimony_reviews", "recorder_segments_json", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_segment_reasons", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_segment_warnings", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_segment_updated_at", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             """
             UPDATE testimony_reviews
@@ -1372,6 +1379,15 @@ def _ensure_column(connection: sqlite3.Connection, table: str, column: str, defi
     existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _sqlite_table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    return bool(
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+    )
 
 
 def _insert_request(
@@ -2357,25 +2373,51 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
         try:
             manifest = sqlite3.connect(str(manifest_path))
             manifest.row_factory = sqlite3.Row
+            has_segment_analysis = _sqlite_table_exists(manifest, "recorder_segment_analysis")
+            segment_select = (
+                "COALESCE(sa.file_kind, '') AS recorder_segment_kind, "
+                "COALESCE(sa.segment_count, 0) AS recorder_segment_count, "
+                "COALESCE(sa.combined_likelihood, 0) AS recorder_segment_likelihood, "
+                "COALESCE(sa.segments_json, '') AS recorder_segments_json, "
+                "COALESCE(sa.reasons_json, '') AS recorder_segment_reasons, "
+                "COALESCE(sa.warnings_json, '') AS recorder_segment_warnings"
+                if has_segment_analysis
+                else "'' AS recorder_segment_kind, 0 AS recorder_segment_count, "
+                "0 AS recorder_segment_likelihood, '' AS recorder_segments_json, "
+                "'' AS recorder_segment_reasons, '' AS recorder_segment_warnings"
+            )
+            segment_join = (
+                "LEFT JOIN recorder_segment_analysis sa ON sa.recorder_file_id = rf.id"
+                if has_segment_analysis
+                else ""
+            )
+            segment_filter = (
+                "OR COALESCE(sa.file_kind, '') IN ('testimony', 'message', 'worship', 'combined')"
+                if has_segment_analysis
+                else ""
+            )
             rows = manifest.execute(
-                """
-                SELECT staged_path,
-                       duration_seconds,
-                       transcript_text,
-                       transcript_source,
-                       transcript_at,
-                       classification,
-                       status,
-                       agent_decision_json,
-                       agent_review_reason
-                FROM recorder_files
-                WHERE staged_path <> ''
-                  AND status IN ('staged', 'source_cleared')
+                f"""
+                SELECT rf.staged_path,
+                       rf.duration_seconds,
+                       rf.transcript_text,
+                       rf.transcript_source,
+                       rf.transcript_at,
+                       rf.classification,
+                       rf.status,
+                       rf.agent_decision_json,
+                       rf.agent_review_reason,
+                       {segment_select}
+                FROM recorder_files rf
+                {segment_join}
+                WHERE rf.staged_path <> ''
+                  AND rf.status IN ('staged', 'source_cleared')
                   AND (
-                      classification = 'testimony_candidate'
-                      OR COALESCE(agent_decision_json, '') <> ''
+                      rf.classification = 'testimony_candidate'
+                      OR COALESCE(rf.agent_decision_json, '') <> ''
+                      {segment_filter}
                   )
-                ORDER BY last_seen_at DESC
+                ORDER BY rf.last_seen_at DESC
                 """
             ).fetchall()
         except sqlite3.Error:
@@ -2447,6 +2489,12 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                     recorder_agent_kind=agent_kind,
                     recorder_agent_action=agent_action,
                     recorder_agent_reason=agent_reason,
+                    recorder_segment_kind=str(row["recorder_segment_kind"] or ""),
+                    recorder_segment_count=int(row["recorder_segment_count"] or 0),
+                    recorder_segment_likelihood=float(row["recorder_segment_likelihood"] or 0),
+                    recorder_segments_json=str(row["recorder_segments_json"] or ""),
+                    recorder_segment_reasons=str(row["recorder_segment_reasons"] or ""),
+                    recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
                 )
                 existing = _testimony_review_row(app, candidate.id)
             else:
@@ -2464,6 +2512,12 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                     recorder_agent_kind=agent_kind,
                     recorder_agent_action=agent_action,
                     recorder_agent_reason=agent_reason,
+                    recorder_segment_kind=str(row["recorder_segment_kind"] or ""),
+                    recorder_segment_count=int(row["recorder_segment_count"] or 0),
+                    recorder_segment_likelihood=float(row["recorder_segment_likelihood"] or 0),
+                    recorder_segments_json=str(row["recorder_segments_json"] or ""),
+                    recorder_segment_reasons=str(row["recorder_segment_reasons"] or ""),
+                    recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
                 )
                 existing = _testimony_review_row(app, candidate.id)
             if row["transcript_text"] and (not existing or not _row_optional_text(existing, "transcript_text")):
@@ -2510,6 +2564,20 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     recorder_agent_action = _row_optional_text(row, "recorder_agent_action")
     recorder_agent_reason = _row_optional_text(row, "recorder_agent_reason")
     recorder_agent_updated_at = _row_optional_text(row, "recorder_agent_updated_at")
+    recorder_segment_kind = _row_optional_text(row, "recorder_segment_kind")
+    recorder_segment_count_text = _row_optional_text(row, "recorder_segment_count")
+    recorder_segment_likelihood_text = _row_optional_text(row, "recorder_segment_likelihood")
+    try:
+        recorder_segment_count = int(recorder_segment_count_text or 0)
+    except ValueError:
+        recorder_segment_count = 0
+    try:
+        recorder_segment_likelihood = float(recorder_segment_likelihood_text or 0)
+    except ValueError:
+        recorder_segment_likelihood = 0
+    recorder_segment_reasons = [str(item) for item in _json_list(_row_optional_text(row, "recorder_segment_reasons"))]
+    recorder_segment_warnings = [str(item) for item in _json_list(_row_optional_text(row, "recorder_segment_warnings"))]
+    recorder_segment_rows = _recorder_segment_rows(_row_optional_text(row, "recorder_segments_json"))
     if not suggested_speaker and not speaker_name:
         suggested_speaker = _testimony_filename_speaker_suggestion(Path(candidate.path))
         if suggested_speaker:
@@ -2567,6 +2635,14 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "recorder_agent_reason": recorder_agent_reason,
         "recorder_agent_updated_at": recorder_agent_updated_at,
         "recorder_agent_updated_label": _format_datetime(recorder_agent_updated_at),
+        "recorder_segment_kind": recorder_segment_kind,
+        "recorder_segment_kind_label": _recorder_segment_kind_label(recorder_segment_kind),
+        "recorder_segment_count": recorder_segment_count,
+        "recorder_segment_likelihood": recorder_segment_likelihood,
+        "recorder_segment_likelihood_label": f"{round(recorder_segment_likelihood * 100)}%" if recorder_segment_likelihood else "",
+        "recorder_segment_reasons": recorder_segment_reasons,
+        "recorder_segment_warnings": recorder_segment_warnings,
+        "recorder_segment_rows": recorder_segment_rows,
         "duration_seconds": duration_seconds,
         "duration_label": _format_duration(duration_seconds),
         "size_label": _human_size(candidate.size_bytes),
@@ -3101,6 +3177,56 @@ def _recorder_agent_action_label(action: str) -> str:
     return normalized.replace("_", " ").title() if normalized else ""
 
 
+def _recorder_segment_kind_label(kind: str) -> str:
+    normalized = re.sub(r"[^a-z]+", "_", str(kind or "").strip().lower()).strip("_")
+    labels = {
+        "message": "Message",
+        "testimony": "Testimony",
+        "worship": "Worship",
+        "noise": "Noise / Snippet",
+        "combined": "Combined Recording",
+        "unknown": "Needs Review",
+    }
+    return labels.get(normalized, normalized.replace("_", " ").title() if normalized else "")
+
+
+def _json_list(value: str) -> list:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def _recorder_segment_rows(value: str) -> list[dict]:
+    rows = []
+    for segment in _json_list(value):
+        if not isinstance(segment, dict):
+            continue
+        kind = str(segment.get("kind") or "unknown")
+        start = segment.get("start_seconds")
+        end = segment.get("end_seconds")
+        evidence = segment.get("evidence") if isinstance(segment.get("evidence"), list) else []
+        confidence = segment.get("confidence")
+        time_label = _format_duration(start if isinstance(start, (int, float)) else None)
+        if isinstance(end, (int, float)):
+            time_label = f"{time_label} - {_format_duration(end)}"
+        evidence_label = "; ".join(str(item) for item in evidence[:2]) or "No evidence detail"
+        if isinstance(confidence, (int, float)):
+            evidence_label = f"{round(confidence * 100)}% - {evidence_label}"
+        rows.append(
+            {
+                "kind": kind,
+                "kind_label": _recorder_segment_kind_label(kind),
+                "time_label": time_label,
+                "evidence_label": evidence_label,
+            }
+        )
+    return rows
+
+
 def _save_testimony_review(
     app: Flask,
     *,
@@ -3119,6 +3245,12 @@ def _save_testimony_review(
     recorder_agent_kind: str | None = None,
     recorder_agent_action: str | None = None,
     recorder_agent_reason: str | None = None,
+    recorder_segment_kind: str | None = None,
+    recorder_segment_count: int | None = None,
+    recorder_segment_likelihood: float | None = None,
+    recorder_segments_json: str | None = None,
+    recorder_segment_reasons: str | None = None,
+    recorder_segment_warnings: str | None = None,
 ) -> None:
     update_suggestion = suggested_speaker is not None or suggestion_source is not None or suggestion_text is not None
     suggested_speaker_value = suggested_speaker or ""
@@ -3130,6 +3262,21 @@ def _save_testimony_review(
     recorder_agent_action_value = recorder_agent_action or ""
     recorder_agent_reason_value = recorder_agent_reason or ""
     recorder_agent_updated_at = _utc_now() if update_agent and (recorder_agent_kind_value or recorder_agent_action_value or recorder_agent_reason_value) else ""
+    update_segment = (
+        recorder_segment_kind is not None
+        or recorder_segment_count is not None
+        or recorder_segment_likelihood is not None
+        or recorder_segments_json is not None
+        or recorder_segment_reasons is not None
+        or recorder_segment_warnings is not None
+    )
+    recorder_segment_kind_value = recorder_segment_kind or ""
+    recorder_segment_count_value = int(recorder_segment_count or 0)
+    recorder_segment_likelihood_value = float(recorder_segment_likelihood or 0)
+    recorder_segments_json_value = recorder_segments_json or ""
+    recorder_segment_reasons_value = recorder_segment_reasons or ""
+    recorder_segment_warnings_value = recorder_segment_warnings or ""
+    recorder_segment_updated_at = _utc_now() if update_segment and recorder_segment_kind_value else ""
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute(
             """
@@ -3151,9 +3298,16 @@ def _save_testimony_review(
                 recorder_agent_action,
                 recorder_agent_reason,
                 recorder_agent_updated_at,
+                recorder_segment_kind,
+                recorder_segment_count,
+                recorder_segment_likelihood,
+                recorder_segments_json,
+                recorder_segment_reasons,
+                recorder_segment_warnings,
+                recorder_segment_updated_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(recording_id) DO UPDATE SET
                 source_path = excluded.source_path,
                 status = excluded.status,
@@ -3171,6 +3325,13 @@ def _save_testimony_review(
                 recorder_agent_action = CASE WHEN ? THEN excluded.recorder_agent_action ELSE recorder_agent_action END,
                 recorder_agent_reason = CASE WHEN ? THEN excluded.recorder_agent_reason ELSE recorder_agent_reason END,
                 recorder_agent_updated_at = CASE WHEN ? THEN excluded.recorder_agent_updated_at ELSE recorder_agent_updated_at END,
+                recorder_segment_kind = CASE WHEN ? THEN excluded.recorder_segment_kind ELSE recorder_segment_kind END,
+                recorder_segment_count = CASE WHEN ? THEN excluded.recorder_segment_count ELSE recorder_segment_count END,
+                recorder_segment_likelihood = CASE WHEN ? THEN excluded.recorder_segment_likelihood ELSE recorder_segment_likelihood END,
+                recorder_segments_json = CASE WHEN ? THEN excluded.recorder_segments_json ELSE recorder_segments_json END,
+                recorder_segment_reasons = CASE WHEN ? THEN excluded.recorder_segment_reasons ELSE recorder_segment_reasons END,
+                recorder_segment_warnings = CASE WHEN ? THEN excluded.recorder_segment_warnings ELSE recorder_segment_warnings END,
+                recorder_segment_updated_at = CASE WHEN ? THEN excluded.recorder_segment_updated_at ELSE recorder_segment_updated_at END,
                 updated_at = excluded.updated_at
             """,
             (
@@ -3191,6 +3352,13 @@ def _save_testimony_review(
                 recorder_agent_action_value,
                 recorder_agent_reason_value,
                 recorder_agent_updated_at,
+                recorder_segment_kind_value,
+                recorder_segment_count_value,
+                recorder_segment_likelihood_value,
+                recorder_segments_json_value,
+                recorder_segment_reasons_value,
+                recorder_segment_warnings_value,
+                recorder_segment_updated_at,
                 _utc_now(),
                 1 if update_suggestion else 0,
                 1 if update_suggestion else 0,
@@ -3200,6 +3368,13 @@ def _save_testimony_review(
                 1 if update_agent else 0,
                 1 if update_agent else 0,
                 1 if update_agent else 0,
+                1 if update_segment else 0,
+                1 if update_segment else 0,
+                1 if update_segment else 0,
+                1 if update_segment else 0,
+                1 if update_segment else 0,
+                1 if update_segment else 0,
+                1 if update_segment else 0,
             ),
         )
 
@@ -5983,6 +6158,37 @@ TESTIMONY_REVIEW_TEMPLATE = """
         color:var(--muted);
         line-height:1.45;
       }
+      .segment-shape-panel {
+        border-color:rgba(249,168,212,.28);
+        background:rgba(249,168,212,.055);
+      }
+      .segment-shape-panel .shape-note {
+        grid-column:1 / -1;
+        color:var(--muted);
+        line-height:1.42;
+      }
+      .segment-list {
+        grid-column:1 / -1;
+        display:grid;
+        gap:.45rem;
+      }
+      .segment-row {
+        display:grid;
+        grid-template-columns:minmax(6rem,.4fr) minmax(5rem,.3fr) minmax(0,1fr);
+        gap:.55rem;
+        border:1px solid rgba(143,211,255,.14);
+        border-radius:13px;
+        background:rgba(4,11,20,.32);
+        padding:.55rem;
+      }
+      .segment-row b {
+        display:block;
+        color:#f3f7fb;
+        font-size:.9rem;
+      }
+      .segment-row small {
+        margin:0;
+      }
       .transcript-panel {
         grid-template-columns:minmax(0,1fr);
         border-color:rgba(143,211,255,.18);
@@ -6039,6 +6245,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .review-row { grid-template-columns:2.3rem minmax(0,1fr); }
         .wide { grid-column:auto; }
         .suggestion-panel { grid-template-columns:1fr; }
+        .segment-row { grid-template-columns:1fr; }
         .button-row, .button-row button, .toolbar-actions, .probe-form, .probe-form input, .probe-form button { width:100%; }
       }
     </style>
@@ -6244,6 +6451,35 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           </div>
                           {% if item.recorder_agent_action_label %}
                             <small>{{ item.recorder_agent_action_label }}</small>
+                          {% endif %}
+                        </div>
+                      {% endif %}
+                      {% if item.recorder_segment_kind %}
+                        <div class="suggestion-panel subdued segment-shape-panel">
+                          <div>
+                            <span>Recording Shape</span>
+                            <strong>{{ item.recorder_segment_kind_label }}</strong>
+                            {% if item.recorder_segment_kind == "combined" and item.recorder_segment_likelihood_label %}
+                              <small>Split review likely: {{ item.recorder_segment_likelihood_label }}</small>
+                            {% elif item.recorder_segment_count %}
+                              <small>{{ item.recorder_segment_count }} segment{{ "" if item.recorder_segment_count == 1 else "s" }} detected</small>
+                            {% endif %}
+                          </div>
+                          {% if item.recorder_segment_warnings %}
+                            <div class="shape-note">{{ item.recorder_segment_warnings[0] }}</div>
+                          {% elif item.recorder_segment_reasons %}
+                            <div class="shape-note">{{ item.recorder_segment_reasons[0] }}</div>
+                          {% endif %}
+                          {% if item.recorder_segment_rows %}
+                            <div class="segment-list">
+                              {% for segment in item.recorder_segment_rows[:4] %}
+                                <div class="segment-row">
+                                  <div><small>Time</small><b>{{ segment.time_label }}</b></div>
+                                  <div><small>Kind</small><b>{{ segment.kind_label }}</b></div>
+                                  <div><small>Evidence</small><b>{{ segment.evidence_label }}</b></div>
+                                </div>
+                              {% endfor %}
+                            </div>
                           {% endif %}
                         </div>
                       {% endif %}
