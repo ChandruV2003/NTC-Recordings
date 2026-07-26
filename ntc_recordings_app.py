@@ -2414,6 +2414,7 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                   AND rf.status IN ('staged', 'source_cleared')
                   AND (
                       rf.classification = 'testimony_candidate'
+                      OR rf.classification IN ('unknown', 'message_candidate', 'worship_candidate', 'combined_candidate')
                       OR COALESCE(rf.agent_decision_json, '') <> ''
                       {segment_filter}
                   )

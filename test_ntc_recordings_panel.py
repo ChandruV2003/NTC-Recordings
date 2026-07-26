@@ -1504,6 +1504,74 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(audio.data, b"external-review-audio")
         audio.close()
 
+    def test_recorder_review_imports_unknown_manifest_rows_after_transcription_failure(self):
+        intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
+        review_root = intake_root / "TestimonyReviewQueue"
+        staged_root = intake_root / "DN700R-primary"
+        review_root.mkdir(parents=True)
+        staged_root.mkdir(parents=True)
+        raw_recording = staged_root / "07262026120053_DN-700R.mp3"
+        raw_recording.write_bytes(b"unresolved-recorder-audio")
+        manifest_path = Path(self.tempdir.name) / "manifest.sqlite3"
+        with sqlite3.connect(manifest_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE recorder_files (
+                    staged_path TEXT NOT NULL,
+                    duration_seconds REAL,
+                    transcript_text TEXT NOT NULL DEFAULT '',
+                    transcript_source TEXT NOT NULL DEFAULT '',
+                    transcript_at TEXT NOT NULL DEFAULT '',
+                    classification TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    agent_decision_json TEXT NOT NULL DEFAULT '',
+                    agent_review_reason TEXT NOT NULL DEFAULT '',
+                    last_seen_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO recorder_files (
+                    staged_path,
+                    duration_seconds,
+                    classification,
+                    status,
+                    last_seen_at
+                ) VALUES (?, ?, 'unknown', 'staged', ?)
+                """,
+                (str(raw_recording), 237.144, datetime.now(timezone.utc).isoformat()),
+            )
+
+        db_path = Path(self.tempdir.name) / "unknown-manifest-requests.db"
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "unknown-manifest-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(db_path),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(review_root),
+                "NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS": str(intake_root),
+                "NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS": str(manifest_path),
+                "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
+                "NTC_RECORDINGS_TESTIMONY_REJECTED_DIR": str(self.rejected_root),
+                "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
+            }
+        )
+        client = app.test_client()
+        client.post("/admin/login", data={"password": "admin-password"})
+
+        response = client.get("/admin/recorder-review?status=all&sort=newest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(raw_recording.name.encode(), response.data)
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute(
+                "SELECT status FROM testimony_reviews WHERE source_path = ?",
+                (str(raw_recording),),
+            ).fetchone()
+        self.assertEqual(row, ("needs_review",))
+
     def test_metadata_dates_use_local_church_day(self):
         raw_recording = self.root / "REC00494.mp3"
         raw_recording.write_bytes(b"evening-service-audio")
