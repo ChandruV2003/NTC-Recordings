@@ -15,6 +15,7 @@ from ntc_recordings_app import (
     _humanize_classifier_evidence,
     _normalize_recording_email_message,
     _recording_id,
+    _run_testimony_transcript_job,
     _sanitize_existing_testimony_transcript_errors,
     _sanitize_existing_testimony_transcripts,
     _testimony_filename_speaker_suggestion,
@@ -697,11 +698,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(audio.status_code, 200)
         self.assertEqual(audio.data, b"raw-testimony-audio")
 
-        with patch(
-            "ntc_recordings_app._transcribe_testimony_intro",
-            return_value=("For those of you who do not know me, my name is Kevin. I want to thank the Lord.", ""),
-        ):
-            suggested = self.client.post(
+        with patch("ntc_recordings_app._start_testimony_transcript_job", return_value=True) as starter:
+            queued = self.client.post(
                 f"/admin/testimonies/{recording_id}/suggest",
                 data={
                     "status_filter": "needs_review",
@@ -709,11 +707,27 @@ class RecordingRequestPanelTests(unittest.TestCase):
                     "source_path": str(raw_recording),
                     "service_date": "2026-04-19",
                 },
-                follow_redirects=True,
+                headers={"Accept": "application/json", "X-Requested-With": "fetch"},
             )
 
+        self.assertEqual(queued.status_code, 202)
+        self.assertTrue(queued.get_json()["analysis_queued"])
+        self.assertIn("Recorder analysis queued", queued.get_json()["message"])
+        starter.assert_called_once()
+        self.assertEqual(starter.call_args.kwargs["recording_ids"], {recording_id})
+
+        with patch(
+            "ntc_recordings_app._transcribe_testimony_review_excerpt",
+            return_value=("For those of you who do not know me, my name is Kevin. I want to thank the Lord.", ""),
+        ):
+            _run_testimony_transcript_job(
+                self.app,
+                limit=1,
+                statuses={"needs_review"},
+                recording_ids={recording_id},
+            )
+        suggested = self.client.get("/admin/recorder-review")
         self.assertEqual(suggested.status_code, 200)
-        self.assertIn(b"Suggested speaker: Kevin.", suggested.data)
         self.assertIn(b"Suggested Speaker", suggested.data)
         self.assertIn(b"Kevin", suggested.data)
         self.assertIn(b"from transcript", suggested.data)
@@ -735,7 +749,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIsNotNone(suggestion_row)
         self.assertEqual(suggestion_row[0], "needs_review")
         self.assertEqual(suggestion_row[1], "Kevin")
-        self.assertEqual(suggestion_row[2], "transcript_intro")
+        self.assertEqual(suggestion_row[2], "transcript_excerpt")
         self.assertIn("my name is Kevin", suggestion_row[3])
 
         with patch("ntc_recordings_app._probe_audio_duration", return_value=65):
@@ -752,7 +766,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 (recording_id,),
             ).fetchone()
         self.assertEqual(preserved_suggestion_row[0], "Kevin")
-        self.assertEqual(preserved_suggestion_row[1], "transcript_intro")
+        self.assertEqual(preserved_suggestion_row[1], "transcript_excerpt")
         self.assertIn("my name is Kevin", preserved_suggestion_row[2])
         self.assertEqual(preserved_suggestion_row[3], 65)
 
@@ -1105,6 +1119,37 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertTrue(payload["source_label"].endswith(".mp3"))
         self.assertFalse(raw_recording.exists())
         self.assertEqual(Path(payload["source_path"]).read_bytes(), b"fake-mp3-audio")
+
+    def test_recorder_intake_file_can_be_saved_to_testimony_library(self):
+        intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
+        recorder_root = intake_root / "DN700R-primary"
+        recorder_root.mkdir(parents=True)
+        raw_recording = recorder_root / "07262026115900_DN-700R.mp3"
+        raw_recording.write_bytes(b"recorder-intake-audio")
+        recording_id = _recording_id(raw_recording)
+        self.app.config["NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS"] = str(intake_root)
+
+        self._login()
+        response = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "status": "identified",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2026-07-26",
+                "speaker_name": "Jeffrey Paul Johnson",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertFalse(raw_recording.exists())
+        saved_path = Path(payload["source_path"])
+        self.assertTrue(saved_path.exists())
+        self.assertEqual(saved_path.parent, self.testimony_root / "2026" / "Sunday Testimonies")
+        self.assertEqual(saved_path.name, "July 26, 2026 - Jeffrey Paul Johnson's Testimony.mp3")
 
     def test_testimony_review_ajax_auth_failure_returns_json(self):
         response = self.client.post(

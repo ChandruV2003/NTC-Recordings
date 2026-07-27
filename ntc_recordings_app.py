@@ -393,6 +393,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.testimony_suggestion_job = _initial_testimony_suggestion_job_state()
     app.testimony_transcript_job_lock = threading.Lock()
     app.testimony_transcript_job = _initial_testimony_transcript_job_state()
+    app.testimony_transcript_pending_ids: set[str] = set()
 
     @app.context_processor
     def _recordings_url_context():
@@ -793,56 +794,23 @@ def create_app(test_config: dict | None = None) -> Flask:
             duration_seconds=duration_seconds,
         )
 
-        transcript_text = ""
-        transcript_error = ""
-        try:
-            transcript_text, transcript_error = _transcribe_testimony_review_excerpt(app, Path(candidate.path))
-            if not transcript_text:
-                transcript_error = transcript_error or "Transcript was empty."
-        except Exception as exc:
-            transcript_error = f"Transcript failed: {exc}"
-            app.logger.exception("testimony row transcript failed for %s", candidate.path)
-        transcript_source = "transcript_excerpt" if transcript_text else ""
-        _save_testimony_transcript(
+        transcript_text = _row_optional_text(existing, "transcript_text")
+        transcript_error = _row_optional_text(existing, "transcript_error")
+        started = _start_testimony_transcript_job(
             app,
-            recording_id,
-            transcript_text=transcript_text,
-            transcript_source=transcript_source,
-            transcript_error=transcript_error,
+            limit=1,
+            statuses={"needs_review", "message_review", "identified", "grouped", "already_named"},
+            recording_ids={recording_id},
         )
-
-        if transcript_text:
-            known_speakers = _testimony_known_speakers(app)
-            transcript_speaker = _valid_person_name_suggestion(_extract_intro_speaker(transcript_text, known_speakers), known_speakers)
-            if transcript_speaker:
-                suggested_speaker = transcript_speaker
-            if transcript_speaker or not suggestion_source:
-                suggestion_source = "transcript_excerpt"
-                suggestion_text = _compact_transcript_excerpt(transcript_text)
-                _save_testimony_review(
-                    app,
-                    recording_id=recording_id,
-                    source_path=candidate.path,
-                    status="identified" if status == "already_named" else status,
-                    service_date=service_date,
-                    speaker_name=speaker_name,
-                    testimony_title=testimony_title,
-                    notes=notes,
-                    proposed_path=proposed_path,
-                    duration_seconds=duration_seconds,
-                    suggested_speaker=suggested_speaker,
-                    suggestion_source=suggestion_source,
-                    suggestion_text=suggestion_text,
-                )
-
-        message = "Analysis completed." if transcript_text else transcript_error or "Analysis was not saved."
+        message = "Recorder analysis queued." if started else "Recorder analysis queued behind the current analysis job."
         if _wants_json_response():
             display_transcript_text = _display_transcript_text(transcript_text)
             response = jsonify(
                 {
-                    "ok": bool(transcript_text),
+                    "ok": True,
+                    "analysis_queued": True,
                     "message": message,
-                    "error": "" if transcript_text else message,
+                    "error": "",
                     "recording_id": recording_id,
                     "status": "identified" if status == "already_named" else status,
                     "status_label": _testimony_status_label(status),
@@ -866,14 +834,13 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "review_url": _recordings_url_for(app, "update_testimony_review", recording_id=recording_id),
                 }
             )
-            return (response, 200 if transcript_text else 500)
+            return response, 202
         return _redirect_to(
             app,
             "testimony_review",
             status=current_filter,
             sort=request.form.get("sort") or "shortest",
-            message=message if transcript_text else None,
-            error=None if transcript_text else message,
+            message=message,
         )
 
     @app.post("/admin/testimonies/quarantine")
@@ -908,82 +875,7 @@ def create_app(test_config: dict | None = None) -> Flask:
 
     @app.post("/admin/testimonies/<recording_id>/suggest")
     def suggest_testimony_speaker(recording_id: str):
-        guard = _require_admin()
-        if guard:
-            return guard
-        current_filter = (request.form.get("status_filter") or "needs_review").strip().lower()
-        if current_filter == "already_named":
-            current_filter = "identified"
-        if current_filter not in TESTIMONY_REVIEW_FILTERS:
-            current_filter = "needs_review"
-        candidate = _testimony_source_recording_from_form(app, recording_id)
-        if not candidate:
-            if _wants_json_response():
-                return jsonify({"ok": False, "error": "Recorder source file was not found."}), 404
-            return _redirect_to(app, "testimony_review", status=current_filter, error="Recorder source file was not found.")
-
-        existing = _testimony_review_row(app, recording_id)
-        duration_seconds = _row_duration(existing) if existing else _probe_audio_duration(Path(candidate.path))
-        service_date = (
-            _normalize_date((request.form.get("service_date") or "").strip())
-            or (str(existing["service_date"] or "") if existing else "")
-            or candidate.recording_date
-            or ""
-        )
-        speaker_name = (request.form.get("speaker_name") or "").strip() or (str(existing["speaker_name"] or "") if existing else "")
-        testimony_title = _testimony_title_for_speaker(speaker_name) if speaker_name else (str(existing["testimony_title"] or "") if existing else "")
-        notes = str(existing["notes"] or "") if existing else ""
-        proposed_path = str(existing["proposed_path"] or "") if existing else ""
-        status = str(existing["status"] or "") if existing else _testimony_status_for_candidate(app, candidate, None, duration_seconds)
-        if status not in TESTIMONY_REVIEW_STATUSES:
-            status = "needs_review"
-
-        suggested_speaker, suggestion_source, suggestion_text, suggestion_error = _generate_testimony_speaker_suggestion(app, candidate)
-        _save_testimony_review(
-            app,
-            recording_id=recording_id,
-            source_path=candidate.path,
-            status="identified" if status == "already_named" else status,
-            service_date=service_date,
-            speaker_name=speaker_name,
-            testimony_title=testimony_title,
-            notes=notes,
-            proposed_path=proposed_path,
-            duration_seconds=duration_seconds,
-            suggested_speaker=suggested_speaker,
-            suggestion_source=suggestion_source,
-            suggestion_text=suggestion_text,
-        )
-        if suggested_speaker:
-            message = f"Suggested speaker: {suggested_speaker}."
-        else:
-            message = suggestion_error or "No speaker suggestion found."
-        if _wants_json_response():
-            transcript_text = _row_optional_text(existing, "transcript_text")
-            display_transcript_text = _display_transcript_text(transcript_text)
-            return jsonify(
-                {
-                    "ok": True,
-                    "message": message,
-                    "recording_id": recording_id,
-                    "suggested_speaker": suggested_speaker,
-                    "suggestion_source": suggestion_source,
-                    "suggestion_source_label": _testimony_suggestion_source_label(suggestion_source),
-                    "suggestion_text": suggestion_text,
-                    "transcript_text": display_transcript_text,
-                    "transcript_excerpt": _compact_transcript_excerpt(display_transcript_text, 900),
-                    "transcript_preview": _testimony_display_transcript_preview(display_transcript_text, suggestion_source, suggestion_text, 900),
-                    "transcript_error": _row_optional_text(existing, "transcript_error"),
-                    "transcript_updated_label": _format_datetime(_row_optional_text(existing, "transcript_updated_at")),
-                }
-            )
-        return _redirect_to(
-            app,
-            "testimony_review",
-            status=current_filter,
-            sort=request.form.get("sort") or "shortest",
-            message=message,
-        )
+        return transcribe_testimony_recording(recording_id)
 
     @app.post("/admin/testimonies/<recording_id>/review")
     def update_testimony_review(recording_id: str):
@@ -3089,9 +2981,16 @@ def _update_testimony_transcript_job(app: Flask, **updates) -> None:
         app.testimony_transcript_job = state
 
 
-def _start_testimony_transcript_job(app: Flask, limit: int | None = None, statuses: set[str] | None = None) -> bool:
+def _start_testimony_transcript_job(
+    app: Flask,
+    limit: int | None = None,
+    statuses: set[str] | None = None,
+    recording_ids: set[str] | None = None,
+) -> bool:
+    requested_ids = {str(recording_id) for recording_id in (recording_ids or set()) if str(recording_id)}
     with app.testimony_transcript_job_lock:
         if app.testimony_transcript_job.get("state") == "running":
+            app.testimony_transcript_pending_ids.update(requested_ids)
             return False
         app.testimony_transcript_job = {
             **_initial_testimony_transcript_job_state(),
@@ -3099,40 +2998,87 @@ def _start_testimony_transcript_job(app: Flask, limit: int | None = None, status
             "started_at": _utc_now(),
             "message": "Scanning for missing recorder analysis.",
         }
-    thread = threading.Thread(target=_run_testimony_transcript_job, args=(app, limit, statuses), name="testimony-transcript-job", daemon=True)
+    thread = threading.Thread(
+        target=_run_testimony_transcript_job,
+        args=(app, limit, statuses, requested_ids),
+        name="testimony-transcript-job",
+        daemon=True,
+    )
     thread.start()
     return True
 
 
-def _run_testimony_transcript_job(app: Flask, limit: int | None = None, statuses: set[str] | None = None) -> None:
+def _run_testimony_transcript_job(
+    app: Flask,
+    limit: int | None = None,
+    statuses: set[str] | None = None,
+    recording_ids: set[str] | None = None,
+) -> None:
     try:
         with app.app_context():
-            targets = _testimony_transcript_targets(app, limit, statuses=statuses)
+            targets = _testimony_transcript_targets(app, limit, statuses=statuses, recording_ids=recording_ids)
             _update_testimony_transcript_job(app, total=len(targets), message=f"Analyzing {len(targets)} recordings with missing transcripts.")
             processed = saved = errors = 0
-            for target in targets:
+            processed_ids: set[str] = set()
+            target_index = 0
+            while True:
+                if target_index >= len(targets):
+                    with app.testimony_transcript_job_lock:
+                        pending_ids = set(app.testimony_transcript_pending_ids)
+                        app.testimony_transcript_pending_ids.clear()
+                        if not pending_ids:
+                            app.testimony_transcript_job = {
+                                **app.testimony_transcript_job,
+                                "state": "finished",
+                                "finished_at": _utc_now(),
+                                "current": "",
+                                "message": f"Finished. Saved {saved}; errors {errors}.",
+                            }
+                            break
+                    pending_ids.difference_update(processed_ids)
+                    if not pending_ids:
+                        continue
+                    pending_targets = _testimony_transcript_targets(
+                        app,
+                        statuses={"needs_review", "message_review", "identified", "grouped", "already_named"},
+                        recording_ids=pending_ids,
+                    )
+                    targets.extend(pending_targets)
+                    _update_testimony_transcript_job(
+                        app,
+                        total=len(targets),
+                        message=f"Analyzing {len(targets)} recordings with missing transcripts.",
+                    )
+                    continue
+
+                target = targets[target_index]
+                target_index += 1
                 row = target["row"]
                 candidate = target["candidate"]
+                processed_ids.add(str(row["recording_id"]))
                 _update_testimony_transcript_job(app, current=Path(candidate.path).name)
-                transcript_text = ""
+                transcript_text = _display_transcript_text(_row_optional_text(row, "transcript_text"))
                 transcript_error = ""
-                try:
-                    transcript_text, transcript_error = _transcribe_testimony_review_excerpt(app, Path(candidate.path))
-                    if transcript_text:
-                        saved += 1
-                    else:
+                if transcript_text:
+                    saved += 1
+                else:
+                    try:
+                        transcript_text, transcript_error = _transcribe_testimony_review_excerpt(app, Path(candidate.path))
+                        if transcript_text:
+                            saved += 1
+                        else:
+                            errors += 1
+                            transcript_error = transcript_error or "Transcript was empty."
+                    except Exception as exc:
                         errors += 1
-                        transcript_error = transcript_error or "Transcript was empty."
-                except Exception as exc:
-                    errors += 1
-                    transcript_error = f"Transcript failed: {exc}"
-                    app.logger.exception("testimony transcript failed for %s", candidate.path)
+                        transcript_error = f"Transcript failed: {exc}"
+                        app.logger.exception("testimony transcript failed for %s", candidate.path)
                 recording_id = str(row["recording_id"])
                 _save_testimony_transcript(
                     app,
                     recording_id=recording_id,
                     transcript_text=transcript_text,
-                    transcript_source="transcript_excerpt" if transcript_text else "",
+                    transcript_source=_row_optional_text(row, "transcript_source") or ("transcript_excerpt" if transcript_text else ""),
                     transcript_error=transcript_error,
                 )
                 if transcript_text and not str(row["speaker_name"] or ""):
@@ -3163,13 +3109,6 @@ def _run_testimony_transcript_job(app: Flask, limit: int | None = None, statuses
                     errors=errors,
                     message=f"Analyzed {processed} of {len(targets)} recordings.",
                 )
-            _update_testimony_transcript_job(
-                app,
-                state="finished",
-                finished_at=_utc_now(),
-                current="",
-                message=f"Finished. Saved {saved}; errors {errors}.",
-            )
     except Exception as exc:
         app.logger.exception("testimony transcript job failed")
         _update_testimony_transcript_job(
@@ -3195,15 +3134,23 @@ def _testimony_transcript_statuses_for_filter(status_filter: str) -> set[str]:
     return {"identified", "already_named"}
 
 
-def _testimony_transcript_targets(app: Flask, limit: int | None = None, statuses: set[str] | None = None) -> list[dict]:
+def _testimony_transcript_targets(
+    app: Flask,
+    limit: int | None = None,
+    statuses: set[str] | None = None,
+    recording_ids: set[str] | None = None,
+) -> list[dict]:
     rows = _testimony_review_rows(app)
     targets = []
     skipped = 0
     target_statuses = statuses or {"message_review", "identified", "grouped", "already_named"}
+    target_ids = {str(recording_id) for recording_id in (recording_ids or set()) if str(recording_id)}
     for row in rows.values():
+        if target_ids and str(row["recording_id"]) not in target_ids:
+            continue
         if str(row["status"] or "") not in target_statuses:
             continue
-        if _display_transcript_text(_row_optional_text(row, "transcript_text")):
+        if not target_ids and _display_transcript_text(_row_optional_text(row, "transcript_text")):
             skipped += 1
             continue
         candidate = _testimony_candidate_from_review_row(app, row)
@@ -3212,7 +3159,7 @@ def _testimony_transcript_targets(app: Flask, limit: int | None = None, statuses
             continue
         targets.append({"row": row, "candidate": candidate})
     targets.sort(key=lambda item: (str(item["row"]["service_date"] or ""), str(item["row"]["speaker_name"] or ""), Path(item["candidate"].path).name))
-    if limit:
+    if limit is not None:
         targets = targets[: max(0, limit)]
     _update_testimony_transcript_job(app, skipped=skipped)
     return targets
@@ -3776,10 +3723,9 @@ def _rename_testimony_recording(
 ) -> tuple[RecordingCandidate, str, str]:
     source_path = Path(candidate.path)
     proposed_path = Path(_proposed_testimony_path(app, source_path, service_date, speaker_name, testimony_title))
-    message_root = _message_recording_root(app)
     testimony_root = _testimony_recording_root(app)
-    source_root = _testimony_source_root(app)
-    if not _path_within(source_path, source_root) and not _path_within(source_path, message_root) and not _path_within(source_path, testimony_root):
+    allowed_source_roots = _unique_paths([*_testimony_allowed_roots(app), _message_recording_root(app)])
+    if not any(_path_within(source_path, root) for root in allowed_source_roots):
         return candidate, str(proposed_path), "Source file is outside the testimony recording folder."
     if not _path_within(proposed_path, testimony_root):
         return candidate, str(proposed_path), "Proposed testimony filename is outside TestimonyRecordings."
@@ -7040,7 +6986,11 @@ TESTIMONY_REVIEW_TEMPLATE = """
         const text = await response.text();
         return {
           ok: false,
-          error: text.trim().startsWith("<") ? `The server returned a page instead of a testimony update (HTTP ${response.status}). Sign in again if the admin page expired, then retry.` : `The server response was not JSON (HTTP ${response.status}).`,
+          error: response.status === 504
+            ? "Recorder analysis exceeded the gateway timeout. It was not saved; retry after the current analysis job finishes."
+            : text.trim().startsWith("<")
+              ? `The server returned a page instead of a recorder update (HTTP ${response.status}). Sign in again if the admin page expired, then retry.`
+              : `The server response was not JSON (HTTP ${response.status}).`,
         };
       }
 
@@ -7137,6 +7087,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
           updateReviewCard(card, data);
           if (data.suggested_speaker || data.suggestion_source || data.suggestion_text || data.transcript_preview || data.transcript_text || data.transcript_error) {
             renderSuggestion(card, data);
+          }
+          if (data.analysis_queued) {
+            pollTranscriptJob();
           }
         } catch (error) {
           showBanner(error.message || "The testimony update failed.", true);
