@@ -18,6 +18,7 @@ from ntc_recordings_app import (
     _run_testimony_transcript_job,
     _sanitize_existing_testimony_transcript_errors,
     _sanitize_existing_testimony_transcripts,
+    _sync_testimony_recorder_manifest_reviews,
     _testimony_filename_speaker_suggestion,
     _testimony_looks_like_message_recording,
     _testimony_suggestion_targets,
@@ -1977,6 +1978,190 @@ class RecordingRequestPanelTests(unittest.TestCase):
             retried_row["transcript_error"],
             "Automatic transcription is busy. This recording remains queued for retry.",
         )
+
+    def test_cached_transcript_is_reclassified_by_recorder_agent(self):
+        review_root = self.root / "TestimonyReviewQueue"
+        review_root.mkdir()
+        recording = review_root / "07262026115900_DN-700R.mp3"
+        recording.write_bytes(b"cached-transcript-audio")
+        recording_id = _recording_id(recording)
+        transcript = (
+            "Praise the Lord. I want to thank and praise God for bringing me through "
+            "this trial and for answering our family's prayers."
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    transcript_text,
+                    transcript_source,
+                    recorder_agent_kind,
+                    recorder_agent_action,
+                    recorder_agent_reason,
+                    recorder_agent_updated_at,
+                    updated_at
+                )
+                VALUES (?, ?, 'needs_review', '2026-07-26', ?, 'recorder_manifest',
+                        'message', 'review', 'Legacy manifest decision.', ?, ?)
+                """,
+                (
+                    recording_id,
+                    str(recording),
+                    transcript,
+                    "2026-07-26T18:00:00+00:00",
+                    "2026-07-26T18:00:00+00:00",
+                ),
+            )
+
+        self.app.config["NTC_RECORDINGS_AGENT_URL"] = "http://agent.test"
+        agent_response = Mock()
+        agent_response.raise_for_status.return_value = None
+        agent_response.json.return_value = {
+            "ok": True,
+            "recording_kind": "testimony",
+            "action": "review",
+            "reasons": ["Personal testimony evidence was found."],
+            "speaker": "",
+        }
+        with patch("ntc_recordings_app.requests.post", return_value=agent_response) as post:
+            _run_testimony_transcript_job(
+                self.app,
+                statuses={"needs_review"},
+                recording_ids={recording_id},
+            )
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT recorder_agent_kind, recorder_agent_action,
+                       recorder_agent_reason, transcript_text
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            ).fetchone()
+        self.assertEqual(row["recorder_agent_kind"], "testimony")
+        self.assertEqual(row["recorder_agent_action"], "review")
+        self.assertIn("recorder-review-v2", row["recorder_agent_reason"])
+        self.assertIn("Personal testimony evidence", row["recorder_agent_reason"])
+        self.assertEqual(row["transcript_text"], transcript)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["classification"], "message_candidate")
+        self.assertEqual(payload["transcript_text"], transcript)
+
+    def test_newer_recorder_review_decision_survives_stale_manifest_sync(self):
+        intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
+        review_root = intake_root / "TestimonyReviewQueue"
+        staged_root = intake_root / "DN700R-primary"
+        review_root.mkdir(parents=True)
+        staged_root.mkdir(parents=True)
+        raw_recording = staged_root / "07262026115900_DN-700R.mp3"
+        raw_recording.write_bytes(b"stale-manifest-audio")
+        manifest_path = Path(self.tempdir.name) / "stale-decision-manifest.sqlite3"
+        stale_decision = {
+            "action": "review",
+            "recording_kind": "message",
+            "reason": "Legacy duration-based decision.",
+        }
+        with sqlite3.connect(manifest_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE recorder_files (
+                    staged_path TEXT NOT NULL,
+                    duration_seconds REAL,
+                    transcript_text TEXT NOT NULL DEFAULT '',
+                    transcript_source TEXT NOT NULL DEFAULT '',
+                    transcript_at TEXT NOT NULL DEFAULT '',
+                    classification TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    matched_path TEXT NOT NULL DEFAULT '',
+                    matched_kind TEXT NOT NULL DEFAULT '',
+                    agent_decision_json TEXT NOT NULL DEFAULT '',
+                    agent_decision_at TEXT NOT NULL DEFAULT '',
+                    agent_review_reason TEXT NOT NULL DEFAULT '',
+                    last_seen_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO recorder_files (
+                    staged_path,
+                    duration_seconds,
+                    transcript_text,
+                    transcript_source,
+                    transcript_at,
+                    classification,
+                    status,
+                    agent_decision_json,
+                    agent_decision_at,
+                    agent_review_reason,
+                    last_seen_at
+                )
+                VALUES (?, 98.0, ?, 'local_transcription', ?, 'message_candidate',
+                        'staged', ?, ?, 'Legacy duration-based decision.', ?)
+                """,
+                (
+                    str(raw_recording),
+                    "I want to thank and praise God for answering my prayer.",
+                    "2026-07-26T18:00:00+00:00",
+                    json.dumps(stale_decision),
+                    "2026-07-26T18:00:00+00:00",
+                    "2026-07-26T18:00:00+00:00",
+                ),
+            )
+
+        db_path = Path(self.tempdir.name) / "stale-decision-requests.db"
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "stale-decision-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(db_path),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(review_root),
+                "NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS": str(intake_root),
+                "NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS": str(manifest_path),
+                "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
+                "NTC_RECORDINGS_TESTIMONY_REJECTED_DIR": str(self.rejected_root),
+            }
+        )
+        _sync_testimony_recorder_manifest_reviews(app)
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                """
+                UPDATE testimony_reviews
+                SET recorder_agent_kind = 'testimony',
+                    recorder_agent_action = 'review',
+                    recorder_agent_reason = 'recorder-review-v2: Personal testimony evidence.',
+                    recorder_agent_updated_at = '2026-07-27T18:00:00+00:00',
+                    updated_at = '2026-07-27T18:00:00+00:00'
+                WHERE source_path = ?
+                """,
+                (str(raw_recording),),
+            )
+
+        _sync_testimony_recorder_manifest_reviews(app)
+
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT recorder_agent_kind, recorder_agent_action,
+                       recorder_agent_reason, recorder_agent_updated_at
+                FROM testimony_reviews
+                WHERE source_path = ?
+                """,
+                (str(raw_recording),),
+            ).fetchone()
+        self.assertEqual(row["recorder_agent_kind"], "testimony")
+        self.assertEqual(row["recorder_agent_action"], "review")
+        self.assertIn("recorder-review-v2", row["recorder_agent_reason"])
+        self.assertEqual(row["recorder_agent_updated_at"], "2026-07-27T18:00:00+00:00")
 
     def test_recorder_review_reconciles_promoted_testimony_as_identified(self):
         intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"

@@ -55,6 +55,7 @@ DEFAULT_TESTIMONY_RECORDER_MANIFESTS = "/app/data/autosyncmix/recorders/DN700R/m
 DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rejected"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
+RECORDER_REVIEW_ANALYSIS_VERSION = "recorder-review-v2"
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
 TESTIMONY_REVIEW_STATUSES = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"}
 TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate"}
@@ -350,6 +351,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS", "240")),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS", "384")),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT", "30")),
+        NTC_RECORDINGS_AGENT_URL=os.getenv("NTC_RECORDINGS_AGENT_URL", ""),
+        NTC_RECORDINGS_AGENT_TOKEN=os.getenv("NTC_RECORDINGS_AGENT_TOKEN", ""),
+        NTC_RECORDINGS_AGENT_TIMEOUT=float(os.getenv("NTC_RECORDINGS_AGENT_TIMEOUT", "30")),
         NTC_RECORDINGS_INDEX_REFRESH_SECONDS=float(
             os.getenv(
                 "NTC_RECORDINGS_INDEX_REFRESH_SECONDS",
@@ -2352,7 +2356,16 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> set[str]:
         try:
             manifest = sqlite3.connect(str(manifest_path))
             manifest.row_factory = sqlite3.Row
+            manifest_columns = {
+                str(row["name"])
+                for row in manifest.execute("PRAGMA table_info(recorder_files)").fetchall()
+            }
             has_segment_analysis = _sqlite_table_exists(manifest, "recorder_segment_analysis")
+            agent_updated_select = (
+                "rf.agent_decision_at"
+                if "agent_decision_at" in manifest_columns
+                else "'' AS agent_decision_at"
+            )
             segment_select = (
                 "COALESCE(sa.file_kind, '') AS recorder_segment_kind, "
                 "COALESCE(sa.segment_count, 0) AS recorder_segment_count, "
@@ -2387,6 +2400,7 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> set[str]:
                        rf.classification,
                        rf.status,
                        rf.agent_decision_json,
+                       {agent_updated_select},
                        rf.agent_review_reason,
                        {segment_select}
                 FROM recorder_files rf
@@ -2484,6 +2498,20 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> set[str]:
                 else _valid_person_name_suggestion(str(decision.get("speaker") or ""), known_speakers)
             )
             existing_status = str(existing["status"] or "") if existing else ""
+            existing_agent_updated_at = _row_optional_text(existing, "recorder_agent_updated_at")
+            manifest_agent_updated_at = str(row["agent_decision_at"] or "")
+            preserve_existing_agent = bool(
+                existing
+                and existing_agent_updated_at
+                and (
+                    not manifest_agent_updated_at
+                    or _timestamp_is_newer(existing_agent_updated_at, manifest_agent_updated_at)
+                )
+            )
+            if preserve_existing_agent:
+                agent_kind = _row_optional_text(existing, "recorder_agent_kind")
+                agent_action = _row_optional_text(existing, "recorder_agent_action")
+                agent_reason = _row_optional_text(existing, "recorder_agent_reason")
             if archived_testimony:
                 review_status = "identified"
             elif existing_status in TESTIMONY_REVIEW_STATUSES:
@@ -2543,9 +2571,9 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> set[str]:
                     notes=str(existing["notes"] or ""),
                     proposed_path=proposed_path,
                     duration_seconds=row["duration_seconds"],
-                    recorder_agent_kind=agent_kind,
-                    recorder_agent_action=agent_action,
-                    recorder_agent_reason=agent_reason,
+                    recorder_agent_kind=None if preserve_existing_agent else agent_kind,
+                    recorder_agent_action=None if preserve_existing_agent else agent_action,
+                    recorder_agent_reason=None if preserve_existing_agent else agent_reason,
                     recorder_segment_kind=str(row["recorder_segment_kind"] or ""),
                     recorder_segment_count=int(row["recorder_segment_count"] or 0),
                     recorder_segment_likelihood=float(row["recorder_segment_likelihood"] or 0),
@@ -2808,7 +2836,10 @@ def _automatic_review_analysis_ids(items: Iterable[dict], limit: int = 20) -> se
     for item in items:
         transcript_text = _display_transcript_text(str(item.get("transcript_text") or ""))
         transcript_error = str(item.get("transcript_error") or "")
-        if transcript_text and not transcript_error:
+        agent_reason = str(item.get("recorder_agent_reason") or "")
+        manual_type_confirmed = agent_reason == "Classification confirmed in Recorder Review."
+        current_analysis = RECORDER_REVIEW_ANALYSIS_VERSION in agent_reason
+        if transcript_text and not transcript_error and (manual_type_confirmed or current_analysis):
             continue
         updated_at = str(item.get("transcript_updated_at") or "")
         if transcript_error and updated_at:
@@ -3076,6 +3107,72 @@ def _initial_testimony_transcript_job_state() -> dict:
     }
 
 
+def _classify_recorder_review_transcript(
+    app: Flask,
+    *,
+    row: sqlite3.Row,
+    candidate: RecordingCandidate,
+    transcript_text: str,
+) -> dict | None:
+    transcript_text = _display_transcript_text(transcript_text)
+    agent_url = str(app.config.get("NTC_RECORDINGS_AGENT_URL") or "").strip().rstrip("/")
+    if not transcript_text or not agent_url:
+        return None
+    if not agent_url.endswith("/api/agent/recording-decision"):
+        agent_url = f"{agent_url}/api/agent/recording-decision"
+
+    existing_kind = _row_optional_text(row, "recorder_agent_kind")
+    classification = {
+        "message": "message_candidate",
+        "testimony": "testimony_candidate",
+        "worship": "worship_candidate",
+        "noise": "noise_or_snippet",
+    }.get(existing_kind, existing_kind or "unknown")
+    payload = {
+        "classification": classification,
+        "transcript_text": transcript_text,
+        "duration_seconds": _row_duration(row),
+        "service_date": str(row["service_date"] or candidate.recording_date or ""),
+        "speaker_name": str(row["speaker_name"] or ""),
+        "filename": Path(candidate.path).name,
+        "source_relative_path": str(candidate.relative_path or Path(candidate.path).name),
+    }
+    headers = {"Accept": "application/json"}
+    agent_token = str(app.config.get("NTC_RECORDINGS_AGENT_TOKEN") or "").strip()
+    if agent_token:
+        headers["Authorization"] = f"Bearer {agent_token}"
+    try:
+        response = requests.post(
+            agent_url,
+            json=payload,
+            headers=headers,
+            timeout=float(app.config.get("NTC_RECORDINGS_AGENT_TIMEOUT") or 30),
+        )
+        response.raise_for_status()
+        result = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        app.logger.warning("Recorder analysis request failed for %s: %s", candidate.path, exc)
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+
+    recording_kind = _normalize_recording_kind(str(result.get("recording_kind") or ""))
+    if recording_kind not in {"testimony", "message", "worship"}:
+        recording_kind = "unknown"
+    reasons = result.get("reasons")
+    if isinstance(reasons, list):
+        reason = "; ".join(str(value).strip() for value in reasons if str(value).strip())
+    else:
+        reason = str(result.get("reason") or "").strip()
+    reason = f"{RECORDER_REVIEW_ANALYSIS_VERSION}: {reason or 'Automatic transcript classification completed.'}"
+    return {
+        "recording_kind": recording_kind,
+        "action": str(result.get("action") or "review").strip().lower() or "review",
+        "reason": reason,
+        "speaker": str(result.get("speaker") or "").strip(),
+    }
+
+
 def _testimony_transcript_job_status(app: Flask) -> dict:
     lock = getattr(app, "testimony_transcript_job_lock", None)
     if lock:
@@ -3127,7 +3224,7 @@ def _run_testimony_transcript_job(
     try:
         with app.app_context():
             targets = _testimony_transcript_targets(app, limit, statuses=statuses, recording_ids=recording_ids)
-            _update_testimony_transcript_job(app, total=len(targets), message=f"Analyzing {len(targets)} recordings with missing transcripts.")
+            _update_testimony_transcript_job(app, total=len(targets), message=f"Analyzing {len(targets)} recordings.")
             processed = saved = errors = 0
             processed_ids: set[str] = set()
             target_index = 0
@@ -3157,7 +3254,7 @@ def _run_testimony_transcript_job(
                     _update_testimony_transcript_job(
                         app,
                         total=len(targets),
-                        message=f"Analyzing {len(targets)} recordings with missing transcripts.",
+                        message=f"Analyzing {len(targets)} recordings.",
                     )
                     continue
 
@@ -3191,26 +3288,46 @@ def _run_testimony_transcript_job(
                     transcript_source=_row_optional_text(row, "transcript_source") or ("transcript_excerpt" if transcript_text else ""),
                     transcript_error=transcript_error,
                 )
+                agent_decision = _classify_recorder_review_transcript(
+                    app,
+                    row=row,
+                    candidate=candidate,
+                    transcript_text=transcript_text,
+                )
+                known_speakers = _testimony_known_speakers(app)
+                transcript_speaker = ""
+                existing_suggestion = _valid_person_name_suggestion(
+                    str(row["suggested_speaker"] or ""),
+                    known_speakers,
+                )
                 if transcript_text and not str(row["speaker_name"] or ""):
-                    known_speakers = _testimony_known_speakers(app)
                     transcript_speaker = _valid_person_name_suggestion(_extract_intro_speaker(transcript_text, known_speakers), known_speakers)
-                    existing_suggestion = _valid_person_name_suggestion(str(row["suggested_speaker"] or ""), known_speakers)
-                    if transcript_speaker or not str(row["suggestion_source"] or ""):
-                        _save_testimony_review(
-                            app,
-                            recording_id=recording_id,
-                            source_path=str(row["source_path"] or candidate.path),
-                            status=str(row["status"] or "needs_review"),
-                            service_date=str(row["service_date"] or candidate.recording_date or ""),
-                            speaker_name=str(row["speaker_name"] or ""),
-                            testimony_title=str(row["testimony_title"] or ""),
-                            notes=str(row["notes"] or ""),
-                            proposed_path=str(row["proposed_path"] or ""),
-                            duration_seconds=_row_duration(row),
-                            suggested_speaker=transcript_speaker or existing_suggestion,
-                            suggestion_source="transcript_excerpt",
-                            suggestion_text=_compact_transcript_excerpt(transcript_text),
-                        )
+                if agent_decision or transcript_speaker or not str(row["suggestion_source"] or ""):
+                    decision_speaker = _valid_person_name_suggestion(
+                        str((agent_decision or {}).get("speaker") or ""),
+                        known_speakers,
+                    )
+                    decision_kind = str((agent_decision or {}).get("recording_kind") or "")
+                    decision_action = str((agent_decision or {}).get("action") or "")
+                    decision_reason = str((agent_decision or {}).get("reason") or "")
+                    _save_testimony_review(
+                        app,
+                        recording_id=recording_id,
+                        source_path=str(row["source_path"] or candidate.path),
+                        status=str(row["status"] or "needs_review"),
+                        service_date=str(row["service_date"] or candidate.recording_date or ""),
+                        speaker_name=str(row["speaker_name"] or ""),
+                        testimony_title=str(row["testimony_title"] or ""),
+                        notes=str(row["notes"] or ""),
+                        proposed_path=str(row["proposed_path"] or ""),
+                        duration_seconds=_row_duration(row),
+                        suggested_speaker=decision_speaker or transcript_speaker or existing_suggestion,
+                        suggestion_source="recorder_agent" if decision_speaker else "transcript_excerpt",
+                        suggestion_text=_compact_transcript_excerpt(transcript_text),
+                        recorder_agent_kind=decision_kind or None,
+                        recorder_agent_action=decision_action or None,
+                        recorder_agent_reason=decision_reason or None,
+                    )
                 processed += 1
                 _update_testimony_transcript_job(
                     app,
@@ -3584,6 +3701,22 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
                 transcript_source = ?,
                 transcript_error = ?,
                 transcript_updated_at = ?,
+                recorder_agent_kind = CASE
+                    WHEN recorder_agent_reason = ? AND ? <> ? THEN ''
+                    ELSE recorder_agent_kind
+                END,
+                recorder_agent_action = CASE
+                    WHEN recorder_agent_reason = ? AND ? <> ? THEN ''
+                    ELSE recorder_agent_action
+                END,
+                recorder_agent_reason = CASE
+                    WHEN recorder_agent_reason = ? AND ? <> ? THEN ''
+                    ELSE recorder_agent_reason
+                END,
+                recorder_agent_updated_at = CASE
+                    WHEN recorder_agent_reason = ? AND ? <> ? THEN ''
+                    ELSE recorder_agent_updated_at
+                END,
                 updated_at = ?
             WHERE recording_id = ?
             """,
@@ -3592,6 +3725,18 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
                 transcript_source,
                 transcript_error,
                 updated_at,
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                transcript_error,
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                transcript_error,
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                transcript_error,
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                transcript_error,
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
                 updated_at,
                 recording_id,
             ),
@@ -4938,6 +5083,19 @@ def _format_datetime(value: str | None) -> str:
     date_part = f"{parsed.strftime('%B')} {parsed.day}, {parsed.year}"
     time_part = parsed.strftime("%I:%M %p").lstrip("0")
     return f"{date_part} at {time_part}"
+
+
+def _timestamp_is_newer(left: str | None, right: str | None) -> bool:
+    try:
+        left_value = datetime.fromisoformat(str(left or "").replace("Z", "+00:00"))
+        right_value = datetime.fromisoformat(str(right or "").replace("Z", "+00:00"))
+    except ValueError:
+        return bool(left) and not bool(right)
+    if left_value.tzinfo is None:
+        left_value = left_value.replace(tzinfo=timezone.utc)
+    if right_value.tzinfo is None:
+        right_value = right_value.replace(tzinfo=timezone.utc)
+    return left_value > right_value
 
 
 def _human_size(size: int) -> str:
