@@ -6415,6 +6415,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
       @media (max-width:1100px) {
         .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .metric:last-child { grid-column:1 / -1; }
         .toolbar, .review-body { grid-template-columns:1fr; }
         .tabs { width:100%; }
         .toolbar-actions, .probe-form { justify-content:flex-start; }
@@ -6424,18 +6425,44 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
       @media (max-width:760px) {
         main { width:min(100vw - 24px, 1120px); padding-top:18px; }
-        header { grid-template-columns:minmax(0,1fr) auto; gap:.65rem; }
+        header { position:relative; display:block; }
         header > div:first-child { min-width:0; }
-        header h1 { font-size:clamp(1.65rem, 8vw, 2.9rem); }
-        header .muted { font-size:.86rem; }
+        header .eyebrow {
+          display:flex;
+          align-items:center;
+          min-height:2rem;
+          max-width:calc(100% - min(65vw, 15.5rem) - .65rem);
+          overflow:hidden;
+          text-overflow:ellipsis;
+          white-space:nowrap;
+        }
+        header h1 { margin-top:.48rem; font-size:2rem; line-height:1; letter-spacing:0; }
+        header .muted { margin-top:.45rem; font-size:.86rem; }
         .panel-head { display:flex; flex-direction:column; align-items:flex-start; }
-        .actions { width:min(65vw, 15.5rem); justify-content:flex-end; flex-wrap:nowrap; gap:.35rem; }
-        .actions > a, .actions > form { flex:1 1 0; min-width:0; }
+        .panel-head > .probe-form {
+          display:grid;
+          grid-template-columns:minmax(0,1fr) 4.7rem auto;
+          align-items:end;
+          width:100%;
+        }
+        .actions {
+          position:absolute;
+          top:0;
+          right:0;
+          width:auto;
+          max-width:calc(100% - 5.4rem);
+          justify-content:flex-end;
+          flex-wrap:nowrap;
+          gap:.35rem;
+        }
+        .actions > a, .actions > form { flex:0 0 auto; min-width:0; }
         .actions > form > button, header .actions a { width:100%; min-width:0; }
         header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.5rem .3rem; font-size:.72rem; border-radius:12px; }
         .tabs { width:100%; }
         .tab { width:auto; justify-content:flex-start; }
-        .metrics, .file-facts, .form-grid { grid-template-columns:1fr; }
+        .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .metric { padding:.72rem; }
+        .file-facts, .form-grid { grid-template-columns:1fr; }
         .review-row { grid-template-columns:2.3rem minmax(0,1fr); }
         .wide { grid-column:auto; }
         .suggestion-panel { grid-template-columns:1fr; }
