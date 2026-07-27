@@ -1843,7 +1843,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             connection.row_factory = sqlite3.Row
             row = connection.execute(
                 """
-                SELECT transcript_text, transcript_source, transcript_error,
+                SELECT recording_id, transcript_text, transcript_source, transcript_error,
                        recorder_agent_kind, recorder_agent_action, recorder_agent_reason
                 FROM testimony_reviews
                 WHERE source_path = ?
@@ -1856,6 +1856,38 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(row["recorder_agent_kind"], "unknown")
         self.assertEqual(row["recorder_agent_action"], "review")
         self.assertIn("transcription instructions", row["recorder_agent_reason"])
+
+        retry_error = (
+            "Transcription request failed: 429 Client Error: Too Many Requests for url: "
+            "http://100.109.220.95:8766/transcription?prompt=internal"
+        )
+        _save_testimony_transcript(
+            app,
+            row["recording_id"],
+            "",
+            "",
+            retry_error,
+        )
+        refreshed = client.get("/admin/recorder-review?status=needs_review")
+        self.assertIn(b"Automatic transcription is busy", refreshed.data)
+        self.assertNotIn(b"whether this sounds like", refreshed.data)
+        self.assertNotIn(b"429 Client Error", refreshed.data)
+        self.assertNotIn(b"100.109.220.95", refreshed.data)
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            retried_row = connection.execute(
+                """
+                SELECT transcript_text, transcript_error
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (row["recording_id"],),
+            ).fetchone()
+        self.assertEqual(retried_row["transcript_text"], "")
+        self.assertEqual(
+            retried_row["transcript_error"],
+            "Automatic transcription is busy. This recording remains queued for retry.",
+        )
 
     def test_recorder_review_reconciles_promoted_testimony_as_identified(self):
         intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"

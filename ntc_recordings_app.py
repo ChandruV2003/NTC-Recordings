@@ -2591,7 +2591,17 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                     recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
                 )
                 existing = _testimony_review_row(app, review_recording_id)
-            if manifest_transcript_text and (not existing or not _row_optional_text(existing, "transcript_text")):
+            existing_transcript_error = (
+                _friendly_transcription_error(_row_optional_text(existing, "transcript_error"))
+                if existing
+                else ""
+            )
+            should_import_manifest_transcript = (
+                bool(manifest_transcript_text)
+                and (not existing or not _row_optional_text(existing, "transcript_text"))
+                and not (manifest_transcript_has_prompt_echo and existing_transcript_error)
+            )
+            if should_import_manifest_transcript:
                 _save_testimony_transcript(
                     app,
                     review_recording_id,
