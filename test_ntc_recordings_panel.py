@@ -8,12 +8,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import requests
+
 from ntc_recordings_app import (
     _date_from_file_metadata,
     _display_transcript_text,
     _extract_intro_speaker,
     _humanize_classifier_evidence,
     _normalize_recording_email_message,
+    _post_transcription_audio,
     _recording_id,
     _run_testimony_transcript_job,
     _sanitize_existing_testimony_transcript_errors,
@@ -1531,6 +1534,53 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Automatic transcription is busy", review.data)
         self.assertNotIn(b"429 Client Error", review.data)
         self.assertNotIn(b"100.109.220.95", review.data)
+
+    def test_transcription_request_waits_for_capacity_then_succeeds(self):
+        busy_response = requests.Response()
+        busy_response.status_code = 429
+        busy_response.headers["Retry-After"] = "0"
+        busy_response.url = "http://transcription.example.test/transcription"
+        success_response = requests.Response()
+        success_response.status_code = 200
+        success_response._content = b'{"text":"Praise the Lord."}'
+        self.app.config["NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_BUSY_WAIT"] = 30
+
+        with (
+            patch(
+                "ntc_recordings_app.requests.post",
+                side_effect=[busy_response, success_response],
+            ) as post,
+            patch("ntc_recordings_app.time.sleep") as sleep,
+        ):
+            response = _post_transcription_audio(
+                self.app,
+                "http://transcription.example.test/transcription",
+                params={"language": "en"},
+                data=b"audio",
+                timeout=600,
+            )
+
+        self.assertIs(response, success_response)
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_transcription_request_stops_after_busy_wait_budget(self):
+        busy_response = requests.Response()
+        busy_response.status_code = 429
+        busy_response.url = "http://transcription.example.test/transcription"
+        self.app.config["NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_BUSY_WAIT"] = 0
+
+        with patch("ntc_recordings_app.requests.post", return_value=busy_response) as post:
+            with self.assertRaises(requests.HTTPError):
+                _post_transcription_audio(
+                    self.app,
+                    "http://transcription.example.test/transcription",
+                    params={"language": "en"},
+                    data=b"audio",
+                    timeout=600,
+                )
+
+        post.assert_called_once()
 
     def test_identified_transcript_survives_testimony_rename(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"

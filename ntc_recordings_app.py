@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -343,7 +344,10 @@ def create_app(test_config: dict | None = None) -> Flask:
             or os.getenv("NTC_TRANSCRIPTION_LOCAL_URL", "")
         ),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_SECONDS", "90")),
-        NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT=float(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT", "120")),
+        NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT=float(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT", "600")),
+        NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_BUSY_WAIT=float(
+            os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_BUSY_WAIT", "600")
+        ),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_PROMPT=os.getenv(
             "NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_PROMPT",
             "This is a church testimony. The speaker may introduce themselves by saying my name is, I am, or I'm.",
@@ -4209,7 +4213,7 @@ def _transcribe_testimony_intro(app: Flask, source_path: Path) -> tuple[str, str
     except (TypeError, ValueError):
         seconds = 90
     seconds = min(max(seconds, 15), 300)
-    timeout = float(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT") or 120)
+    timeout = float(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT") or 600)
     prompt = str(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_PROMPT") or "")
     with tempfile.TemporaryDirectory(prefix="ntc-testimony-intro-") as temp_dir:
         wav_path = Path(temp_dir) / "intro.wav"
@@ -4242,14 +4246,13 @@ def _transcribe_testimony_intro(app: Flask, source_path: Path) -> tuple[str, str
             detail = (completed.stderr or completed.stdout or "").strip()
             return "", f"Could not prepare intro audio for transcription{': ' + detail[:180] if detail else ''}."
         try:
-            response = requests.post(
+            response = _post_transcription_audio(
+                app,
                 transcribe_url,
                 params={"language": "en", "prompt": prompt, "max_new_tokens": "128"},
                 data=wav_path.read_bytes(),
-                headers={"Content-Type": "audio/wav", "Accept": "application/json"},
                 timeout=timeout,
             )
-            response.raise_for_status()
         except requests.RequestException as exc:
             return "", f"Transcription request failed: {exc}"
     try:
@@ -4273,7 +4276,7 @@ def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple
     except (TypeError, ValueError):
         max_tokens = 384
     max_tokens = min(max(max_tokens, 128), 384)
-    timeout = float(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT") or 120)
+    timeout = float(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT") or 600)
     prompt = str(
         app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_PROMPT")
         or "Transcribe this church testimony clearly. Keep names exactly as spoken."
@@ -4309,14 +4312,13 @@ def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple
             detail = (completed.stderr or completed.stdout or "").strip()
             return "", f"Could not prepare testimony audio for transcription{': ' + detail[:180] if detail else ''}."
         try:
-            response = requests.post(
+            response = _post_transcription_audio(
+                app,
                 transcribe_url,
                 params={"language": "en", "prompt": prompt, "max_new_tokens": str(max_tokens)},
                 data=wav_path.read_bytes(),
-                headers={"Content-Type": "audio/wav", "Accept": "application/json"},
                 timeout=timeout,
             )
-            response.raise_for_status()
         except requests.RequestException as exc:
             return "", f"Transcription request failed: {exc}"
     try:
@@ -4324,6 +4326,43 @@ def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple
     except ValueError:
         return response.text.strip(), ""
     return str(payload.get("text") or "").strip(), ""
+
+
+def _post_transcription_audio(
+    app: Flask,
+    transcribe_url: str,
+    *,
+    params: dict[str, str],
+    data: bytes,
+    timeout: float,
+) -> requests.Response:
+    try:
+        busy_wait = float(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_BUSY_WAIT") or 600)
+    except (TypeError, ValueError):
+        busy_wait = 600
+    deadline = time.monotonic() + max(0, busy_wait)
+
+    while True:
+        response = requests.post(
+            transcribe_url,
+            params=params,
+            data=data,
+            headers={"Content-Type": "audio/wav", "Accept": "application/json"},
+            timeout=timeout,
+        )
+        if response.status_code not in {429, 503}:
+            response.raise_for_status()
+            return response
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            response.raise_for_status()
+        retry_after = response.headers.get("Retry-After", "")
+        try:
+            retry_delay = float(retry_after)
+        except (TypeError, ValueError):
+            retry_delay = 5
+        time.sleep(min(max(retry_delay, 1), remaining))
 
 
 def _extract_intro_speaker(transcript: str, known_speakers: Iterable[str]) -> str:
