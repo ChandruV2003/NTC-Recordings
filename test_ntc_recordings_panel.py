@@ -174,7 +174,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(review.status_code, 200)
         self.assertIn(b'href="/recordings/admin/panel"', review.data)
-        self.assertIn(b'data-status-url="/recordings/admin/testimonies/suggest-status"', review.data)
+        self.assertIn(b'data-status-url="/recordings/admin/testimonies/transcript-status"', review.data)
         self.assertIn(b'action="/recordings/admin/testimonies/', review.data)
         self.assertIn(b'formaction="/recordings/admin/testimonies/', review.data)
         self.assertIn(b'data-src="/recordings/admin/testimonies/audio/', review.data)
@@ -656,14 +656,16 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Listen, confirm the service date", review.data)
         self.assertIn(b'preload="none" data-src="/admin/testimonies/audio/', review.data)
         self.assertNotIn(b'preload="metadata" src="/admin/testimonies/audio/', review.data)
-        self.assertIn(b"Suggest Speaker", review.data)
-        self.assertIn(b"Process Suggestions", review.data)
+        self.assertNotIn(b">Suggest Speaker</button>", review.data)
+        self.assertNotIn(b"Process Suggestions", review.data)
         self.assertIn(b"Group / Event Title", review.data)
         self.assertIn(b"Grouped", review.data)
-        self.assertIn(b"Process Transcripts", review.data)
+        self.assertIn(b"Retry Missing Analysis", review.data)
+        self.assertIn(b">Retry Analysis</button>", review.data)
+        self.assertNotIn(b"Process Transcripts", review.data)
         self.assertNotIn(b"Quarantine Rejected", review.data)
-        self.assertIn(b'data-suggestion-job', review.data)
-        self.assertIn(b'data-status-url="/admin/testimonies/suggest-status"', review.data)
+        self.assertNotIn(b'data-suggestion-job', review.data)
+        self.assertNotIn(b'data-status-url="/admin/testimonies/suggest-status"', review.data)
         self.assertIn(b'data-transcript-job', review.data)
         self.assertIn(b'data-status-url="/admin/testimonies/transcript-status"', review.data)
         self.assertIn(b'data-review-id="', review.data)
@@ -685,7 +687,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         identified = self.client.get("/admin/recorder-review?status=identified")
         self.assertEqual(identified.status_code, 200)
         self.assertIn(b"20250413 - Sister Rachel", identified.data)
-        self.assertIn(b"Process Transcripts", identified.data)
+        self.assertIn(b"Retry Missing Analysis", identified.data)
 
         recording_id = _recording_id(raw_recording)
         audio = self.client.get(f"/admin/testimonies/audio/{recording_id}")
@@ -970,7 +972,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         grouped = self.client.get("/admin/recorder-review?status=grouped").data
         self.assertIn(b"Testimonies Part 1", grouped)
         self.assertIn(b"Grouped", grouped)
-        self.assertIn(b"Process Transcripts", grouped)
+        self.assertIn(b"Retry Missing Analysis", grouped)
 
     def test_testimony_review_quarantines_rejected_recordings(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -1164,7 +1166,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(started.status_code, 200)
-        self.assertIn(b"Started recorder transcript processing", started.data)
+        self.assertIn(b"Started retrying missing recorder analysis", started.data)
         starter.assert_called_once()
 
         status = self.client.get("/admin/testimonies/transcript-status")
@@ -1205,7 +1207,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(started.status_code, 200)
-        self.assertIn(b"Started recorder transcript processing", started.data)
+        self.assertIn(b"Started retrying missing recorder analysis", started.data)
         starter.assert_called_once()
         self.assertEqual(starter.call_args.kwargs["statuses"], {"needs_review"})
 
@@ -1238,7 +1240,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self._login()
         review_before = self.client.get("/admin/recorder-review?status=identified")
         self.assertEqual(review_before.status_code, 200)
-        self.assertIn(b"Not processed yet", review_before.data)
+        self.assertIn(b"Automatic analysis has not completed.", review_before.data)
 
         _save_testimony_transcript(
             self.app,

@@ -701,9 +701,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         target_statuses = _testimony_transcript_statuses_for_filter(current_filter)
         started = _start_testimony_transcript_job(app, min(max(limit, 1), 100), statuses=target_statuses)
         if started:
-            message = "Started recorder transcript processing."
+            message = "Started retrying missing recorder analysis."
         else:
-            message = "Recorder transcript processing is already running."
+            message = "Recorder analysis retry is already running."
         return _redirect_to(
             app,
             "testimony_review",
@@ -810,7 +810,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     suggestion_text=suggestion_text,
                 )
 
-        message = "Transcript processed." if transcript_text else transcript_error or "Transcript was not saved."
+        message = "Analysis completed." if transcript_text else transcript_error or "Analysis was not saved."
         if _wants_json_response():
             display_transcript_text = _display_transcript_text(transcript_text)
             response = jsonify(
@@ -3040,7 +3040,7 @@ def _start_testimony_transcript_job(app: Flask, limit: int | None = None, status
             **_initial_testimony_transcript_job_state(),
             "state": "running",
             "started_at": _utc_now(),
-            "message": "Scanning identified testimonies.",
+            "message": "Scanning for missing recorder analysis.",
         }
     thread = threading.Thread(target=_run_testimony_transcript_job, args=(app, limit, statuses), name="testimony-transcript-job", daemon=True)
     thread.start()
@@ -3051,7 +3051,7 @@ def _run_testimony_transcript_job(app: Flask, limit: int | None = None, statuses
     try:
         with app.app_context():
             targets = _testimony_transcript_targets(app, limit, statuses=statuses)
-            _update_testimony_transcript_job(app, total=len(targets), message=f"Processing {len(targets)} testimony transcripts.")
+            _update_testimony_transcript_job(app, total=len(targets), message=f"Analyzing {len(targets)} recordings with missing transcripts.")
             processed = saved = errors = 0
             for target in targets:
                 row = target["row"]
@@ -3104,7 +3104,7 @@ def _run_testimony_transcript_job(app: Flask, limit: int | None = None, statuses
                     processed=processed,
                     saved=saved,
                     errors=errors,
-                    message=f"Processed {processed} of {len(targets)} testimony transcripts.",
+                    message=f"Analyzed {processed} of {len(targets)} recordings.",
                 )
             _update_testimony_transcript_job(
                 app,
@@ -6373,17 +6373,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
               </label>
               <button type="submit">Check Durations</button>
             </form>
-            <form class="probe-form action-only" method="post" action="{{ recordings_url_for('suggest_all_testimony_speakers') }}">
-              <input type="hidden" name="status" value="{{ status_filter }}">
-              <input type="hidden" name="sort" value="{{ sort }}">
-              <button type="submit" data-process-suggestions-button {% if suggestion_job.state == "running" %}disabled{% endif %}>Process Suggestions</button>
-            </form>
           {% endif %}
           {% if status_filter in ["needs_review", "message_review", "identified", "grouped", "all"] %}
             <form class="probe-form action-only" method="post" action="{{ recordings_url_for('transcribe_identified_testimonies') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
               <input type="hidden" name="sort" value="{{ sort }}">
-              <button type="submit" data-process-transcripts-button {% if transcript_job.state == "running" %}disabled{% endif %}>Process Transcripts</button>
+              <button type="submit" data-process-transcripts-button {% if transcript_job.state == "running" %}disabled{% endif %}>Retry Missing Analysis</button>
             </form>
           {% endif %}
           {% if status_filter in ["not_testimony", "duplicate", "all"] %}
@@ -6403,25 +6398,15 @@ TESTIMONY_REVIEW_TEMPLATE = """
           {% endif %}
         </div>
       </div>
-      <div class="job-panel" data-suggestion-job data-status-url="{{ recordings_url_for('testimony_suggestion_status') }}" data-state="{{ suggestion_job.state }}" {% if suggestion_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
-        <div>
-          <span>Recorder Suggestions</span>
-          <strong data-job-message>{{ suggestion_job.message or "Idle." }}</strong>
-          <div data-job-counts>
-            {{ suggestion_job.processed }} / {{ suggestion_job.total }} processed · {{ suggestion_job.found }} suggested · {{ suggestion_job.checked }} checked · {{ suggestion_job.errors }} errors
-          </div>
-        </div>
-        <div data-job-current>{% if suggestion_job.current %}Now checking {{ suggestion_job.current }}{% endif %}</div>
-      </div>
       <div class="job-panel" data-transcript-job data-status-url="{{ recordings_url_for('testimony_transcript_status') }}" data-state="{{ transcript_job.state }}" {% if transcript_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
         <div>
-          <span>Recorder Transcripts</span>
+          <span>Recorder Analysis</span>
           <strong data-job-message>{{ transcript_job.message or "Idle." }}</strong>
           <div data-job-counts>
-            {{ transcript_job.processed }} / {{ transcript_job.total }} processed · {{ transcript_job.saved }} saved · {{ transcript_job.errors }} errors
+            {{ transcript_job.processed }} / {{ transcript_job.total }} processed · {{ transcript_job.saved }} analyzed · {{ transcript_job.errors }} errors
           </div>
         </div>
-        <div data-job-current>{% if transcript_job.current %}Now transcribing {{ transcript_job.current }}{% endif %}</div>
+        <div data-job-current>{% if transcript_job.current %}Now analyzing {{ transcript_job.current }}{% endif %}</div>
       </div>
       <section class="panel">
         <div class="panel-head">
@@ -6580,32 +6565,29 @@ TESTIMONY_REVIEW_TEMPLATE = """
                         <div class="suggestion-panel subdued speaker-assist-panel">
                           <div>
                             <span>Suggested Speaker</span>
-                            <strong>No suggestion yet</strong>
-                            <small>Use Suggest Speaker or Process Transcript for this row.</small>
+                            <strong>No suggested speaker</strong>
+                            <small>Automatic analysis did not find a reliable person name.</small>
                           </div>
-                          <button class="secondary" type="submit" formaction="{{ recordings_url_for('suggest_testimony_speaker', recording_id=item.id) }}" formmethod="post">Suggest Speaker</button>
                         </div>
                       {% endif %}
-                      {% if item.transcript_preview or item.transcript_text or item.transcript_error or item.status in ["identified", "grouped", "already_named"] %}
-                        <div class="suggestion-panel subdued transcript-panel speaker-transcript-panel">
-                          <div>
-                            <span>Transcript</span>
-                          </div>
-                          {% if item.transcript_preview %}
-                            <p>{{ item.transcript_preview }}</p>
-                          {% elif item.transcript_error %}
-                            <p>{{ item.transcript_error }}</p>
-                          {% else %}
-                            <small>Not processed yet.</small>
-                          {% endif %}
-                          {% if item.transcript_text %}
-                            <details class="transcript-full">
-                              <summary>View full transcript</summary>
-                              <p>{{ item.transcript_text }}</p>
-                            </details>
-                          {% endif %}
+                      <div class="suggestion-panel subdued transcript-panel speaker-transcript-panel">
+                        <div>
+                          <span>Transcript</span>
                         </div>
-                      {% endif %}
+                        {% if item.transcript_preview %}
+                          <p>{{ item.transcript_preview }}</p>
+                        {% elif item.transcript_error %}
+                          <p>{{ item.transcript_error }}</p>
+                        {% else %}
+                          <small>Automatic analysis has not completed.</small>
+                        {% endif %}
+                        {% if item.transcript_text %}
+                          <details class="transcript-full">
+                            <summary>View full transcript</summary>
+                            <p>{{ item.transcript_text }}</p>
+                          </details>
+                        {% endif %}
+                      </div>
                       {% if item.quarantined %}
                         <div class="suggestion-panel subdued transcript-panel">
                           <div>
@@ -6620,7 +6602,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
                       <button class="secondary" type="submit" name="status" value="needs_review">Needs Review</button>
                       <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Needed</button>
                       <button class="secondary" type="submit" name="status" value="duplicate">Mark Duplicate</button>
-                      <button class="secondary" type="submit" formaction="{{ recordings_url_for('transcribe_testimony_recording', recording_id=item.id) }}" formmethod="post">Process Transcript</button>
+                      {% if not item.transcript_text or item.transcript_error %}
+                        <button class="secondary" type="submit" data-retry-analysis formaction="{{ recordings_url_for('transcribe_testimony_recording', recording_id=item.id) }}" formmethod="post">Retry Analysis</button>
+                      {% endif %}
                       <button class="secondary" type="submit" name="status" value="message_review">Save Message/Event</button>
                       <button class="secondary" type="submit" name="status" value="grouped">Save Grouped</button>
                       <button class="save" type="submit" name="status" value="identified">Save Speaker</button>
@@ -6802,6 +6786,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
         if (!(data.suggested_speaker || data.suggestion_source || data.suggestion_text)) {
           card.querySelectorAll(".speaker-assist-panel").forEach((panel) => panel.remove());
         }
+        if (data.transcript_text && !data.transcript_error) {
+          card.querySelector("[data-retry-analysis]")?.remove();
+        }
         if (data.status) {
           updateStatusCounts(previousStatus, data.status);
           if (!belongsInActiveFilter(data.status)) {
@@ -6865,7 +6852,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           textWrap.appendChild(label);
           transcriptPanel.appendChild(textWrap);
           const paragraph = document.createElement("p");
-          paragraph.textContent = transcriptPreview || data.transcript_error || "Not processed yet.";
+          paragraph.textContent = transcriptPreview || data.transcript_error || "Automatic analysis has not completed.";
           transcriptPanel.appendChild(paragraph);
           if (data.transcript_text) {
             const details = document.createElement("details");
@@ -6995,53 +6982,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
       });
 
-      function updateSuggestionJob(job) {
-        const panel = document.querySelector("[data-suggestion-job]");
-        if (!panel || !job) return;
-        const message = panel.querySelector("[data-job-message]");
-        const counts = panel.querySelector("[data-job-counts]");
-        const current = panel.querySelector("[data-job-current]");
-        const button = document.querySelector("[data-process-suggestions-button]");
-        const priorState = panel.dataset.state || "";
-
-        panel.hidden = !["running", "finished", "failed"].includes(job.state);
-        panel.dataset.state = job.state || "";
-        if (message) message.textContent = job.message || "Idle.";
-        if (counts) {
-          counts.textContent = `${job.processed || 0} / ${job.total || 0} processed · ${job.found || 0} suggested · ${job.checked || 0} checked · ${job.errors || 0} errors`;
-        }
-        if (current) {
-          current.textContent = job.current ? `Now checking ${job.current}` : "";
-        }
-        if (button) {
-          button.disabled = job.state === "running";
-        }
-        if (priorState === "running" && ["finished", "failed"].includes(job.state)) {
-          const tag = document.activeElement ? document.activeElement.tagName : "";
-          const editing = ["INPUT", "TEXTAREA", "SELECT"].includes(tag);
-          if (!editing && job.state === "finished") {
-            saveOpenCards();
-            window.setTimeout(() => window.location.reload(), 900);
-          }
-        }
-      }
-
-      async function pollSuggestionJob() {
-        const panel = document.querySelector("[data-suggestion-job]");
-        if (!panel || !panel.dataset.statusUrl) return;
-        try {
-          const response = await fetch(panel.dataset.statusUrl, { headers: { "Accept": "application/json" } });
-          if (!response.ok) return;
-          const job = await response.json();
-          updateSuggestionJob(job);
-          if (job.state === "running") {
-            window.setTimeout(pollSuggestionJob, 3000);
-          }
-        } catch (error) {
-          window.setTimeout(pollSuggestionJob, 6000);
-        }
-      }
-
       function updateTranscriptJob(job) {
         const panel = document.querySelector("[data-transcript-job]");
         if (!panel || !job) return;
@@ -7055,10 +6995,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
         panel.dataset.state = job.state || "";
         if (message) message.textContent = job.message || "Idle.";
         if (counts) {
-          counts.textContent = `${job.processed || 0} / ${job.total || 0} processed · ${job.saved || 0} saved · ${job.errors || 0} errors`;
+          counts.textContent = `${job.processed || 0} / ${job.total || 0} processed · ${job.saved || 0} analyzed · ${job.errors || 0} errors`;
         }
         if (current) {
-          current.textContent = job.current ? `Now transcribing ${job.current}` : "";
+          current.textContent = job.current ? `Now analyzing ${job.current}` : "";
         }
         if (button) {
           button.disabled = job.state === "running";
@@ -7091,9 +7031,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
 
       restoreOpenCards();
       document.querySelectorAll(".review-card[open]").forEach(hydrateReviewAudio);
-      if (document.querySelector("[data-suggestion-job]")?.dataset.state === "running") {
-        pollSuggestionJob();
-      }
       if (document.querySelector("[data-transcript-job]")?.dataset.state === "running") {
         pollTranscriptJob();
       }
