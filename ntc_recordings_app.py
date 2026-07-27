@@ -5633,7 +5633,7 @@ RECORDING_ADMIN_TEMPLATE = """
         .actions { width:min(65vw, 15.5rem); justify-content:flex-end; flex-wrap:nowrap; gap:.35rem; }
         .actions > a, .actions > form { flex:1 1 0; min-width:0; }
         .actions > form > button, header .actions a { width:100%; min-width:0; }
-        header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.5rem .4rem; font-size:.72rem; border-radius:12px; }
+        header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.5rem .3rem; font-size:.72rem; border-radius:12px; }
         .tabs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); border-radius:999px; width:100%; }
         .tab { justify-content:space-between; }
         .metrics, .request-head { grid-template-columns:1fr; }
@@ -6312,7 +6312,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .actions { width:min(65vw, 15.5rem); justify-content:flex-end; flex-wrap:nowrap; gap:.35rem; }
         .actions > a, .actions > form { flex:1 1 0; min-width:0; }
         .actions > form > button, header .actions a { width:100%; min-width:0; }
-        header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.5rem .4rem; font-size:.72rem; border-radius:12px; }
+        header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.5rem .3rem; font-size:.72rem; border-radius:12px; }
         .tabs { width:100%; border-radius:22px; }
         .tab { width:100%; justify-content:space-between; }
         .metrics, .file-facts, .form-grid { grid-template-columns:1fr; }
