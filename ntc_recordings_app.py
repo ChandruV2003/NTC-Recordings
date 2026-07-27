@@ -112,6 +112,15 @@ TRANSCRIPTION_PROMPT_ECHO_ERROR = (
     "Automatic transcript was rejected because it contained transcription instructions "
     "instead of recording content. Retry analysis."
 )
+TRANSCRIPTION_BUSY_ERROR = (
+    "Automatic transcription is busy. This recording remains queued for retry."
+)
+TRANSCRIPTION_TIMEOUT_ERROR = (
+    "Automatic transcription timed out. This recording remains queued for retry."
+)
+TRANSCRIPTION_FAILED_ERROR = (
+    "Automatic transcription failed. This recording remains queued for retry."
+)
 MONTHS = {
     "jan": 1,
     "january": 1,
@@ -1390,6 +1399,7 @@ def _init_db(db_path: str) -> None:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_status ON testimony_reviews(status)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_source_path ON testimony_reviews(source_path)")
         _sanitize_existing_testimony_transcripts(connection)
+        _sanitize_existing_testimony_transcript_errors(connection)
 
 
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -2617,7 +2627,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     transcript_has_prompt_echo = _transcript_contains_prompt_echo(transcript_text)
     display_transcript_text = _display_transcript_text(transcript_text)
     transcript_source = _row_optional_text(row, "transcript_source")
-    transcript_error = _row_optional_text(row, "transcript_error")
+    transcript_error = _friendly_transcription_error(_row_optional_text(row, "transcript_error"))
     transcript_updated_at = _row_optional_text(row, "transcript_updated_at")
     quarantined_from_path = _row_optional_text(row, "quarantined_from_path")
     quarantined_path = _row_optional_text(row, "quarantined_path")
@@ -3497,6 +3507,7 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
         transcript_error = TRANSCRIPTION_PROMPT_ECHO_ERROR
     else:
         transcript_text = _display_transcript_text(transcript_text)
+        transcript_error = _friendly_transcription_error(transcript_error)
     updated_at = _utc_now()
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute(
@@ -3563,6 +3574,33 @@ def _sanitize_existing_testimony_transcripts(connection: sqlite3.Connection) -> 
         ],
     )
     return len(invalid_ids)
+
+
+def _sanitize_existing_testimony_transcript_errors(connection: sqlite3.Connection) -> int:
+    rows = connection.execute(
+        """
+        SELECT recording_id, transcript_error
+        FROM testimony_reviews
+        WHERE COALESCE(transcript_error, '') <> ''
+        """
+    ).fetchall()
+    updates = [
+        (friendly_error, str(row["recording_id"]))
+        for row in rows
+        if (friendly_error := _friendly_transcription_error(str(row["transcript_error"] or "")))
+        != str(row["transcript_error"] or "")
+    ]
+    if not updates:
+        return 0
+    connection.executemany(
+        """
+        UPDATE testimony_reviews
+        SET transcript_error = ?
+        WHERE recording_id = ?
+        """,
+        updates,
+    )
+    return len(updates)
 
 
 def _testimony_quarantine_status_folder(status: str) -> str:
@@ -4226,6 +4264,27 @@ def _display_transcript_text(text: str) -> str:
 def _transcript_contains_prompt_echo(text: str) -> bool:
     value = str(text or "")
     return any(pattern.search(value) for pattern in TRANSCRIPTION_PROMPT_ECHO_PATTERNS)
+
+
+def _friendly_transcription_error(error: str) -> str:
+    value = str(error or "").strip()
+    if not value or value == TRANSCRIPTION_PROMPT_ECHO_ERROR:
+        return value
+    lowered = value.lower()
+    if "429" in lowered or "too many requests" in lowered or "rate limit" in lowered:
+        return TRANSCRIPTION_BUSY_ERROR
+    if "timed out" in lowered or "timeout" in lowered:
+        return TRANSCRIPTION_TIMEOUT_ERROR
+    if (
+        lowered.startswith(("transcription request failed:", "transcript failed:"))
+        or "client error" in lowered
+        or "server error" in lowered
+        or "connection error" in lowered
+        or "http://" in lowered
+        or "https://" in lowered
+    ):
+        return TRANSCRIPTION_FAILED_ERROR
+    return value
 
 
 def _format_duration(seconds: float | None) -> str:

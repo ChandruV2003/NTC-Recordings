@@ -15,6 +15,7 @@ from ntc_recordings_app import (
     _humanize_classifier_evidence,
     _normalize_recording_email_message,
     _recording_id,
+    _sanitize_existing_testimony_transcript_errors,
     _sanitize_existing_testimony_transcripts,
     _testimony_filename_speaker_suggestion,
     _testimony_looks_like_message_recording,
@@ -1386,6 +1387,62 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("transcription instructions", row["transcript_error"])
         self.assertEqual(row["recorder_agent_kind"], "unknown")
         self.assertEqual(row["recorder_agent_action"], "review")
+
+    def test_transcription_transport_error_is_sanitized_and_migrated(self):
+        testimony_source_root = self.root / "TestimonyReviewQueue"
+        testimony_source_root.mkdir()
+        recording = testimony_source_root / "07262026115802_DN-700R.mp3"
+        recording.write_bytes(b"rate-limited-testimony-audio")
+        recording_id = _recording_id(recording)
+        raw_error = (
+            "Transcription request failed: 429 Client Error: Too Many Requests for url: "
+            "http://100.109.220.95:8766/transcription?prompt=internal"
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    transcript_error,
+                    updated_at
+                )
+                VALUES (?, ?, 'needs_review', '2026-07-26', ?, ?)
+                """,
+                (
+                    recording_id,
+                    str(recording),
+                    raw_error,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            connection.row_factory = sqlite3.Row
+            migrated = _sanitize_existing_testimony_transcript_errors(connection)
+
+        self.assertEqual(migrated, 1)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT transcript_error
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            ).fetchone()
+        self.assertEqual(
+            row["transcript_error"],
+            "Automatic transcription is busy. This recording remains queued for retry.",
+        )
+
+        _save_testimony_transcript(self.app, recording_id, "", "", raw_error)
+        self._login()
+        review = self.client.get("/admin/recorder-review?status=needs_review")
+        self.assertIn(b"Automatic transcription is busy", review.data)
+        self.assertNotIn(b"429 Client Error", review.data)
+        self.assertNotIn(b"100.109.220.95", review.data)
 
     def test_identified_transcript_survives_testimony_rename(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
