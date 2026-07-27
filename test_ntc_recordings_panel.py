@@ -504,6 +504,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         )
         self.assertIn("/shares/2468", put.call_args.args[0])
         self.assertEqual(put.call_args.kwargs["data"]["permissions"], 1)
+        self.assertEqual(put.call_args.kwargs["data"]["hideDownload"], "true")
         self.assertEqual(
             json.loads(put.call_args.kwargs["data"]["attributes"]),
             [{"scope": "permissions", "key": "download", "value": False}],
@@ -571,6 +572,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         )
         put.assert_called_once()
         self.assertIn("/shares/1357", put.call_args.args[0])
+        self.assertEqual(put.call_args.kwargs["data"]["hideDownload"], "true")
 
     def test_nextcloud_share_provider_reuses_existing_public_link(self):
         self.app.config.update(
@@ -622,6 +624,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         put.assert_called_once()
         self.assertIn("/shares/9753", put.call_args.args[0])
         self.assertEqual(put.call_args.kwargs["data"]["permissions"], 1)
+        self.assertEqual(put.call_args.kwargs["data"]["hideDownload"], "true")
         self.assertEqual(
             json.loads(put.call_args.kwargs["data"]["attributes"]),
             [{"scope": "permissions", "key": "download", "value": False}],

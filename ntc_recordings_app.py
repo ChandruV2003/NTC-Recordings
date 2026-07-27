@@ -4526,6 +4526,11 @@ def _nextcloud_public_share_payload(nextcloud_path: str = "", *, include_share_t
     }
     if include_share_type:
         payload["shareType"] = 3
+    else:
+        # Nextcloud exposes hideDownload separately from share attributes when
+        # updating a public link. Set both so UI and direct-download behavior
+        # stay locked down across supported server versions.
+        payload["hideDownload"] = "true"
     if nextcloud_path:
         payload["path"] = nextcloud_path
     return payload
