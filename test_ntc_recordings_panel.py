@@ -1524,6 +1524,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
                     transcript_at TEXT NOT NULL DEFAULT '',
                     classification TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    matched_path TEXT NOT NULL DEFAULT '',
+                    matched_kind TEXT NOT NULL DEFAULT '',
                     agent_decision_json TEXT NOT NULL DEFAULT '',
                     agent_review_reason TEXT NOT NULL DEFAULT '',
                     last_seen_at TEXT NOT NULL
@@ -1571,6 +1573,125 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 (str(raw_recording),),
             ).fetchone()
         self.assertEqual(row, ("needs_review",))
+
+    def test_recorder_review_reconciles_promoted_testimony_as_identified(self):
+        intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
+        review_root = intake_root / "TestimonyReviewQueue"
+        staged_root = intake_root / "DN700R-primary"
+        review_root.mkdir(parents=True)
+        staged_root.mkdir(parents=True)
+        staged_recording = staged_root / "07262026114801_DN-700R.mp3"
+        staged_recording.write_bytes(b"raw-john-testimony")
+        final_recording = self.testimony_root / "2026" / "Sunday Testimonies" / "July 26, 2026 - John's Testimony.mp3"
+        final_recording.parent.mkdir(parents=True)
+        final_recording.write_bytes(b"final-john-testimony")
+        manifest_path = Path(self.tempdir.name) / "identified-manifest.sqlite3"
+        decision = {
+            "action": "promote",
+            "recording_kind": "testimony",
+            "speaker": "John",
+            "title": "John's Testimony",
+            "service_date": "2026-07-26",
+        }
+        with sqlite3.connect(manifest_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE recorder_files (
+                    staged_path TEXT NOT NULL,
+                    matched_path TEXT NOT NULL DEFAULT '',
+                    matched_kind TEXT NOT NULL DEFAULT '',
+                    duration_seconds REAL,
+                    transcript_text TEXT NOT NULL DEFAULT '',
+                    transcript_source TEXT NOT NULL DEFAULT '',
+                    transcript_at TEXT NOT NULL DEFAULT '',
+                    classification TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    agent_decision_json TEXT NOT NULL DEFAULT '',
+                    agent_review_reason TEXT NOT NULL DEFAULT '',
+                    last_seen_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO recorder_files (
+                    staged_path,
+                    matched_path,
+                    matched_kind,
+                    duration_seconds,
+                    transcript_text,
+                    transcript_source,
+                    transcript_at,
+                    classification,
+                    status,
+                    agent_decision_json,
+                    last_seen_at
+                ) VALUES (?, ?, 'testimony', ?, ?, 'local_transcription', ?, 'testimony_candidate', 'already_archived', ?, ?)
+                """,
+                (
+                    str(staged_recording),
+                    str(final_recording),
+                    29.88,
+                    "Praise the Lord. My name is John.",
+                    datetime.now(timezone.utc).isoformat(),
+                    json.dumps(decision),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+        db_path = Path(self.tempdir.name) / "identified-manifest-requests.db"
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "identified-manifest-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(db_path),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(review_root),
+                "NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS": str(intake_root),
+                "NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS": str(manifest_path),
+                "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
+                "NTC_RECORDINGS_TESTIMONY_REJECTED_DIR": str(self.rejected_root),
+                "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
+            }
+        )
+        staged_recording_id = _recording_id(staged_recording)
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    updated_at
+                ) VALUES (?, ?, 'needs_review', '2026-07-26', ?)
+                """,
+                (
+                    staged_recording_id,
+                    str(staged_recording),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+        client = app.test_client()
+        client.post("/admin/login", data={"password": "admin-password"})
+
+        response = client.get("/admin/recorder-review?status=identified&sort=newest")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"July 26, 2026 - John&#39;s Testimony.mp3", response.data)
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT status, source_path, speaker_name, testimony_title
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (staged_recording_id,),
+            ).fetchone()
+        self.assertEqual(
+            row,
+            ("identified", str(final_recording), "John", "John's Testimony"),
+        )
 
     def test_metadata_dates_use_local_church_day(self):
         raw_recording = self.root / "REC00494.mp3"

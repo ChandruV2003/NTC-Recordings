@@ -2399,6 +2399,8 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
             rows = manifest.execute(
                 f"""
                 SELECT rf.staged_path,
+                       rf.matched_path,
+                       rf.matched_kind,
                        rf.duration_seconds,
                        rf.transcript_text,
                        rf.transcript_source,
@@ -2410,13 +2412,20 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                        {segment_select}
                 FROM recorder_files rf
                 {segment_join}
-                WHERE rf.staged_path <> ''
-                  AND rf.status IN ('staged', 'source_cleared')
-                  AND (
-                      rf.classification = 'testimony_candidate'
-                      OR rf.classification IN ('unknown', 'message_candidate', 'worship_candidate', 'combined_candidate')
-                      OR COALESCE(rf.agent_decision_json, '') <> ''
-                      {segment_filter}
+                WHERE (
+                    rf.staged_path <> ''
+                    AND rf.status IN ('staged', 'source_cleared')
+                    AND (
+                        rf.classification = 'testimony_candidate'
+                        OR rf.classification IN ('unknown', 'message_candidate', 'worship_candidate', 'combined_candidate')
+                        OR COALESCE(rf.agent_decision_json, '') <> ''
+                        {segment_filter}
+                    )
+                  )
+                  OR (
+                    rf.status = 'already_archived'
+                    AND rf.matched_kind = 'testimony'
+                    AND rf.matched_path <> ''
                   )
                 ORDER BY rf.last_seen_at DESC
                 """
@@ -2433,10 +2442,21 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
 
         for row in rows:
             staged_path = Path(str(row["staged_path"] or ""))
-            candidate = _testimony_source_candidate_from_path(app, staged_path)
+            archived_testimony = (
+                str(row["status"] or "") == "already_archived"
+                and str(row["matched_kind"] or "") == "testimony"
+                and bool(str(row["matched_path"] or "").strip())
+            )
+            candidate_path = Path(str(row["matched_path"] or "")) if archived_testimony else staged_path
+            candidate = _testimony_source_candidate_from_path(app, candidate_path)
             if not candidate:
                 continue
             existing = _testimony_review_row(app, candidate.id)
+            if not existing and archived_testimony:
+                staged_candidate = _testimony_source_candidate_from_path(app, staged_path)
+                if staged_candidate:
+                    existing = _testimony_review_row(app, staged_candidate.id)
+            review_recording_id = str(existing["recording_id"] or "") if existing else candidate.id
             decision = {}
             if row["agent_decision_json"]:
                 try:
@@ -2449,6 +2469,8 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
             agent_kind = _normalize_recording_kind(agent_kind_raw)
             if agent_kind == "unsure":
                 agent_kind = agent_kind_raw
+            if archived_testimony:
+                agent_kind = "testimony"
             agent_action = str(decision.get("action") or "").strip().lower()
             agent_reason = str(row["agent_review_reason"] or decision.get("reason") or decision.get("notes") or "").strip()
             if not agent_kind and str(row["classification"] or "") == "testimony_candidate":
@@ -2456,7 +2478,9 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
             service_date = _normalize_date(str(decision.get("service_date") or "")) or (str(existing["service_date"] or "") if existing else "") or candidate.recording_date
             suggested_speaker = _valid_person_name_suggestion(str(decision.get("speaker") or ""), known_speakers)
             existing_status = str(existing["status"] or "") if existing else ""
-            if existing_status in TESTIMONY_REVIEW_STATUSES:
+            if archived_testimony:
+                review_status = "identified"
+            elif existing_status in TESTIMONY_REVIEW_STATUSES:
                 review_status = existing_status
             elif agent_kind in {"message", "worship", "event"}:
                 review_status = "message_review"
@@ -2464,25 +2488,34 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                 review_status = "message_review"
             else:
                 review_status = "needs_review"
+            decision_title = str(decision.get("title") or "").strip()
             if existing and str(existing["testimony_title"] or ""):
                 review_title = str(existing["testimony_title"] or "")
+            elif archived_testimony and decision_title:
+                review_title = decision_title
             elif review_status == "message_review" and agent_kind == "worship":
                 review_title = "Worship Recording Needs Review"
             elif review_status == "message_review":
                 review_title = "Message / Event Needs Review"
             else:
                 review_title = ""
+            review_speaker = str(existing["speaker_name"] or "") if existing else ""
+            if archived_testimony and not review_speaker:
+                review_speaker = suggested_speaker
+            proposed_path = str(existing["proposed_path"] or "") if existing else ""
+            if archived_testimony:
+                proposed_path = str(candidate_path)
             if not existing:
                 _save_testimony_review(
                     app,
-                    recording_id=candidate.id,
+                    recording_id=review_recording_id,
                     source_path=candidate.path,
                     status=review_status,
                     service_date=service_date,
-                    speaker_name="",
+                    speaker_name=review_speaker,
                     testimony_title=review_title,
                     notes="",
-                    proposed_path="",
+                    proposed_path=proposed_path,
                     duration_seconds=row["duration_seconds"],
                     suggested_speaker=suggested_speaker,
                     suggestion_source="recorder_manifest" if suggested_speaker else "",
@@ -2497,18 +2530,18 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                     recorder_segment_reasons=str(row["recorder_segment_reasons"] or ""),
                     recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
                 )
-                existing = _testimony_review_row(app, candidate.id)
+                existing = _testimony_review_row(app, review_recording_id)
             else:
                 _save_testimony_review(
                     app,
-                    recording_id=candidate.id,
+                    recording_id=review_recording_id,
                     source_path=candidate.path,
                     status=review_status,
                     service_date=service_date,
-                    speaker_name=str(existing["speaker_name"] or ""),
+                    speaker_name=review_speaker,
                     testimony_title=review_title,
                     notes=str(existing["notes"] or ""),
-                    proposed_path=str(existing["proposed_path"] or ""),
+                    proposed_path=proposed_path,
                     duration_seconds=row["duration_seconds"],
                     recorder_agent_kind=agent_kind,
                     recorder_agent_action=agent_action,
@@ -2520,11 +2553,11 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                     recorder_segment_reasons=str(row["recorder_segment_reasons"] or ""),
                     recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
                 )
-                existing = _testimony_review_row(app, candidate.id)
+                existing = _testimony_review_row(app, review_recording_id)
             if row["transcript_text"] and (not existing or not _row_optional_text(existing, "transcript_text")):
                 _save_testimony_transcript(
                     app,
-                    candidate.id,
+                    review_recording_id,
                     transcript_text=str(row["transcript_text"] or ""),
                     transcript_source=str(row["transcript_source"] or "recorder_manifest"),
                     transcript_error="",
