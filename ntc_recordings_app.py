@@ -6294,6 +6294,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         border-radius:14px;
         background:rgba(255,255,255,.035);
         padding:.65rem;
+        min-width:0;
       }
       .fact span {
         display:block;
@@ -6473,7 +6474,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .tab { width:auto; justify-content:flex-start; }
         .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
         .metric { padding:.72rem; }
-        .file-facts, .form-grid { grid-template-columns:1fr; }
+        .file-facts { grid-template-columns:minmax(0,1fr); }
+        .form-grid { grid-template-columns:1fr; }
         .review-row { grid-template-columns:2.3rem minmax(0,1fr); }
         .wide { grid-column:auto; }
         .suggestion-panel { grid-template-columns:1fr; }
