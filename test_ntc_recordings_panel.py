@@ -15,12 +15,14 @@ from ntc_recordings_app import (
     _humanize_classifier_evidence,
     _normalize_recording_email_message,
     _recording_id,
+    _sanitize_existing_testimony_transcripts,
     _testimony_filename_speaker_suggestion,
     _testimony_looks_like_message_recording,
     _testimony_suggestion_targets,
     _testimony_transcript_statuses_for_filter,
     _testimony_transcript_targets,
     _save_testimony_transcript,
+    _transcript_contains_prompt_echo,
     _valid_person_name_suggestion,
     create_app,
 )
@@ -1270,6 +1272,120 @@ class RecordingRequestPanelTests(unittest.TestCase):
             "Praise the Lord. I thank God for His faithfulness.\n\n"
             "God has helped our family through every season.",
         )
+
+    def test_prompt_only_transcript_is_rejected_and_retried(self):
+        testimony_source_root = self.root / "TestimonyReviewQueue"
+        testimony_source_root.mkdir()
+        recording = testimony_source_root / "07262026115802_DN-700R.mp3"
+        recording.write_bytes(b"prompt-echo-testimony-audio")
+        recording_id = _recording_id(recording)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    updated_at
+                )
+                VALUES (?, ?, 'needs_review', '2026-07-26', ?)
+                """,
+                (recording_id, str(recording), datetime.now(timezone.utc).isoformat()),
+            )
+
+        prompt_echo = (
+            "[start] introductions, and whether this sounds like a personal testimony "
+            "or a preached message.\n"
+            "introductions, and whether this sounds like a personal testimony "
+            "or a preached message."
+        )
+        self.assertTrue(_transcript_contains_prompt_echo(prompt_echo))
+        self.assertEqual(_display_transcript_text(prompt_echo), "")
+
+        _save_testimony_transcript(
+            self.app,
+            recording_id,
+            prompt_echo,
+            "recorder_manifest",
+            "",
+        )
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT transcript_text, transcript_source, transcript_error
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            ).fetchone()
+        self.assertEqual(row["transcript_text"], "")
+        self.assertEqual(row["transcript_source"], "")
+        self.assertIn("transcription instructions", row["transcript_error"])
+        targets = _testimony_transcript_targets(self.app, statuses={"needs_review"})
+        self.assertEqual([Path(item["candidate"].path).name for item in targets], [recording.name])
+        self._login()
+        review = self.client.get("/admin/recorder-review?status=needs_review")
+        self.assertNotIn(b"whether this sounds like", review.data)
+        self.assertNotIn(b">Testimony</strong>", review.data)
+        self.assertIn(b"Automatic transcript was rejected", review.data)
+        self.assertIn(b">Retry Analysis</button>", review.data)
+
+    def test_existing_prompt_only_transcript_is_migrated_to_retry(self):
+        testimony_source_root = self.root / "TestimonyReviewQueue"
+        testimony_source_root.mkdir()
+        recording = testimony_source_root / "REC00999.mp3"
+        recording.write_bytes(b"prompt-echo-testimony-audio")
+        recording_id = _recording_id(recording)
+        prompt_echo = (
+            "[start] Preserve speaker names, scripture references, sermon introductions, "
+            "and whether this sounds like a personal testimony or a preached message."
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    transcript_text,
+                    transcript_source,
+                    recorder_agent_kind,
+                    recorder_agent_action,
+                    updated_at
+                )
+                VALUES (?, ?, 'needs_review', '2026-07-26', ?, 'recorder_manifest', 'testimony', 'review', ?)
+                """,
+                (
+                    recording_id,
+                    str(recording),
+                    prompt_echo,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            connection.row_factory = sqlite3.Row
+            migrated = _sanitize_existing_testimony_transcripts(connection)
+
+        self.assertEqual(migrated, 1)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT transcript_text, transcript_source, transcript_error,
+                       recorder_agent_kind, recorder_agent_action
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            ).fetchone()
+        self.assertEqual(row["transcript_text"], "")
+        self.assertEqual(row["transcript_source"], "")
+        self.assertIn("transcription instructions", row["transcript_error"])
+        self.assertEqual(row["recorder_agent_kind"], "unknown")
+        self.assertEqual(row["recorder_agent_action"], "review")
 
     def test_identified_transcript_survives_testimony_rename(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"

@@ -96,6 +96,22 @@ TESTIMONY_EXPLICIT_INTRO_PATTERNS = [
     r"\bmy\s+testimony\b",
     r"\btestimony\s+is\b",
 ]
+TRANSCRIPTION_PROMPT_ECHO_PATTERNS = [
+    re.compile(r"\bpreserve\s+speaker\s+names\b", re.IGNORECASE),
+    re.compile(r"\bscripture\s+references,?\s+sermon\s+(?:titles|introductions)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:sermon\s+)?introductions?,?\s+(?:and\s+)?whether\s+this\s+sounds\s+like\s+a\s+personal\s+testimony\s+or\s+a\s+preached\s+message\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bwhether\s+this\s+sounds\s+like\s+a\s+personal\s+testimony\s+or\s+a\s+preached\s+message\b",
+        re.IGNORECASE,
+    ),
+]
+TRANSCRIPTION_PROMPT_ECHO_ERROR = (
+    "Automatic transcript was rejected because it contained transcription instructions "
+    "instead of recording content. Retry analysis."
+)
 MONTHS = {
     "jan": 1,
     "january": 1,
@@ -1373,6 +1389,7 @@ def _init_db(db_path: str) -> None:
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_status ON testimony_reviews(status)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_testimony_reviews_source_path ON testimony_reviews(source_path)")
+        _sanitize_existing_testimony_transcripts(connection)
 
 
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -2587,6 +2604,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     suggestion_source = str(row["suggestion_source"] or "") if row else ""
     suggestion_text = str(row["suggestion_text"] or "") if row else ""
     transcript_text = _row_optional_text(row, "transcript_text")
+    transcript_has_prompt_echo = _transcript_contains_prompt_echo(transcript_text)
     display_transcript_text = _display_transcript_text(transcript_text)
     transcript_source = _row_optional_text(row, "transcript_source")
     transcript_error = _row_optional_text(row, "transcript_error")
@@ -2598,6 +2616,15 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     recorder_agent_action = _row_optional_text(row, "recorder_agent_action")
     recorder_agent_reason = _row_optional_text(row, "recorder_agent_reason")
     recorder_agent_updated_at = _row_optional_text(row, "recorder_agent_updated_at")
+    if transcript_has_prompt_echo:
+        suggested_speaker = ""
+        suggestion_source = ""
+        suggestion_text = ""
+        transcript_source = ""
+        transcript_error = TRANSCRIPTION_PROMPT_ECHO_ERROR
+        recorder_agent_kind = "unknown"
+        recorder_agent_action = "review"
+        recorder_agent_reason = TRANSCRIPTION_PROMPT_ECHO_ERROR
     recorder_segment_kind = _row_optional_text(row, "recorder_segment_kind")
     recorder_segment_count_text = _row_optional_text(row, "recorder_segment_count")
     recorder_segment_likelihood_text = _row_optional_text(row, "recorder_segment_likelihood")
@@ -3146,7 +3173,7 @@ def _testimony_transcript_targets(app: Flask, limit: int | None = None, statuses
     for row in rows.values():
         if str(row["status"] or "") not in target_statuses:
             continue
-        if _row_optional_text(row, "transcript_text"):
+        if _display_transcript_text(_row_optional_text(row, "transcript_text")):
             skipped += 1
             continue
         candidate = _testimony_candidate_from_review_row(app, row)
@@ -3454,6 +3481,12 @@ def _save_testimony_review(
 
 
 def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: str, transcript_source: str, transcript_error: str) -> None:
+    if _transcript_contains_prompt_echo(transcript_text):
+        transcript_text = ""
+        transcript_source = ""
+        transcript_error = TRANSCRIPTION_PROMPT_ECHO_ERROR
+    else:
+        transcript_text = _display_transcript_text(transcript_text)
     updated_at = _utc_now()
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute(
@@ -3475,6 +3508,51 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
                 recording_id,
             ),
         )
+
+
+def _sanitize_existing_testimony_transcripts(connection: sqlite3.Connection) -> int:
+    invalid_rows = connection.execute(
+        """
+        SELECT recording_id, transcript_text
+        FROM testimony_reviews
+        WHERE COALESCE(transcript_text, '') <> ''
+        """
+    ).fetchall()
+    invalid_ids = [
+        str(row["recording_id"])
+        for row in invalid_rows
+        if _transcript_contains_prompt_echo(str(row["transcript_text"] or ""))
+    ]
+    if not invalid_ids:
+        return 0
+    updated_at = _utc_now()
+    connection.executemany(
+        """
+        UPDATE testimony_reviews
+        SET transcript_text = '',
+            transcript_source = '',
+            transcript_error = ?,
+            transcript_updated_at = ?,
+            recorder_agent_kind = 'unknown',
+            recorder_agent_action = 'review',
+            recorder_agent_reason = ?,
+            recorder_agent_updated_at = ?,
+            updated_at = ?
+        WHERE recording_id = ?
+        """,
+        [
+            (
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                updated_at,
+                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                updated_at,
+                updated_at,
+                recording_id,
+            )
+            for recording_id in invalid_ids
+        ],
+    )
+    return len(invalid_ids)
 
 
 def _testimony_quarantine_status_folder(status: str) -> str:
@@ -4121,6 +4199,8 @@ def _compact_transcript_excerpt(text: str, limit: int = 360) -> str:
 
 
 def _display_transcript_text(text: str) -> str:
+    if _transcript_contains_prompt_echo(text):
+        return ""
     chunks = []
     for chunk in re.split(r"\n{2,}", str(text or "")):
         cleaned = re.sub(r"^\[(?:start|\+\d+s)\]\s*", "", chunk.strip())
@@ -4131,6 +4211,11 @@ def _display_transcript_text(text: str) -> str:
         return "\n\n".join(chunks)
     cleaned = re.sub(r"(?m)^\[(?:start|\+\d+s)\]\s*", "", str(text or ""))
     return cleaned.replace("[no transcription returned]", "").strip()
+
+
+def _transcript_contains_prompt_echo(text: str) -> bool:
+    value = str(text or "")
+    return any(pattern.search(value) for pattern in TRANSCRIPTION_PROMPT_ECHO_PATTERNS)
 
 
 def _format_duration(seconds: float | None) -> str:
