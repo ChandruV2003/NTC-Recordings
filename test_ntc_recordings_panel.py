@@ -1692,6 +1692,114 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row, ("needs_review",))
 
+    def test_recorder_review_rejects_prompt_echo_manifest_decision(self):
+        intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
+        review_root = intake_root / "TestimonyReviewQueue"
+        staged_root = intake_root / "DN700R-primary"
+        review_root.mkdir(parents=True)
+        staged_root.mkdir(parents=True)
+        raw_recording = staged_root / "07262026115802_DN-700R.mp3"
+        raw_recording.write_bytes(b"prompt-echo-recorder-audio")
+        manifest_path = Path(self.tempdir.name) / "prompt-echo-manifest.sqlite3"
+        prompt_echo = (
+            "[start] introductions, and whether this sounds like a personal testimony "
+            "or a preached message."
+        )
+        stale_decision = {
+            "action": "review",
+            "recording_kind": "testimony",
+            "speaker": "",
+            "title": "",
+            "service_date": "2026-07-26",
+        }
+        with sqlite3.connect(manifest_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE recorder_files (
+                    staged_path TEXT NOT NULL,
+                    duration_seconds REAL,
+                    transcript_text TEXT NOT NULL DEFAULT '',
+                    transcript_source TEXT NOT NULL DEFAULT '',
+                    transcript_at TEXT NOT NULL DEFAULT '',
+                    classification TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    matched_path TEXT NOT NULL DEFAULT '',
+                    matched_kind TEXT NOT NULL DEFAULT '',
+                    agent_decision_json TEXT NOT NULL DEFAULT '',
+                    agent_review_reason TEXT NOT NULL DEFAULT '',
+                    last_seen_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO recorder_files (
+                    staged_path,
+                    duration_seconds,
+                    transcript_text,
+                    transcript_source,
+                    transcript_at,
+                    classification,
+                    status,
+                    agent_decision_json,
+                    agent_review_reason,
+                    last_seen_at
+                ) VALUES (?, ?, ?, 'local_transcription', ?, 'testimony_candidate', 'staged', ?, ?, ?)
+                """,
+                (
+                    str(raw_recording),
+                    45.84,
+                    prompt_echo,
+                    datetime.now(timezone.utc).isoformat(),
+                    json.dumps(stale_decision),
+                    "No testimony speaker/name was confirmed.",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+        db_path = Path(self.tempdir.name) / "prompt-echo-manifest-requests.db"
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "prompt-echo-manifest-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(db_path),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(review_root),
+                "NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS": str(intake_root),
+                "NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS": str(manifest_path),
+                "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
+                "NTC_RECORDINGS_TESTIMONY_REJECTED_DIR": str(self.rejected_root),
+                "NTC_RECORDINGS_ADMIN_PASSWORD": "admin-password",
+            }
+        )
+        client = app.test_client()
+        client.post("/admin/login", data={"password": "admin-password"})
+
+        response = client.get("/admin/recorder-review?status=needs_review")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(b"whether this sounds like", response.data)
+        self.assertNotIn(b">Testimony</strong>", response.data)
+        self.assertIn(b"Automatic transcript was rejected", response.data)
+        self.assertIn(b">Retry Analysis</button>", response.data)
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT transcript_text, transcript_source, transcript_error,
+                       recorder_agent_kind, recorder_agent_action, recorder_agent_reason
+                FROM testimony_reviews
+                WHERE source_path = ?
+                """,
+                (str(raw_recording),),
+            ).fetchone()
+        self.assertEqual(row["transcript_text"], "")
+        self.assertEqual(row["transcript_source"], "")
+        self.assertIn("transcription instructions", row["transcript_error"])
+        self.assertEqual(row["recorder_agent_kind"], "unknown")
+        self.assertEqual(row["recorder_agent_action"], "review")
+        self.assertIn("transcription instructions", row["recorder_agent_reason"])
+
     def test_recorder_review_reconciles_promoted_testimony_as_identified(self):
         intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
         review_root = intake_root / "TestimonyReviewQueue"

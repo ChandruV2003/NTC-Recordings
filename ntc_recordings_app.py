@@ -2482,6 +2482,8 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                         decision = parsed
                 except json.JSONDecodeError:
                     decision = {}
+            manifest_transcript_text = str(row["transcript_text"] or "")
+            manifest_transcript_has_prompt_echo = _transcript_contains_prompt_echo(manifest_transcript_text)
             agent_kind_raw = str(decision.get("recording_kind") or decision.get("kind") or "").strip().lower()
             agent_kind = _normalize_recording_kind(agent_kind_raw)
             if agent_kind == "unsure":
@@ -2490,10 +2492,18 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                 agent_kind = "testimony"
             agent_action = str(decision.get("action") or "").strip().lower()
             agent_reason = str(row["agent_review_reason"] or decision.get("reason") or decision.get("notes") or "").strip()
+            if manifest_transcript_has_prompt_echo:
+                agent_kind = "unknown"
+                agent_action = "review"
+                agent_reason = TRANSCRIPTION_PROMPT_ECHO_ERROR
             if not agent_kind and str(row["classification"] or "") == "testimony_candidate":
                 agent_kind = "testimony"
             service_date = _normalize_date(str(decision.get("service_date") or "")) or (str(existing["service_date"] or "") if existing else "") or candidate.recording_date
-            suggested_speaker = _valid_person_name_suggestion(str(decision.get("speaker") or ""), known_speakers)
+            suggested_speaker = (
+                ""
+                if manifest_transcript_has_prompt_echo
+                else _valid_person_name_suggestion(str(decision.get("speaker") or ""), known_speakers)
+            )
             existing_status = str(existing["status"] or "") if existing else ""
             if archived_testimony:
                 review_status = "identified"
@@ -2536,7 +2546,7 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                     duration_seconds=row["duration_seconds"],
                     suggested_speaker=suggested_speaker,
                     suggestion_source="recorder_manifest" if suggested_speaker else "",
-                    suggestion_text=_compact_transcript_excerpt(str(row["transcript_text"] or "")) if suggested_speaker else "",
+                    suggestion_text=_compact_transcript_excerpt(manifest_transcript_text) if suggested_speaker else "",
                     recorder_agent_kind=agent_kind,
                     recorder_agent_action=agent_action,
                     recorder_agent_reason=agent_reason,
@@ -2571,11 +2581,11 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                     recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
                 )
                 existing = _testimony_review_row(app, review_recording_id)
-            if row["transcript_text"] and (not existing or not _row_optional_text(existing, "transcript_text")):
+            if manifest_transcript_text and (not existing or not _row_optional_text(existing, "transcript_text")):
                 _save_testimony_transcript(
                     app,
                     review_recording_id,
-                    transcript_text=str(row["transcript_text"] or ""),
+                    transcript_text=manifest_transcript_text,
                     transcript_source=str(row["transcript_source"] or "recorder_manifest"),
                     transcript_error="",
                 )
@@ -2616,7 +2626,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     recorder_agent_action = _row_optional_text(row, "recorder_agent_action")
     recorder_agent_reason = _row_optional_text(row, "recorder_agent_reason")
     recorder_agent_updated_at = _row_optional_text(row, "recorder_agent_updated_at")
-    if transcript_has_prompt_echo:
+    if transcript_has_prompt_echo or transcript_error == TRANSCRIPTION_PROMPT_ECHO_ERROR:
         suggested_speaker = ""
         suggestion_source = ""
         suggestion_text = ""
