@@ -689,6 +689,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"grid-template-columns:minmax(0,1fr) 4.7rem auto;", review.data)
         self.assertIn(b".metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }", review.data)
         self.assertIn(b".listen-panel audio { display:block; max-width:100%; min-width:0; }", review.data)
+        self.assertIn(b"grid-template-columns:minmax(0,1fr);", review.data)
+        self.assertIn(b".listen-panel > * { min-width:0; max-width:100%; }", review.data)
         self.assertIn(b"@media (max-width:350px)", review.data)
         self.assertIn(b".panel-head > .probe-form > button { grid-column:1 / -1; }", review.data)
         self.assertIn(b"X-Requested-With", review.data)

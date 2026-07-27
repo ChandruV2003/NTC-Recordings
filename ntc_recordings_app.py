@@ -6276,11 +6276,18 @@ TESTIMONY_REVIEW_TEMPLATE = """
         min-width:0;
       }
       .listen-panel audio { display:block; max-width:100%; min-width:0; }
-      .listen-panel { display:grid; gap:.75rem; align-content:start; }
+      .listen-panel {
+        display:grid;
+        grid-template-columns:minmax(0,1fr);
+        gap:.75rem;
+        align-content:start;
+      }
+      .listen-panel > * { min-width:0; max-width:100%; }
       .file-facts {
         display:grid;
         grid-template-columns:repeat(2,minmax(0,1fr));
         gap:.55rem;
+        min-width:0;
       }
       .fact {
         border:1px solid rgba(143,211,255,.12);
