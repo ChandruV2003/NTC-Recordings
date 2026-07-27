@@ -180,7 +180,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b'href="/recordings/admin/panel"', review.data)
         self.assertIn(b'data-status-url="/recordings/admin/testimonies/transcript-status"', review.data)
         self.assertIn(b'action="/recordings/admin/testimonies/', review.data)
-        self.assertIn(b'formaction="/recordings/admin/testimonies/', review.data)
+        self.assertNotIn(b'formaction="/recordings/admin/testimonies/', review.data)
         self.assertIn(b'data-src="/recordings/admin/testimonies/audio/', review.data)
         legacy_review = self.client.get("/admin/testimonies?status=all", base_url="https://ntcnas.myftp.org")
         self.assertEqual(legacy_review.status_code, 302)
@@ -667,9 +667,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b"Process Suggestions", review.data)
         self.assertIn(b"Group / Event Title", review.data)
         self.assertIn(b"Grouped", review.data)
-        self.assertIn(b"Retry Missing Analysis", review.data)
+        self.assertNotIn(b"Retry Missing Analysis", review.data)
         self.assertNotIn(b"Recording Shape", review.data)
-        self.assertIn(b">Retry Analysis</button>", review.data)
+        self.assertNotIn(b">Retry Analysis</button>", review.data)
+        self.assertIn(b"Recording Type", review.data)
+        self.assertIn(b">Save Type</button>", review.data)
+        self.assertNotIn(b">Message/Event", review.data)
         self.assertNotIn(b"Process Transcripts", review.data)
         self.assertNotIn(b"Quarantine Rejected", review.data)
         self.assertNotIn(b'data-suggestion-job', review.data)
@@ -724,13 +727,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
             connection.commit()
         classified = self.client.get("/admin/recorder-review")
-        self.assertIn(b"Recording Classification", classified.data)
+        self.assertIn(b"Recording Structure", classified.data)
         self.assertNotIn(b"Recording Shape", classified.data)
 
         identified = self.client.get("/admin/recorder-review?status=identified")
         self.assertEqual(identified.status_code, 200)
         self.assertIn(b"20250413 - Sister Rachel", identified.data)
-        self.assertIn(b"Retry Missing Analysis", identified.data)
+        self.assertNotIn(b"Retry Missing Analysis", identified.data)
 
         audio = self.client.get(f"/admin/testimonies/audio/{recording_id}")
         self.assertEqual(audio.status_code, 200)
@@ -1027,7 +1030,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         grouped = self.client.get("/admin/recorder-review?status=grouped").data
         self.assertIn(b"Testimonies Part 1", grouped)
         self.assertIn(b"Grouped", grouped)
-        self.assertIn(b"Retry Missing Analysis", grouped)
+        self.assertNotIn(b"Retry Missing Analysis", grouped)
 
     def test_testimony_review_quarantines_rejected_recordings(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -1295,7 +1298,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(started.status_code, 200)
         self.assertIn(b"Started retrying missing recorder analysis", started.data)
         starter.assert_called_once()
-        self.assertEqual(starter.call_args.kwargs["statuses"], {"needs_review"})
+        self.assertEqual(starter.call_args.kwargs["statuses"], {"needs_review", "message_review"})
 
     def test_identified_testimony_transcripts_are_saved_and_skipped_afterwards(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -1415,7 +1418,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b"whether this sounds like", review.data)
         self.assertNotIn(b">Testimony</strong>", review.data)
         self.assertIn(b"Automatic transcript was rejected", review.data)
-        self.assertIn(b">Retry Analysis</button>", review.data)
+        self.assertNotIn(b">Retry Analysis</button>", review.data)
 
     def test_existing_prompt_only_transcript_is_migrated_to_retry(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -1594,12 +1597,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual([Path(item["candidate"].path).name for item in targets], ["REC00101.mp3"])
         with sqlite3.connect(self.db_path) as connection:
             named_row = connection.execute(
-                "SELECT status FROM testimony_reviews WHERE recording_id = ?",
+                "SELECT status, recorder_agent_kind FROM testimony_reviews WHERE recording_id = ?",
                 (_recording_id(named_message),),
             ).fetchone()
 
         self.assertIsNotNone(named_row)
-        self.assertEqual(named_row[0], "message_review")
+        self.assertEqual(named_row, ("needs_review", "message"))
 
     def test_bulk_testimony_suggestions_mark_long_message_like_rows(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -1642,11 +1645,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(recording_id, [item["candidate"].id for item in targets])
         with sqlite3.connect(self.db_path) as connection:
             row = connection.execute(
-                "SELECT status, suggestion_text FROM testimony_reviews WHERE recording_id = ?",
+                "SELECT status, suggestion_text, recorder_agent_kind FROM testimony_reviews WHERE recording_id = ?",
                 (recording_id,),
             ).fetchone()
-        self.assertEqual(row[0], "message_review")
+        self.assertEqual(row[0], "needs_review")
         self.assertIn("Shall we turn", row[1])
+        self.assertEqual(row[2], "message")
 
     def test_intro_speaker_suggestions_require_person_names(self):
         self.assertEqual(
@@ -1921,7 +1925,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b"whether this sounds like", response.data)
         self.assertNotIn(b">Testimony</strong>", response.data)
         self.assertIn(b"Automatic transcript was rejected", response.data)
-        self.assertIn(b">Retry Analysis</button>", response.data)
+        self.assertNotIn(b">Retry Analysis</button>", response.data)
         with sqlite3.connect(db_path) as connection:
             connection.row_factory = sqlite3.Row
             row = connection.execute(
