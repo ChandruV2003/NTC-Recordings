@@ -708,12 +708,16 @@ class RecordingRequestPanelTests(unittest.TestCase):
         with sqlite3.connect(self.db_path) as connection:
             connection.execute(
                 """
-                UPDATE testimony_reviews
-                SET recorder_segment_kind = 'testimony',
-                    recorder_segment_count = 1
-                WHERE recording_id = ?
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    recorder_segment_kind,
+                    recorder_segment_count,
+                    updated_at
+                )
+                VALUES (?, ?, 'testimony', 1, ?)
                 """,
-                (recording_id,),
+                (recording_id, str(raw_recording), datetime.now(timezone.utc).isoformat()),
             )
             connection.commit()
         classified = self.client.get("/admin/recorder-review")
