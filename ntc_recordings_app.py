@@ -6456,7 +6456,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
           gap:.35rem;
         }
         .actions > a, .actions > form { flex:0 0 auto; min-width:0; }
-        .actions > form > button, header .actions a { width:100%; min-width:0; }
+        .actions > form > button { width:100%; min-width:0; }
+        header .actions a { width:auto; min-width:0; }
         header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.5rem .3rem; font-size:.72rem; border-radius:12px; }
         .tabs { width:100%; }
         .tab { width:auto; justify-content:flex-start; }
