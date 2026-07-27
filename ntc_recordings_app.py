@@ -6167,7 +6167,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .banner-stack:empty { display:none; }
       .metrics {
         display:grid;
-        grid-template-columns:repeat(7,minmax(0,1fr));
+        grid-template-columns:repeat(6,minmax(0,1fr));
         gap:.65rem;
         margin:.65rem 0 1rem;
       }
@@ -6552,7 +6552,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
       @media (max-width:1100px) {
         .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
-        .metric:last-child { grid-column:1 / -1; }
         .toolbar, .review-body { grid-template-columns:1fr; }
         .tabs { width:100%; }
         .toolbar-actions, .probe-form { justify-content:flex-start; }
@@ -7289,7 +7288,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
         const message = panel.querySelector("[data-job-message]");
         const counts = panel.querySelector("[data-job-counts]");
         const current = panel.querySelector("[data-job-current]");
-        const button = document.querySelector("[data-process-transcripts-button]");
         const priorState = panel.dataset.state || "";
 
         panel.hidden = !["running", "finished", "failed"].includes(job.state);
@@ -7300,9 +7298,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
         if (current) {
           current.textContent = job.current ? `Now analyzing ${job.current}` : "";
-        }
-        if (button) {
-          button.disabled = job.state === "running";
         }
         if (priorState === "running" && ["finished", "failed"].includes(job.state)) {
           const tag = document.activeElement ? document.activeElement.tagName : "";
