@@ -6091,7 +6091,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .tabs {
         display:flex;
         flex-wrap:nowrap;
-        gap:.35rem;
+        gap:.3rem;
         padding:.28rem;
         border:1px solid var(--line);
         border-radius:999px;
@@ -6110,12 +6110,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
         display:flex;
         flex:0 0 auto;
         align-items:center;
-        gap:.44rem;
+        gap:.34rem;
         border-color:transparent;
         border-radius:999px;
         background:transparent;
         color:var(--muted);
-        padding:.5rem .72rem;
+        padding:.5rem .5rem;
         font-size:.84rem;
         line-height:1;
         white-space:nowrap;
