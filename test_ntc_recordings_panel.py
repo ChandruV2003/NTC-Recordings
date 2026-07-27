@@ -1870,6 +1870,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         )
         refreshed = client.get("/admin/recorder-review?status=needs_review")
         self.assertIn(b"Automatic transcription is busy", refreshed.data)
+        self.assertNotIn(b"Automatic transcript was rejected", refreshed.data)
         self.assertNotIn(b"whether this sounds like", refreshed.data)
         self.assertNotIn(b"429 Client Error", refreshed.data)
         self.assertNotIn(b"100.109.220.95", refreshed.data)

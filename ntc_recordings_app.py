@@ -2484,6 +2484,11 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                 if staged_candidate:
                     existing = _testimony_review_row(app, staged_candidate.id)
             review_recording_id = str(existing["recording_id"] or "") if existing else candidate.id
+            existing_transcript_error = (
+                _friendly_transcription_error(_row_optional_text(existing, "transcript_error"))
+                if existing
+                else ""
+            )
             decision = {}
             if row["agent_decision_json"]:
                 try:
@@ -2505,7 +2510,7 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
             if manifest_transcript_has_prompt_echo:
                 agent_kind = "unknown"
                 agent_action = "review"
-                agent_reason = TRANSCRIPTION_PROMPT_ECHO_ERROR
+                agent_reason = existing_transcript_error or TRANSCRIPTION_PROMPT_ECHO_ERROR
             if not agent_kind and str(row["classification"] or "") == "testimony_candidate":
                 agent_kind = "testimony"
             service_date = _normalize_date(str(decision.get("service_date") or "")) or (str(existing["service_date"] or "") if existing else "") or candidate.recording_date
@@ -2591,11 +2596,6 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                     recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
                 )
                 existing = _testimony_review_row(app, review_recording_id)
-            existing_transcript_error = (
-                _friendly_transcription_error(_row_optional_text(existing, "transcript_error"))
-                if existing
-                else ""
-            )
             should_import_manifest_transcript = (
                 bool(manifest_transcript_text)
                 and (not existing or not _row_optional_text(existing, "transcript_text"))
