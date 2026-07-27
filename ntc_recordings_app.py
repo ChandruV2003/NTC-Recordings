@@ -6090,7 +6090,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
       .tabs {
         display:flex;
-        flex-wrap:wrap;
+        flex-wrap:nowrap;
         gap:.35rem;
         padding:.28rem;
         border:1px solid var(--line);
@@ -6098,9 +6098,17 @@ TESTIMONY_REVIEW_TEMPLATE = """
         background:rgba(5,13,24,.58);
         width:max-content;
         max-width:100%;
+        min-width:0;
+        overflow-x:auto;
+        overflow-y:hidden;
+        overscroll-behavior-inline:contain;
+        scrollbar-width:none;
+        -webkit-overflow-scrolling:touch;
       }
+      .tabs::-webkit-scrollbar { display:none; }
       .tab {
         display:flex;
+        flex:0 0 auto;
         align-items:center;
         gap:.44rem;
         border-color:transparent;
@@ -6110,6 +6118,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         padding:.5rem .72rem;
         font-size:.84rem;
         line-height:1;
+        white-space:nowrap;
       }
       .tab.active {
         color:var(--text);
@@ -6407,6 +6416,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       @media (max-width:1100px) {
         .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
         .toolbar, .review-body { grid-template-columns:1fr; }
+        .tabs { width:100%; }
         .toolbar-actions, .probe-form { justify-content:flex-start; }
         .job-panel { flex-direction:column; align-items:flex-start; }
         .review-row { grid-template-columns:2.3rem minmax(0,1fr) minmax(0,1fr); align-items:start; }
@@ -6423,8 +6433,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .actions > a, .actions > form { flex:1 1 0; min-width:0; }
         .actions > form > button, header .actions a { width:100%; min-width:0; }
         header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.5rem .3rem; font-size:.72rem; border-radius:12px; }
-        .tabs { width:100%; border-radius:22px; }
-        .tab { width:100%; justify-content:space-between; }
+        .tabs { width:100%; }
+        .tab { width:auto; justify-content:flex-start; }
         .metrics, .file-facts, .form-grid { grid-template-columns:1fr; }
         .review-row { grid-template-columns:2.3rem minmax(0,1fr); }
         .wide { grid-column:auto; }
