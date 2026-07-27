@@ -6683,7 +6683,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                       {% if item.recorder_segment_kind %}
                         <div class="suggestion-panel subdued segment-shape-panel">
                           <div>
-                            <span>Recording Shape</span>
+                            <span>Recording Classification</span>
                             <strong>{{ item.recorder_segment_kind_label }}</strong>
                             {% if item.recorder_segment_kind == "combined" and item.recorder_segment_likelihood_label %}
                               <small>Split review likely: {{ item.recorder_segment_likelihood_label }}</small>

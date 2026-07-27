@@ -665,6 +665,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Group / Event Title", review.data)
         self.assertIn(b"Grouped", review.data)
         self.assertIn(b"Retry Missing Analysis", review.data)
+        self.assertNotIn(b"Recording Shape", review.data)
         self.assertIn(b">Retry Analysis</button>", review.data)
         self.assertNotIn(b"Process Transcripts", review.data)
         self.assertNotIn(b"Quarantine Rejected", review.data)
@@ -703,12 +704,27 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b"Already Named", review.data)
         self.assertNotIn(b"20250413 - Sister Rachel", review.data)
 
+        recording_id = _recording_id(raw_recording)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE testimony_reviews
+                SET recorder_segment_kind = 'testimony',
+                    recorder_segment_count = 1
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            )
+            connection.commit()
+        classified = self.client.get("/admin/recorder-review")
+        self.assertIn(b"Recording Classification", classified.data)
+        self.assertNotIn(b"Recording Shape", classified.data)
+
         identified = self.client.get("/admin/recorder-review?status=identified")
         self.assertEqual(identified.status_code, 200)
         self.assertIn(b"20250413 - Sister Rachel", identified.data)
         self.assertIn(b"Retry Missing Analysis", identified.data)
 
-        recording_id = _recording_id(raw_recording)
         audio = self.client.get(f"/admin/testimonies/audio/{recording_id}")
         self.assertEqual(audio.status_code, 200)
         self.assertEqual(audio.data, b"raw-testimony-audio")
