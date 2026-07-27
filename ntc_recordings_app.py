@@ -2283,8 +2283,9 @@ def _testimony_recorder_manifest_paths(app: Flask) -> list[Path]:
     return _configured_path_list(str(app.config.get("NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS") or ""))
 
 
-def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
+def _sync_testimony_recorder_manifest_reviews(app: Flask) -> set[str]:
     known_speakers = _testimony_known_speakers(app)
+    archived_non_review_paths: set[str] = set()
     for manifest_path in _testimony_recorder_manifest_paths(app):
         if not manifest_path.exists() or not manifest_path.is_file():
             continue
@@ -2343,7 +2344,7 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                   )
                   OR (
                     rf.status = 'already_archived'
-                    AND rf.matched_kind = 'testimony'
+                    AND rf.matched_kind <> ''
                     AND rf.matched_path <> ''
                   )
                 ORDER BY rf.last_seen_at DESC
@@ -2361,6 +2362,18 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
 
         for row in rows:
             staged_path = Path(str(row["staged_path"] or ""))
+            archived_kind = _normalize_recording_kind(str(row["matched_kind"] or ""))
+            archived_non_review = (
+                str(row["status"] or "") == "already_archived"
+                and archived_kind in {"message", "worship", "event", "combined"}
+                and bool(str(row["matched_path"] or "").strip())
+            )
+            if archived_non_review:
+                archived_non_review_paths.add(str(staged_path))
+                staged_candidate = _testimony_source_candidate_from_path(app, staged_path)
+                if staged_candidate:
+                    _delete_testimony_review(app, staged_candidate.id)
+                continue
             archived_testimony = (
                 str(row["status"] or "") == "already_archived"
                 and str(row["matched_kind"] or "") == "testimony"
@@ -2501,6 +2514,7 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> None:
                     transcript_source=str(row["transcript_source"] or "recorder_manifest"),
                     transcript_error="",
                 )
+    return archived_non_review_paths
 
 
 def _testimony_candidate_from_review_row(app: Flask, row: sqlite3.Row) -> RecordingCandidate | None:
@@ -2644,13 +2658,15 @@ def _testimony_review_row_is_quarantined(row: sqlite3.Row) -> bool:
 
 
 def _testimony_review_items(app: Flask) -> list[dict]:
-    _sync_testimony_recorder_manifest_reviews(app)
+    archived_non_review_paths = _sync_testimony_recorder_manifest_reviews(app)
     rows = _testimony_review_rows(app)
     known_speakers = _testimony_known_speakers(app)
     items = []
     seen_row_ids = set()
     seen_paths = set()
     for candidate in _testimony_source_candidates(app):
+        if candidate.path in archived_non_review_paths:
+            continue
         row = rows.get(candidate.id)
         if row and _testimony_review_row_is_quarantined(row):
             seen_row_ids.add(str(row["recording_id"]))
