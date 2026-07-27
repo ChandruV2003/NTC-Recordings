@@ -6266,13 +6266,16 @@ TESTIMONY_REVIEW_TEMPLATE = """
         padding:1rem;
         background:linear-gradient(180deg,rgba(143,211,255,.028),rgba(4,11,20,.12));
         align-items:start;
+        min-width:0;
       }
       .listen-panel, .edit-panel, .path-panel {
         border:1px solid rgba(143,211,255,.16);
         border-radius:18px;
         background:rgba(5,13,24,.45);
         padding:.9rem;
+        min-width:0;
       }
+      .listen-panel audio { display:block; max-width:100%; min-width:0; }
       .listen-panel { display:grid; gap:.75rem; align-content:start; }
       .file-facts {
         display:grid;
@@ -6469,6 +6472,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .suggestion-panel { grid-template-columns:1fr; }
         .segment-row { grid-template-columns:1fr; }
         .button-row, .button-row button, .toolbar-actions, .probe-form, .probe-form input, .probe-form button { width:100%; }
+      }
+      @media (max-width:350px) {
+        header .eyebrow { font-size:.68rem; letter-spacing:.08em; }
+        header .actions { gap:.25rem; }
+        header .actions a, header .actions button { padding:.45rem .25rem; font-size:.68rem; }
+        .panel-head > .probe-form { grid-template-columns:minmax(0,1fr) 4.7rem; }
+        .panel-head > .probe-form > button { grid-column:1 / -1; }
       }
     </style>
   </head>
