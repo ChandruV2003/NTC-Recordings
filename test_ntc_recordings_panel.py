@@ -928,7 +928,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "status_filter": "needs_review",
                 "source_path": str(raw_recording),
                 "service_date": "2026-07-26",
-                "recording_kind": "worship",
+                "recording_kind": "message",
                 "group_title": "Stale overwrite",
                 "review_revision": "0",
             },
@@ -956,6 +956,37 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual(row, ("needs_review", "The Lord Is Faithful", "message", 1))
         self.assertEqual(history, [("save_review", "needs_review", "needs_review", "message")])
+
+    def test_ntc_recorder_review_rejects_worship_destination(self):
+        testimony_source_root = self.root / "TestimonyReviewQueue"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "07262026115900_DN-700R.mp3"
+        raw_recording.write_bytes(b"ntc-dn700r-audio")
+        recording_id = _recording_id(raw_recording)
+
+        self._login()
+        response = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "action": "save_review",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2026-07-26",
+                "recording_kind": "worship",
+                "review_revision": "0",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "Choose Testimony or Message before saving.")
+        self.assertTrue(raw_recording.exists())
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT recorder_agent_kind FROM testimony_reviews WHERE recording_id = ?",
+                (recording_id,),
+            ).fetchone()
+        self.assertIsNone(row)
 
     def test_background_analysis_preserves_human_review_fields(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -1485,7 +1516,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self._login()
         review_before = self.client.get("/admin/recorder-review?status=identified")
         self.assertEqual(review_before.status_code, 200)
-        self.assertIn(b"Automatic analysis has not completed.", review_before.data)
+        self.assertIn(b"Automatic analysis is queued.", review_before.data)
+        self.assertIn(b"<span>Recording Type</span>", review_before.data)
+        self.assertIn(b'data-field="recording-kind-label">Testimony</strong>', review_before.data)
+        self.assertIn(b"No alternate suggestion", review_before.data)
+        self.assertIn(b"choose Testimony or Message", review_before.data)
+        self.assertNotIn(b"Testimony, Message, or Worship", review_before.data)
+        self.assertNotIn(b'<option value="worship"', review_before.data)
 
         _save_testimony_transcript(
             self.app,
@@ -2334,6 +2371,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["classification"], "message_candidate")
         self.assertEqual(payload["transcript_text"], transcript)
+        self.assertEqual(payload["recorder_lane"], "ntc-dn700r")
+        self.assertEqual(payload["allowed_recording_kinds"], ["testimony", "message", "noise"])
 
     def test_newer_recorder_review_decision_survives_stale_manifest_sync(self):
         intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"

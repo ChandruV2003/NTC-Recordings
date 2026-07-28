@@ -58,6 +58,7 @@ DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rej
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
 RECORDER_REVIEW_ANALYSIS_VERSION = "recorder-review-v2"
+RECORDER_REVIEW_ALLOWED_KINDS = ("testimony", "message")
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
 TESTIMONY_REVIEW_STATUSES = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"}
 TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate"}
@@ -1013,8 +1014,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         if requested_status == "message_review":
             requested_status = "needs_review"
         if requested_action == "save_review":
-            if recording_kind not in {"testimony", "message", "worship"}:
-                review_error = "Choose Testimony, Message, or Worship before saving."
+            if recording_kind not in RECORDER_REVIEW_ALLOWED_KINDS:
+                review_error = "Choose Testimony or Message before saving."
                 if _wants_json_response():
                     return jsonify({"ok": False, "error": review_error}), 400
                 return _redirect_to(
@@ -1072,7 +1073,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             speaker_name = ""
             testimony_title = group_title or "Testimonies"
         elif status == "needs_review":
-            testimony_title = group_title if recording_kind in {"message", "worship"} else ""
+            testimony_title = group_title if recording_kind == "message" else ""
         else:
             testimony_title = _testimony_title_for_speaker(speaker_name)
         notes = str(existing["notes"] or "") if existing else ""
@@ -1198,7 +1199,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "service_date": service_date,
                     "service_date_label": _format_date(service_date),
                     "speaker_name": speaker_name,
-                    "group_title": testimony_title if status == "grouped" or recording_kind in {"message", "worship"} else "",
+                    "group_title": testimony_title if status == "grouped" or recording_kind == "message" else "",
                     "title": candidate.title,
                     "source_label": Path(candidate.path).name,
                     "source_path": candidate.path,
@@ -2953,6 +2954,20 @@ def _testimony_candidate_from_review_row(app: Flask, row: sqlite3.Row) -> Record
     return None
 
 
+def _recorder_review_display_kind(
+    candidate: RecordingCandidate,
+    row: sqlite3.Row | None,
+    status: str,
+) -> str:
+    stored_kind = _normalize_recording_kind(_row_optional_text(row, "recorder_agent_kind"))
+    if stored_kind in RECORDER_REVIEW_ALLOWED_KINDS:
+        return stored_kind
+
+    if status in {"identified", "grouped"}:
+        return "testimony"
+    return "unsure"
+
+
 def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlite3.Row | None, known_speakers: Iterable[str]) -> dict:
     duration_seconds = _row_duration(row) if row else None
     status = _testimony_status_for_candidate(app, candidate, row, duration_seconds)
@@ -3011,6 +3026,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
             suggestion_text = Path(candidate.path).name
     if not service_date:
         service_date = candidate.recording_date
+    review_recording_kind = _recorder_review_display_kind(candidate, row, status)
     event_folder = _testimony_event_folder(service_date)
     if not proposed_path and status in {"identified", "grouped"}:
         proposed_path = _proposed_testimony_path(
@@ -3033,7 +3049,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "service_date": service_date,
         "speaker_name": speaker_name,
         "testimony_title": testimony_title,
-        "group_title": testimony_title if status == "grouped" or recorder_agent_kind in {"message", "worship"} else "",
+        "group_title": testimony_title if status == "grouped" or review_recording_kind == "message" else "",
         "event_group": event_folder[1] if event_folder else "",
         "notes": notes,
         "proposed_path": proposed_path,
@@ -3056,6 +3072,8 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "quarantined_label": _format_datetime(quarantined_at),
         "recorder_agent_kind": recorder_agent_kind,
         "recorder_agent_kind_label": _recorder_agent_kind_label(recorder_agent_kind),
+        "review_recording_kind": review_recording_kind,
+        "review_recording_kind_label": _recorder_agent_kind_label(review_recording_kind),
         "recorder_agent_action": recorder_agent_action,
         "recorder_agent_action_label": _recorder_agent_action_label(recorder_agent_action),
         "recorder_agent_reason": recorder_agent_reason,
@@ -3522,6 +3540,8 @@ def _classify_recorder_review_transcript(
         "speaker_name": str(row["speaker_name"] or ""),
         "filename": Path(candidate.path).name,
         "source_relative_path": str(candidate.relative_path or Path(candidate.path).name),
+        "recorder_lane": "ntc-dn700r",
+        "allowed_recording_kinds": [*RECORDER_REVIEW_ALLOWED_KINDS, "noise"],
     }
     headers = {"Accept": "application/json"}
     agent_token = str(app.config.get("NTC_RECORDINGS_AGENT_TOKEN") or "").strip()
@@ -3543,13 +3563,22 @@ def _classify_recorder_review_transcript(
         return None
 
     recording_kind = _normalize_recording_kind(str(result.get("recording_kind") or ""))
-    if recording_kind not in {"testimony", "message", "worship"}:
+    invalid_kind_reason = ""
+    if recording_kind == "worship":
+        invalid_kind_reason = (
+            "Worship is not a valid destination for the NTC DN700R lane; "
+            "the recording was left for Message or Testimony review."
+        )
+        recording_kind = "unknown"
+    elif recording_kind not in RECORDER_REVIEW_ALLOWED_KINDS:
         recording_kind = "unknown"
     reasons = result.get("reasons")
     if isinstance(reasons, list):
         reason = "; ".join(str(value).strip() for value in reasons if str(value).strip())
     else:
         reason = str(result.get("reason") or "").strip()
+    if invalid_kind_reason:
+        reason = "; ".join(value for value in (reason, invalid_kind_reason) if value)
     reason = f"{RECORDER_REVIEW_ANALYSIS_VERSION}: {reason or 'Automatic transcript classification completed.'}"
     return {
         "recording_kind": recording_kind,
@@ -8094,7 +8123,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div class="panel-head">
           <div>
             <h2>{{ status_label(status_filter) }}</h2>
-            <p class="muted">Listen, confirm the service date, then choose Testimony, Message, or Worship and complete any needed details.</p>
+            <p class="muted">Listen, confirm the service date, then choose Testimony or Message and complete any needed details.</p>
           </div>
           <form class="probe-form" method="get" action="{{ recordings_url_for('testimony_review') }}">
             <input type="hidden" name="status" value="{{ status_filter }}">
@@ -8187,18 +8216,16 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           </div>
                         </div>
                       {% endif %}
-                      {% if item.recorder_agent_kind %}
-                        <div class="suggestion-panel subdued agent-decision-panel">
-                          <div>
-                            <span>Recording Type</span>
-                            <strong>{{ item.recorder_agent_kind_label }}</strong>
-                            {% if item.recorder_agent_reason_label %}<small>{{ item.recorder_agent_reason_label }}</small>{% endif %}
-                          </div>
-                          {% if item.recorder_agent_action_label %}
-                            <small>{{ item.recorder_agent_action_label }}</small>
-                          {% endif %}
+                      <div class="suggestion-panel subdued agent-decision-panel">
+                        <div>
+                          <span>Recording Type</span>
+                          <strong data-field="recording-kind-label">{{ item.review_recording_kind_label }}</strong>
+                          {% if item.recorder_agent_reason_label %}<small>{{ item.recorder_agent_reason_label }}</small>{% endif %}
                         </div>
-                      {% endif %}
+                        {% if item.recorder_agent_action_label %}
+                          <small>{{ item.recorder_agent_action_label }}</small>
+                        {% endif %}
+                      </div>
                       {% if item.recorder_segment_kind == "combined" or item.recorder_segment_count > 1 or item.recorder_segment_warnings %}
                         <div class="suggestion-panel subdued segment-shape-panel">
                           <div>
@@ -8255,6 +8282,14 @@ TESTIMONY_REVIEW_TEMPLATE = """
                             <small>Automatic analysis did not find a reliable person name.</small>
                           </div>
                         </div>
+                      {% else %}
+                        <div class="suggestion-panel subdued speaker-assist-panel">
+                          <div>
+                            <span>Suggested Speaker</span>
+                            <strong>No alternate suggestion</strong>
+                            <small>The current speaker is already confirmed.</small>
+                          </div>
+                        </div>
                       {% endif %}
                       <div class="suggestion-panel subdued transcript-panel speaker-transcript-panel">
                         <div>
@@ -8287,10 +8322,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
                     <label class="classification-field">
                       <span>Recording Type</span>
                       <select name="recording_kind">
-                        <option value="" {% if item.recorder_agent_kind not in ["testimony", "message", "worship"] %}selected{% endif %}>Choose type</option>
-                        <option value="testimony" {% if item.recorder_agent_kind == "testimony" %}selected{% endif %}>Testimony</option>
-                        <option value="message" {% if item.recorder_agent_kind == "message" %}selected{% endif %}>Message</option>
-                        <option value="worship" {% if item.recorder_agent_kind == "worship" %}selected{% endif %}>Worship</option>
+                        <option value="" {% if item.review_recording_kind not in ["testimony", "message"] %}selected{% endif %}>Choose type</option>
+                        <option value="testimony" {% if item.review_recording_kind == "testimony" %}selected{% endif %}>Testimony</option>
+                        <option value="message" {% if item.review_recording_kind == "message" %}selected{% endif %}>Message</option>
                       </select>
                     </label>
                     <div class="button-row">
@@ -8483,6 +8517,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         setText(card, "file-fact", data.source_label);
         setText(card, "service-date-label", data.service_date_label);
         setText(card, "speaker", data.speaker_name || "Not set");
+        setText(card, "recording-kind-label", data.recording_kind_label || "Needs Review");
 
         const statusPill = card.querySelector('[data-field="status-pill"]');
         if (statusPill && data.status) {
@@ -8514,6 +8549,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
         setInputValue(card, "speaker_name", data.speaker_name || "");
         setInputValue(card, "group_title", data.group_title || "");
         setInputValue(card, "review_revision", data.review_revision);
+        const recordingKind = card.querySelector('select[name="recording_kind"]');
+        if (recordingKind) {
+          recordingKind.value = ["testimony", "message"].includes(data.recording_kind || "")
+            ? data.recording_kind
+            : "";
+        }
 
         const audio = card.querySelector("audio[data-src]");
         if (audio && data.audio_url && audio.dataset.src !== data.audio_url) {
@@ -8522,9 +8563,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
           audio.dataset.src = data.audio_url;
           audio.load();
           if (card.open) hydrateReviewAudio(card);
-        }
-        if (!(data.suggested_speaker || data.suggestion_source || data.suggestion_text)) {
-          card.querySelectorAll(".speaker-assist-panel").forEach((panel) => panel.remove());
         }
         if (data.transcript_text && !data.transcript_error) {
           card.querySelector("[data-retry-analysis]")?.remove();
@@ -8551,62 +8589,61 @@ TESTIMONY_REVIEW_TEMPLATE = """
 
         const speakerInput = form.querySelector('input[name="speaker_name"]');
         const currentSpeaker = speakerInput ? speakerInput.value : (data.speaker_name || "");
-        const hasSuggestionState = Boolean(data.suggested_speaker || data.suggestion_source || data.suggestion_text);
-        if (data.suggested_speaker || (!currentSpeaker && hasSuggestionState)) {
-          const panel = document.createElement("div");
-          panel.className = data.suggested_speaker ? "suggestion-panel speaker-assist-panel" : "suggestion-panel subdued speaker-assist-panel";
-          const textWrap = document.createElement("div");
-          const label = document.createElement("span");
-          label.textContent = "Suggested Speaker";
-          const strong = document.createElement("strong");
-          strong.textContent = data.suggested_speaker || "No suggested speaker";
-          textWrap.append(label, strong);
-          if (data.suggested_speaker && data.suggestion_source_label) {
-            const small = document.createElement("small");
-            small.textContent = data.suggestion_source_label;
-            textWrap.appendChild(small);
-          }
-          panel.appendChild(textWrap);
-          if (data.suggested_speaker && data.suggested_speaker !== currentSpeaker) {
-            const button = document.createElement("button");
-            button.className = "secondary apply-suggestion";
-            button.type = "button";
-            button.dataset.speaker = data.suggested_speaker;
-            button.textContent = "Use Suggestion";
-            panel.appendChild(button);
-          }
-          if (data.suggestion_text && !["transcript_intro", "transcript_excerpt"].includes(data.suggestion_source || "")) {
-            const paragraph = document.createElement("p");
-            paragraph.textContent = data.suggestion_text;
-            panel.appendChild(paragraph);
-          }
-          editPanel.appendChild(panel);
+        const panel = document.createElement("div");
+        panel.className = data.suggested_speaker ? "suggestion-panel speaker-assist-panel" : "suggestion-panel subdued speaker-assist-panel";
+        const textWrap = document.createElement("div");
+        const label = document.createElement("span");
+        label.textContent = "Suggested Speaker";
+        const strong = document.createElement("strong");
+        strong.textContent = data.suggested_speaker || (currentSpeaker ? "No alternate suggestion" : "No suggested speaker");
+        textWrap.append(label, strong);
+        const small = document.createElement("small");
+        if (data.suggested_speaker && data.suggestion_source_label) {
+          small.textContent = data.suggestion_source_label;
+        } else if (currentSpeaker) {
+          small.textContent = "The current speaker is already confirmed.";
+        } else {
+          small.textContent = "Automatic analysis did not find a reliable person name.";
         }
+        textWrap.appendChild(small);
+        panel.appendChild(textWrap);
+        if (data.suggested_speaker && data.suggested_speaker !== currentSpeaker) {
+          const button = document.createElement("button");
+          button.className = "secondary apply-suggestion";
+          button.type = "button";
+          button.dataset.speaker = data.suggested_speaker;
+          button.textContent = "Use Suggestion";
+          panel.appendChild(button);
+        }
+        if (data.suggestion_text && !["transcript_intro", "transcript_excerpt"].includes(data.suggestion_source || "")) {
+          const paragraph = document.createElement("p");
+          paragraph.textContent = data.suggestion_text;
+          panel.appendChild(paragraph);
+        }
+        editPanel.appendChild(panel);
 
         const transcriptPreview = data.transcript_preview || data.transcript_excerpt || (["transcript_intro", "transcript_excerpt"].includes(data.suggestion_source || "") ? data.suggestion_text : "");
-        if (transcriptPreview || data.transcript_text || data.transcript_error) {
-          const transcriptPanel = document.createElement("div");
-          transcriptPanel.className = "suggestion-panel subdued transcript-panel speaker-transcript-panel";
-          const textWrap = document.createElement("div");
-          const label = document.createElement("span");
-          label.textContent = "Transcript";
-          textWrap.appendChild(label);
-          transcriptPanel.appendChild(textWrap);
-          const paragraph = document.createElement("p");
-          paragraph.textContent = transcriptPreview || data.transcript_error || "Automatic analysis has not completed.";
-          transcriptPanel.appendChild(paragraph);
-          if (data.transcript_text) {
-            const details = document.createElement("details");
-            details.className = "transcript-full";
-            const summary = document.createElement("summary");
-            summary.textContent = "View full transcript";
-            const full = document.createElement("p");
-            full.textContent = data.transcript_text;
-            details.append(summary, full);
-            transcriptPanel.appendChild(details);
-          }
-          editPanel.appendChild(transcriptPanel);
+        const transcriptPanel = document.createElement("div");
+        transcriptPanel.className = "suggestion-panel subdued transcript-panel speaker-transcript-panel";
+        const transcriptTextWrap = document.createElement("div");
+        const transcriptLabel = document.createElement("span");
+        transcriptLabel.textContent = "Transcript";
+        transcriptTextWrap.appendChild(transcriptLabel);
+        transcriptPanel.appendChild(transcriptTextWrap);
+        const paragraph = document.createElement("p");
+        paragraph.textContent = transcriptPreview || data.transcript_error || "Automatic analysis is queued.";
+        transcriptPanel.appendChild(paragraph);
+        if (data.transcript_text) {
+          const details = document.createElement("details");
+          details.className = "transcript-full";
+          const summary = document.createElement("summary");
+          summary.textContent = "View full transcript";
+          const full = document.createElement("p");
+          full.textContent = data.transcript_text;
+          details.append(summary, full);
+          transcriptPanel.appendChild(details);
         }
+        editPanel.appendChild(transcriptPanel);
       }
 
       async function readJsonResponse(response) {
@@ -8664,9 +8701,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
             showBanner(data.message || "Recorder review updated.");
           }
           updateReviewCard(card, data);
-          if (data.suggested_speaker || data.suggestion_source || data.suggestion_text || data.transcript_preview || data.transcript_text || data.transcript_error) {
-            renderSuggestion(card, data);
-          }
+          renderSuggestion(card, data);
           if (data.analysis_queued) {
             pollTranscriptJob();
           }
