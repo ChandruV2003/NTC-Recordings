@@ -19,6 +19,7 @@ from ntc_recordings_app import (
     _post_transcription_audio,
     _recording_id,
     _run_testimony_transcript_job,
+    _save_testimony_review,
     _sanitize_existing_testimony_transcript_errors,
     _sanitize_existing_testimony_transcripts,
     _sync_testimony_recorder_manifest_reviews,
@@ -661,8 +662,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(review.status_code, 200)
         self.assertIn(b"Recorder Review", review.data)
         self.assertIn(b"REC00042", review.data)
-        self.assertIn(b"Check Durations", review.data)
-        self.assertIn(b"Save Speaker", review.data)
+        self.assertNotIn(b"Check Durations", review.data)
+        self.assertNotIn(b">Probe</span>", review.data)
+        self.assertIn(b"Save Review", review.data)
+        self.assertNotIn(b"Keep for Review", review.data)
+        self.assertNotIn(b"Return to Review", review.data)
         self.assertIn(b"Mark Duplicate", review.data)
         self.assertIn(b"Listen, confirm the service date", review.data)
         self.assertIn(b'preload="none" data-src="/admin/testimonies/audio/', review.data)
@@ -673,9 +677,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Grouped", review.data)
         self.assertNotIn(b"Retry Missing Analysis", review.data)
         self.assertNotIn(b"Recording Shape", review.data)
+        self.assertNotIn(b"Recording Structure", review.data)
         self.assertNotIn(b">Retry Analysis</button>", review.data)
         self.assertIn(b"Recording Type", review.data)
-        self.assertIn(b">Save Type</button>", review.data)
+        self.assertNotIn(b">Save Type</button>", review.data)
+        self.assertNotIn(b">Save Grouped</button>", review.data)
+        self.assertNotIn(b">Save Speaker</button>", review.data)
         self.assertNotIn(b">Message/Event", review.data)
         self.assertNotIn(b"Process Transcripts", review.data)
         self.assertNotIn(b"Quarantine Rejected", review.data)
@@ -726,13 +733,14 @@ class RecordingRequestPanelTests(unittest.TestCase):
                     recorder_segment_count,
                     updated_at
                 )
-                VALUES (?, ?, 'testimony', 1, ?)
+                VALUES (?, ?, 'combined', 2, ?)
                 """,
                 (recording_id, str(raw_recording), datetime.now(timezone.utc).isoformat()),
             )
             connection.commit()
         classified = self.client.get("/admin/recorder-review")
-        self.assertIn(b"Recording Structure", classified.data)
+        self.assertIn(b"Sections", classified.data)
+        self.assertNotIn(b"Recording Structure", classified.data)
         self.assertNotIn(b"Recording Shape", classified.data)
 
         identified = self.client.get("/admin/recorder-review?status=identified")
@@ -866,6 +874,136 @@ class RecordingRequestPanelTests(unittest.TestCase):
         renamed_audio = self.client.get(f"/admin/testimonies/audio/{new_recording_id}")
         self.assertEqual(renamed_audio.status_code, 200)
         self.assertEqual(renamed_audio.data, b"raw-testimony-audio")
+
+    def test_recorder_review_uses_one_context_aware_save_and_rejects_stale_edits(self):
+        testimony_source_root = self.root / "TestimonyReviewQueue"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "REC00077.mp3"
+        raw_recording.write_bytes(b"recorder-review-audio")
+        recording_id = _recording_id(raw_recording)
+
+        self._login()
+        review = self.client.get("/admin/recorder-review")
+        self.assertIn(b'name="review_revision" value="0"', review.data)
+
+        first = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "action": "save_review",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2026-07-26",
+                "recording_kind": "message",
+                "group_title": "The Lord Is Faithful",
+                "review_revision": "0",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        first_payload = first.get_json()
+        self.assertTrue(first_payload["ok"])
+        self.assertEqual(first_payload["status"], "needs_review")
+        self.assertEqual(first_payload["recording_kind"], "message")
+        self.assertEqual(first_payload["group_title"], "The Lord Is Faithful")
+        self.assertEqual(first_payload["review_revision"], 1)
+
+        stale = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "action": "save_review",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2026-07-26",
+                "recording_kind": "worship",
+                "group_title": "Stale overwrite",
+                "review_revision": "0",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(stale.status_code, 409)
+        self.assertIn("Another reviewer updated", stale.get_json()["error"])
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT status, testimony_title, recorder_agent_kind, review_revision
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            ).fetchone()
+            history = connection.execute(
+                """
+                SELECT action, previous_status, new_status, recording_kind
+                FROM recorder_review_history
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            ).fetchall()
+        self.assertEqual(row, ("needs_review", "The Lord Is Faithful", "message", 1))
+        self.assertEqual(history, [("save_review", "needs_review", "needs_review", "message")])
+
+    def test_background_analysis_preserves_human_review_fields(self):
+        testimony_source_root = self.root / "TestimonyReviewQueue"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "REC00078.mp3"
+        raw_recording.write_bytes(b"recorder-review-audio")
+        recording_id = _recording_id(raw_recording)
+
+        _save_testimony_review(
+            self.app,
+            recording_id=recording_id,
+            source_path=str(raw_recording),
+            status="identified",
+            service_date="2026-07-26",
+            speaker_name="Jeffrey Jeeva",
+            testimony_title="Jeffrey Jeeva's Testimony",
+            notes="human review",
+            proposed_path="/final/testimony.mp3",
+            duration_seconds=90,
+        )
+        _save_testimony_review(
+            self.app,
+            recording_id=recording_id,
+            source_path=str(raw_recording),
+            status="needs_review",
+            service_date="2026-07-27",
+            speaker_name="",
+            testimony_title="",
+            notes="stale background row",
+            proposed_path="",
+            duration_seconds=91,
+            suggested_speaker="Jeff",
+            suggestion_source="recorder_agent",
+            suggestion_text="Automatic analysis",
+            recorder_agent_kind="testimony",
+            update_review_fields=False,
+        )
+
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                """
+                SELECT status, service_date, speaker_name, testimony_title, notes,
+                       proposed_path, duration_seconds, suggested_speaker
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            ).fetchone()
+        self.assertEqual(
+            row,
+            (
+                "identified",
+                "2026-07-26",
+                "Jeffrey Jeeva",
+                "Jeffrey Jeeva's Testimony",
+                "human review",
+                "/final/testimony.mp3",
+                91,
+                "Jeff",
+            ),
+        )
 
     def test_testimony_review_can_mark_duplicate_recordings(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"

@@ -811,6 +811,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             notes=notes,
             proposed_path=proposed_path,
             duration_seconds=duration_seconds,
+            update_review_fields=False,
         )
 
         transcript_text = _row_optional_text(existing, "transcript_text")
@@ -914,16 +915,6 @@ def create_app(test_config: dict | None = None) -> Flask:
         original_recording_id = recording_id
         existing = _testimony_review_row(app, recording_id)
         requested_action = (request.form.get("action") or "").strip().lower()
-        status = (
-            request.form.get("status")
-            or ("needs_review" if requested_action == "save_type" else "")
-            or (str(existing["status"] or "") if existing else "")
-            or "needs_review"
-        ).strip().lower()
-        if status == "message_review":
-            status = "needs_review"
-        if status not in TESTIMONY_REVIEW_EDITABLE_STATUSES:
-            status = "needs_review"
         service_date = (
             _normalize_date((request.form.get("service_date") or "").strip())
             or (str(existing["service_date"] or "") if existing else "")
@@ -935,10 +926,44 @@ def create_app(test_config: dict | None = None) -> Flask:
         recording_kind = _normalize_recording_kind(request.form.get("recording_kind") or "")
         if recording_kind == "unsure":
             recording_kind = _normalize_recording_kind(_row_optional_text(existing, "recorder_agent_kind"))
-        if requested_action == "save_type" and recording_kind not in {"testimony", "message", "worship"}:
-            review_error = "Choose Testimony, Message, or Worship before saving the recording type."
+        requested_status = (request.form.get("status") or "").strip().lower()
+        if requested_status == "message_review":
+            requested_status = "needs_review"
+        if requested_action == "save_review":
+            if recording_kind not in {"testimony", "message", "worship"}:
+                review_error = "Choose Testimony, Message, or Worship before saving."
+                if _wants_json_response():
+                    return jsonify({"ok": False, "error": review_error}), 400
+                return _redirect_to(
+                    app,
+                    "testimony_review",
+                    status=current_filter,
+                    sort=request.form.get("sort") or "shortest",
+                    error=review_error,
+                )
+            if recording_kind == "testimony":
+                status = "identified" if speaker_name else "grouped" if group_title else ""
+                if not status:
+                    review_error = "Enter a speaker or group/event title for this testimony."
+                    if _wants_json_response():
+                        return jsonify({"ok": False, "error": review_error}), 400
+                    return _redirect_to(
+                        app,
+                        "testimony_review",
+                        status=current_filter,
+                        sort=request.form.get("sort") or "shortest",
+                        error=review_error,
+                    )
+            else:
+                status = "needs_review"
+        else:
+            status = requested_status or (str(existing["status"] or "") if existing else "") or "needs_review"
+        if status not in TESTIMONY_REVIEW_EDITABLE_STATUSES:
+            status = "needs_review"
+        if requested_action == "save_type":
+            review_error = "This page has changed. Reload it and use Save Review."
             if _wants_json_response():
-                return jsonify({"ok": False, "error": review_error}), 400
+                return jsonify({"ok": False, "error": review_error}), 409
             return _redirect_to(
                 app,
                 "testimony_review",
@@ -978,6 +1003,27 @@ def create_app(test_config: dict | None = None) -> Flask:
         proposed_path = ""
         save_message = "Recorder review saved."
         review_error = ""
+        revision_text = (request.form.get("review_revision") or "").strip()
+        try:
+            expected_revision = int(revision_text) if revision_text else None
+        except ValueError:
+            expected_revision = None
+        review_revision, previous_status, revision_claimed = _claim_testimony_review_revision(
+            app,
+            recording_id,
+            expected_revision,
+        )
+        if not revision_claimed:
+            review_error = "Another reviewer updated this recording. Reload the row before saving your changes."
+            if _wants_json_response():
+                return jsonify({"ok": False, "error": review_error, "review_revision": review_revision}), 409
+            return _redirect_to(
+                app,
+                "testimony_review",
+                status=current_filter,
+                sort=request.form.get("sort") or "shortest",
+                error=review_error,
+            )
         if status in {"identified", "grouped"}:
             proposed_path = _proposed_testimony_path(app, Path(candidate.path), service_date, speaker_name, testimony_title)
             renamed_candidate, proposed_path, rename_error = _rename_testimony_recording(
@@ -1023,6 +1069,21 @@ def create_app(test_config: dict | None = None) -> Flask:
             recorder_agent_action="review" if status == "needs_review" else None,
             recorder_agent_reason="Classification confirmed in Recorder Review." if recording_kind else None,
         )
+        reviewed_at = _utc_now()
+        _set_testimony_review_revision(app, recording_id, review_revision, reviewed_at)
+        _record_testimony_review_history(
+            app,
+            recording_id=recording_id,
+            previous_recording_id=original_recording_id if recording_id != original_recording_id else "",
+            action=requested_action or requested_status or status,
+            previous_status=previous_status,
+            new_status=status,
+            service_date=service_date,
+            speaker_name=speaker_name,
+            recording_kind=recording_kind,
+            source_path=str(existing["source_path"] or candidate.path) if existing else candidate.path,
+            target_path=proposed_path or candidate.path,
+        )
         if transcript_text or transcript_source or transcript_error:
             _save_testimony_transcript(
                 app,
@@ -1060,6 +1121,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "transcript_updated_label": _format_datetime(_row_optional_text(existing, "transcript_updated_at")),
                     "recording_kind": recording_kind,
                     "recording_kind_label": _recorder_agent_kind_label(recording_kind),
+                    "review_revision": review_revision,
                     "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=recording_id),
                     "review_url": _recordings_url_for(app, "update_testimony_review", recording_id=recording_id),
                 }
@@ -1323,6 +1385,30 @@ def _init_db(db_path: str) -> None:
         _ensure_column(connection, "testimony_reviews", "recorder_segment_reasons", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "recorder_segment_warnings", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "recorder_segment_updated_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "review_revision", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "testimony_reviews", "reviewed_at", "TEXT NOT NULL DEFAULT ''")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recorder_review_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recording_id TEXT NOT NULL,
+                previous_recording_id TEXT NOT NULL DEFAULT '',
+                action TEXT NOT NULL,
+                previous_status TEXT NOT NULL DEFAULT '',
+                new_status TEXT NOT NULL DEFAULT '',
+                service_date TEXT NOT NULL DEFAULT '',
+                speaker_name TEXT NOT NULL DEFAULT '',
+                recording_kind TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                target_path TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recorder_review_history_recording "
+            "ON recorder_review_history(recording_id, created_at)"
+        )
         connection.execute(
             """
             UPDATE testimony_reviews
@@ -2561,6 +2647,7 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> set[str]:
                     recorder_segments_json=str(row["recorder_segments_json"] or ""),
                     recorder_segment_reasons=str(row["recorder_segment_reasons"] or ""),
                     recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
+                    update_review_fields=archived_testimony,
                 )
                 existing = _testimony_review_row(app, review_recording_id)
             else:
@@ -2584,6 +2671,7 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> set[str]:
                     recorder_segments_json=str(row["recorder_segments_json"] or ""),
                     recorder_segment_reasons=str(row["recorder_segment_reasons"] or ""),
                     recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
+                    update_review_fields=archived_testimony,
                 )
                 existing = _testimony_review_row(app, review_recording_id)
             should_import_manifest_transcript = (
@@ -2660,6 +2748,10 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     recorder_segment_reasons = [str(item) for item in _json_list(_row_optional_text(row, "recorder_segment_reasons"))]
     recorder_segment_warnings = [str(item) for item in _json_list(_row_optional_text(row, "recorder_segment_warnings"))]
     recorder_segment_rows = _recorder_segment_rows(_row_optional_text(row, "recorder_segments_json"))
+    try:
+        review_revision = int(_row_optional_text(row, "review_revision") or 0)
+    except ValueError:
+        review_revision = 0
     if not suggested_speaker and not speaker_name:
         suggested_speaker = _testimony_filename_speaker_suggestion(Path(candidate.path))
         if suggested_speaker:
@@ -2725,6 +2817,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "recorder_segment_reasons": recorder_segment_reasons,
         "recorder_segment_warnings": recorder_segment_warnings,
         "recorder_segment_rows": recorder_segment_rows,
+        "review_revision": review_revision,
         "duration_seconds": duration_seconds,
         "duration_label": _format_duration(duration_seconds),
         "size_label": _human_size(candidate.size_bytes),
@@ -2969,6 +3062,7 @@ def _run_testimony_suggestion_job(app: Flask) -> None:
                         recorder_agent_kind=recorder_agent_kind or None,
                         recorder_agent_action="review" if recorder_agent_kind else None,
                         recorder_agent_reason=recorder_agent_reason or None,
+                        update_review_fields=False,
                     )
                 except Exception as exc:
                     errors += 1
@@ -2987,6 +3081,7 @@ def _run_testimony_suggestion_job(app: Flask) -> None:
                         suggested_speaker="",
                         suggestion_source="",
                         suggestion_text=f"Suggestion failed: {exc}",
+                        update_review_fields=False,
                     )
                 processed += 1
                 _update_testimony_suggestion_job(
@@ -3075,6 +3170,7 @@ def _testimony_suggestion_targets(app: Flask) -> list[dict]:
                 recorder_agent_kind=recorder_agent_kind,
                 recorder_agent_action="review",
                 recorder_agent_reason=recorder_agent_reason,
+                update_review_fields=False,
             )
         if status != "needs_review" or speaker_name or suggested_speaker or suggestion_source or recorder_agent_kind:
             skipped += 1
@@ -3227,6 +3323,8 @@ def _run_testimony_transcript_job(
 ) -> None:
     try:
         with app.app_context():
+            duration_limit = limit if limit is not None else int(app.config.get("NTC_RECORDINGS_TESTIMONY_PROBE_LIMIT") or 120)
+            _probe_missing_testimony_durations(app, max(1, min(duration_limit, 500)))
             targets = _testimony_transcript_targets(app, limit, statuses=statuses, recording_ids=recording_ids)
             _update_testimony_transcript_job(app, total=len(targets), message=f"Analyzing {len(targets)} recordings.")
             processed = saved = errors = 0
@@ -3331,6 +3429,7 @@ def _run_testimony_transcript_job(
                         recorder_agent_kind=decision_kind or None,
                         recorder_agent_action=decision_action or None,
                         recorder_agent_reason=decision_reason or None,
+                        update_review_fields=False,
                     )
                 processed += 1
                 _update_testimony_transcript_job(
@@ -3560,6 +3659,7 @@ def _save_testimony_review(
     recorder_segments_json: str | None = None,
     recorder_segment_reasons: str | None = None,
     recorder_segment_warnings: str | None = None,
+    update_review_fields: bool = True,
 ) -> None:
     update_suggestion = suggested_speaker is not None or suggestion_source is not None or suggestion_text is not None
     suggested_speaker_value = suggested_speaker or ""
@@ -3618,13 +3718,13 @@ def _save_testimony_review(
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(recording_id) DO UPDATE SET
-                source_path = excluded.source_path,
-                status = excluded.status,
-                service_date = excluded.service_date,
-                speaker_name = excluded.speaker_name,
-                testimony_title = excluded.testimony_title,
-                notes = excluded.notes,
-                proposed_path = excluded.proposed_path,
+                source_path = CASE WHEN ? THEN excluded.source_path ELSE source_path END,
+                status = CASE WHEN ? THEN excluded.status ELSE status END,
+                service_date = CASE WHEN ? THEN excluded.service_date ELSE service_date END,
+                speaker_name = CASE WHEN ? THEN excluded.speaker_name ELSE speaker_name END,
+                testimony_title = CASE WHEN ? THEN excluded.testimony_title ELSE testimony_title END,
+                notes = CASE WHEN ? THEN excluded.notes ELSE notes END,
+                proposed_path = CASE WHEN ? THEN excluded.proposed_path ELSE proposed_path END,
                 duration_seconds = excluded.duration_seconds,
                 suggested_speaker = CASE WHEN ? THEN excluded.suggested_speaker ELSE suggested_speaker END,
                 suggestion_source = CASE WHEN ? THEN excluded.suggestion_source ELSE suggestion_source END,
@@ -3669,6 +3769,13 @@ def _save_testimony_review(
                 recorder_segment_warnings_value,
                 recorder_segment_updated_at,
                 _utc_now(),
+                1 if update_review_fields else 0,
+                1 if update_review_fields else 0,
+                1 if update_review_fields else 0,
+                1 if update_review_fields else 0,
+                1 if update_review_fields else 0,
+                1 if update_review_fields else 0,
+                1 if update_review_fields else 0,
                 1 if update_suggestion else 0,
                 1 if update_suggestion else 0,
                 1 if update_suggestion else 0,
@@ -3684,6 +3791,108 @@ def _save_testimony_review(
                 1 if update_segment else 0,
                 1 if update_segment else 0,
                 1 if update_segment else 0,
+            ),
+        )
+
+
+def _claim_testimony_review_revision(
+    app: Flask,
+    recording_id: str,
+    expected_revision: int | None,
+) -> tuple[int, str, bool]:
+    reviewed_at = _utc_now()
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        row = connection.execute(
+            "SELECT review_revision, status FROM testimony_reviews WHERE recording_id = ?",
+            (recording_id,),
+        ).fetchone()
+        current_revision = int(row["review_revision"] or 0) if row else 0
+        previous_status = str(row["status"] or "") if row else "needs_review"
+        if expected_revision is not None and expected_revision != current_revision:
+            return current_revision, previous_status, False
+        if row:
+            cursor = connection.execute(
+                """
+                UPDATE testimony_reviews
+                SET review_revision = review_revision + 1,
+                    reviewed_at = ?,
+                    updated_at = ?
+                WHERE recording_id = ?
+                  AND review_revision = ?
+                """,
+                (reviewed_at, reviewed_at, recording_id, current_revision),
+            )
+            if cursor.rowcount != 1:
+                refreshed = connection.execute(
+                    "SELECT review_revision, status FROM testimony_reviews WHERE recording_id = ?",
+                    (recording_id,),
+                ).fetchone()
+                return (
+                    int(refreshed["review_revision"] or 0) if refreshed else current_revision,
+                    str(refreshed["status"] or "") if refreshed else previous_status,
+                    False,
+                )
+        return current_revision + 1, previous_status, True
+
+
+def _set_testimony_review_revision(app: Flask, recording_id: str, revision: int, reviewed_at: str) -> None:
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute(
+            """
+            UPDATE testimony_reviews
+            SET review_revision = ?,
+                reviewed_at = ?,
+                updated_at = ?
+            WHERE recording_id = ?
+            """,
+            (revision, reviewed_at, reviewed_at, recording_id),
+        )
+
+
+def _record_testimony_review_history(
+    app: Flask,
+    *,
+    recording_id: str,
+    previous_recording_id: str,
+    action: str,
+    previous_status: str,
+    new_status: str,
+    service_date: str,
+    speaker_name: str,
+    recording_kind: str,
+    source_path: str,
+    target_path: str,
+) -> None:
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute(
+            """
+            INSERT INTO recorder_review_history (
+                recording_id,
+                previous_recording_id,
+                action,
+                previous_status,
+                new_status,
+                service_date,
+                speaker_name,
+                recording_kind,
+                source_path,
+                target_path,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                recording_id,
+                previous_recording_id,
+                action,
+                previous_status,
+                new_status,
+                service_date,
+                speaker_name,
+                recording_kind,
+                source_path,
+                target_path,
+                _utc_now(),
             ),
         )
 
@@ -4012,7 +4221,7 @@ def _probe_missing_testimony_durations(app: Flask, limit: int) -> tuple[int, int
     probed = 0
     skipped = 0
     for candidate in _testimony_source_candidates(app):
-        if probed + skipped >= limit:
+        if probed >= limit:
             break
         row = rows.get(candidate.id)
         if _row_duration(row) is not None:
@@ -4039,6 +4248,7 @@ def _probe_missing_testimony_durations(app: Flask, limit: int) -> tuple[int, int
             notes=notes,
             proposed_path=proposed_path,
             duration_seconds=duration,
+            update_review_fields=False,
         )
         probed += 1
     return probed, skipped
@@ -4337,7 +4547,8 @@ def _post_transcription_audio(
     timeout: float,
 ) -> requests.Response:
     try:
-        busy_wait = float(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_BUSY_WAIT") or 600)
+        busy_wait_value = app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_BUSY_WAIT")
+        busy_wait = float(600 if busy_wait_value is None else busy_wait_value)
     except (TypeError, ValueError):
         busy_wait = 600
     deadline = time.monotonic() + max(0, busy_wait)
@@ -6803,7 +7014,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .suggestion-panel { grid-template-columns:1fr; }
         .segment-row { grid-template-columns:1fr; }
         .classification-field { grid-template-columns:1fr; justify-content:stretch; }
-        .button-row, .button-row button, .toolbar-actions, .probe-form, .probe-form input, .probe-form button { width:100%; }
+        .button-row {
+          display:grid;
+          grid-template-columns:repeat(2,minmax(0,1fr));
+          width:100%;
+        }
+        .button-row button, .toolbar-actions, .probe-form, .probe-form input, .probe-form button { width:100%; }
       }
       @media (max-width:350px) {
         header .eyebrow { font-size:.68rem; letter-spacing:.08em; }
@@ -6852,17 +7068,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
           {% endfor %}
         </nav>
         <div class="toolbar-actions">
-          {% if status_filter in ["needs_review", "all"] %}
-            <form class="probe-form" method="post" action="{{ recordings_url_for('probe_testimony_durations') }}">
-              <input type="hidden" name="status" value="{{ status_filter }}">
-              <input type="hidden" name="sort" value="{{ sort }}">
-              <label>
-                <span>Probe</span>
-                <input name="limit" type="number" min="1" max="120" value="{{ probe_limit }}">
-              </label>
-              <button type="submit">Check Durations</button>
-            </form>
-          {% endif %}
           {% if status_filter in ["not_testimony", "duplicate", "all"] %}
             <form class="probe-form action-only" method="post" action="{{ recordings_url_for('quarantine_testimony_reviews') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
@@ -6959,6 +7164,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                     <input type="hidden" name="sort" value="{{ sort }}">
                     <input type="hidden" name="status_filter" value="{{ status_filter }}">
                     <input type="hidden" name="source_path" value="{{ item.source_path }}">
+                    <input type="hidden" name="review_revision" value="{{ item.review_revision }}">
                     <section class="edit-panel">
                       <div class="form-grid">
                         <label>
@@ -6995,10 +7201,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           {% endif %}
                         </div>
                       {% endif %}
-                      {% if item.recorder_segment_kind %}
+                      {% if item.recorder_segment_kind == "combined" or item.recorder_segment_count > 1 or item.recorder_segment_warnings %}
                         <div class="suggestion-panel subdued segment-shape-panel">
                           <div>
-                            <span>Recording Structure</span>
+                            <span>Sections</span>
                             <strong>{{ item.recorder_segment_kind_label }}</strong>
                             {% if item.recorder_segment_kind == "combined" and item.recorder_segment_likelihood_label %}
                               <small>Split review likely: {{ item.recorder_segment_likelihood_label }}</small>
@@ -7090,12 +7296,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
                       </select>
                     </label>
                     <div class="button-row">
-                      <button class="secondary" type="submit" name="status" value="needs_review">Needs Review</button>
+                      {% if item.status not in ["needs_review", "message_review"] %}
+                        <button class="secondary" type="submit" name="status" value="needs_review">Return to Review</button>
+                      {% endif %}
                       <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Needed</button>
                       <button class="secondary" type="submit" name="status" value="duplicate">Mark Duplicate</button>
-                      <button class="secondary" type="submit" name="action" value="save_type">Save Type</button>
-                      <button class="secondary" type="submit" name="status" value="grouped">Save Grouped</button>
-                      <button class="save" type="submit" name="status" value="identified">Save Speaker</button>
+                      <button class="save" type="submit" name="action" value="save_review">Save Review</button>
                     </div>
                   </form>
                 </div>
@@ -7264,6 +7470,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
         setInputValue(card, "speaker_name", data.speaker_name || "");
         setInputValue(card, "group_title", data.group_title || "");
+        setInputValue(card, "review_revision", data.review_revision);
 
         const audio = card.querySelector("audio[data-src]");
         if (audio && data.audio_url && audio.dataset.src !== data.audio_url) {
@@ -7461,7 +7668,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           });
           const data = await readJsonResponse(response);
           if (!response.ok || !data.ok) {
-            throw new Error(data.error || data.message || "The testimony update failed.");
+            throw new Error(data.error || data.message || "The recorder update failed.");
           }
           showBanner(data.message || "Recorder review updated.");
           updateReviewCard(card, data);
@@ -7472,7 +7679,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
             pollTranscriptJob();
           }
         } catch (error) {
-          showBanner(error.message || "The testimony update failed.", true);
+          showBanner(error.message || "The recorder update failed.", true);
         } finally {
           card.classList.remove("is-saving");
           setFormBusy(form, false);
