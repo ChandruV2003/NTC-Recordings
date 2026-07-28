@@ -2032,6 +2032,29 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row, ("needs_review",))
 
+    def test_recorder_manifest_sync_is_reused_while_manifest_is_unchanged(self):
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "manifest-cache-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(Path(self.tempdir.name) / "manifest-cache-requests.db"),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
+                "NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS": str(Path(self.tempdir.name) / "missing-manifest.sqlite3"),
+            }
+        )
+        app.testing = False
+
+        with patch(
+            "ntc_recordings_app._sync_testimony_recorder_manifest_reviews_uncached",
+            return_value={"archived-path"},
+        ) as sync:
+            first = _sync_testimony_recorder_manifest_reviews(app)
+            second = _sync_testimony_recorder_manifest_reviews(app)
+
+        self.assertEqual(first, {"archived-path"})
+        self.assertEqual(second, {"archived-path"})
+        sync.assert_called_once()
+
     def test_recorder_review_rejects_prompt_echo_manifest_decision(self):
         intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
         review_root = intake_root / "TestimonyReviewQueue"

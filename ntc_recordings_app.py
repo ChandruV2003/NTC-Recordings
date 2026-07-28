@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
@@ -404,6 +405,13 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.testimony_transcript_pending_ids: set[str] = set()
     app.testimony_delivery_job_lock = threading.Lock()
     app.testimony_delivery_job_running = False
+    app.testimony_manifest_sync_lock = threading.Lock()
+    app.testimony_manifest_sync_signature = None
+    app.testimony_manifest_archived_paths: set[str] = set()
+    app.testimony_allowed_roots_cache_key = None
+    app.testimony_allowed_roots_cache: tuple[Path, ...] = ()
+    app.testimony_resolved_allowed_roots_cache_key = None
+    app.testimony_resolved_allowed_roots_cache: tuple[Path, ...] = ()
 
     @app.context_processor
     def _recordings_url_context():
@@ -635,7 +643,8 @@ def create_app(test_config: dict | None = None) -> Flask:
         except ValueError:
             limit = 100
         limit = min(max(limit, 1), 500)
-        items = _testimony_review_items(app)
+        speaker_names = _testimony_known_speakers(app)
+        items = _testimony_review_items(app, known_speakers=speaker_names)
         counts = _testimony_status_counts(items)
         if status_filter == "all":
             visible_items = items
@@ -672,7 +681,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             error=request.args.get("error"),
             status_label=_testimony_status_label,
             format_date=_format_date,
-            speaker_names=_testimony_known_speakers(app),
+            speaker_names=speaker_names,
             suggestion_job=_testimony_suggestion_job_status(app),
             transcript_job=_testimony_transcript_job_status(app),
         )
@@ -2363,8 +2372,18 @@ def _testimony_source_roots(app: Flask) -> list[Path]:
 
 
 def _testimony_allowed_roots(app: Flask) -> list[Path]:
+    cache_key = (
+        str(app.config.get("NTC_RECORDINGS_TESTIMONY_SOURCE_DIR") or ""),
+        str(app.config.get("NTC_RECORDINGS_TESTIMONY_SOURCE_DIRS") or ""),
+        str(app.config.get("NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS") or ""),
+        str(app.config.get("NTC_RECORDINGS_LIBRARY_DIRS") or ""),
+        str(app.config.get("NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR") or ""),
+        str(app.config.get("NTC_RECORDINGS_TESTIMONY_REJECTED_DIR") or ""),
+    )
+    if getattr(app, "testimony_allowed_roots_cache_key", None) == cache_key:
+        return list(getattr(app, "testimony_allowed_roots_cache", ()))
     configured_allowed = _configured_path_list(str(app.config.get("NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS") or ""))
-    return _unique_paths(
+    roots = _unique_paths(
         [
             *_testimony_source_roots(app),
             *configured_allowed,
@@ -2374,6 +2393,38 @@ def _testimony_allowed_roots(app: Flask) -> list[Path]:
             _testimony_rejected_root(app),
         ]
     )
+    app.testimony_allowed_roots_cache_key = cache_key
+    app.testimony_allowed_roots_cache = tuple(roots)
+    return list(roots)
+
+
+def _resolved_testimony_allowed_roots(app: Flask) -> tuple[Path, ...]:
+    roots = _testimony_allowed_roots(app)
+    cache_key = tuple(str(root) for root in roots)
+    if getattr(app, "testimony_resolved_allowed_roots_cache_key", None) == cache_key:
+        return tuple(getattr(app, "testimony_resolved_allowed_roots_cache", ()))
+    resolved_roots = []
+    for root in roots:
+        try:
+            resolved_roots.append(root.resolve())
+        except OSError:
+            resolved_roots.append(root.absolute())
+    app.testimony_resolved_allowed_roots_cache_key = cache_key
+    app.testimony_resolved_allowed_roots_cache = tuple(resolved_roots)
+    return tuple(resolved_roots)
+
+
+def _path_within_resolved_roots(path: Path, resolved_roots: Iterable[Path]) -> bool:
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        resolved_path = path.absolute()
+    resolved_path_text = os.path.normcase(os.fspath(resolved_path))
+    for root in resolved_roots:
+        root_text = os.path.normcase(os.fspath(root)).rstrip(os.sep)
+        if resolved_path_text == root_text or resolved_path_text.startswith(f"{root_text}{os.sep}"):
+            return True
+    return False
 
 
 def _message_recording_root(app: Flask) -> Path:
@@ -2404,11 +2455,14 @@ def _testimony_rejected_root(app: Flask) -> Path:
 
 
 def _relative_to_first_root(path: Path, roots: Iterable[Path]) -> str:
+    path_text = os.path.normcase(os.path.abspath(os.fspath(path)))
     for root in roots:
-        try:
-            return str(path.relative_to(root))
-        except ValueError:
-            continue
+        root_text = os.path.normcase(os.path.abspath(os.fspath(root))).rstrip(os.sep)
+        if path_text == root_text:
+            return "."
+        prefix = f"{root_text}{os.sep}"
+        if path_text.startswith(prefix):
+            return path_text[len(prefix) :]
     raise ValueError(f"{path} is outside known roots")
 
 
@@ -2456,7 +2510,7 @@ def _testimony_source_candidates(app: Flask) -> list[RecordingCandidate]:
 
 def _testimony_source_candidate_from_path(app: Flask, path: Path) -> RecordingCandidate | None:
     known_roots = _testimony_allowed_roots(app)
-    if not any(_path_within(path, root) for root in known_roots):
+    if not _path_within_resolved_roots(path, _resolved_testimony_allowed_roots(app)):
         return None
     if not path.exists() or not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
         return None
@@ -2566,8 +2620,45 @@ def _testimony_recorder_manifest_paths(app: Flask) -> list[Path]:
     return _configured_path_list(str(app.config.get("NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS") or ""))
 
 
-def _sync_testimony_recorder_manifest_reviews(app: Flask) -> set[str]:
-    known_speakers = _testimony_known_speakers(app)
+def _sqlite_path_signature(path: Path) -> tuple[tuple[str, int, int], ...]:
+    signature = []
+    for candidate in (path, Path(f"{path}-wal")):
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        signature.append((str(candidate), stat.st_mtime_ns, stat.st_size))
+    return tuple(signature)
+
+
+def _testimony_manifest_signature(app: Flask) -> tuple[tuple[str, tuple[tuple[str, int, int], ...]], ...]:
+    return tuple(
+        (str(path), _sqlite_path_signature(path))
+        for path in _testimony_recorder_manifest_paths(app)
+    )
+
+
+def _sync_testimony_recorder_manifest_reviews(
+    app: Flask,
+    known_speakers: Iterable[str] | None = None,
+) -> set[str]:
+    if app.testing:
+        return _sync_testimony_recorder_manifest_reviews_uncached(app, known_speakers)
+    signature = _testimony_manifest_signature(app)
+    with app.testimony_manifest_sync_lock:
+        if signature == app.testimony_manifest_sync_signature:
+            return set(app.testimony_manifest_archived_paths)
+        archived_paths = _sync_testimony_recorder_manifest_reviews_uncached(app, known_speakers)
+        app.testimony_manifest_sync_signature = signature
+        app.testimony_manifest_archived_paths = set(archived_paths)
+        return archived_paths
+
+
+def _sync_testimony_recorder_manifest_reviews_uncached(
+    app: Flask,
+    known_speakers: Iterable[str] | None = None,
+) -> set[str]:
+    known_speakers = list(known_speakers) if known_speakers is not None else _testimony_known_speakers(app)
     archived_non_review_paths: set[str] = set()
     for manifest_path in _testimony_recorder_manifest_paths(app):
         if not manifest_path.exists() or not manifest_path.is_file():
@@ -2975,10 +3066,13 @@ def _testimony_review_row_is_quarantined(row: sqlite3.Row) -> bool:
     return status in {"duplicate", "not_testimony"} and bool(_row_optional_text(row, "quarantined_path"))
 
 
-def _testimony_review_items(app: Flask) -> list[dict]:
-    archived_non_review_paths = _sync_testimony_recorder_manifest_reviews(app)
+def _testimony_review_items(
+    app: Flask,
+    known_speakers: Iterable[str] | None = None,
+) -> list[dict]:
+    known_speakers = tuple(known_speakers) if known_speakers is not None else tuple(_testimony_known_speakers(app))
+    archived_non_review_paths = _sync_testimony_recorder_manifest_reviews(app, known_speakers)
     rows = _testimony_review_rows(app)
-    known_speakers = _testimony_known_speakers(app)
     items = []
     seen_row_ids = set()
     seen_paths = set()
@@ -4778,16 +4872,29 @@ def _valid_person_name_suggestion(value: str, known_speakers: Iterable[str]) -> 
     return _canonical_speaker_name(candidate, known_speakers)
 
 
+@lru_cache(maxsize=32)
+def _known_speaker_aliases(known_speakers: tuple[str, ...]) -> dict[str, str]:
+    aliases = {}
+    for known_speaker in known_speakers:
+        aliases.setdefault(_speaker_key(known_speaker), known_speaker)
+        aliases.setdefault(_speaker_key(_remove_speaker_title(known_speaker)), known_speaker)
+    return aliases
+
+
+def _known_speaker_alias_lookup(known_speakers: Iterable[str]) -> dict[str, str]:
+    speakers = known_speakers if isinstance(known_speakers, tuple) else tuple(known_speakers)
+    return _known_speaker_aliases(speakers)
+
+
 def _person_name_candidate(value: str, known_speakers: Iterable[str]) -> bool:
     candidate = _clean_speaker_name(value)
     if not candidate:
         return False
-    known = list(known_speakers)
     candidate_key = _speaker_key(candidate)
     candidate_titleless_key = _speaker_key(_remove_speaker_title(candidate))
-    for known_speaker in known:
-        if candidate_key == _speaker_key(known_speaker) or candidate_titleless_key == _speaker_key(_remove_speaker_title(known_speaker)):
-            return True
+    aliases = _known_speaker_alias_lookup(known_speakers)
+    if candidate_key in aliases or candidate_titleless_key in aliases:
+        return True
     words = candidate.split()
     lowered = [word.strip("'").lower() for word in words]
     starts_with_title = lowered[0] in {"brother", "sister"}
@@ -4844,10 +4951,11 @@ def _canonical_speaker_name(candidate: str, known_speakers: Iterable[str]) -> st
         return ""
     candidate_key = _speaker_key(candidate)
     candidate_titleless_key = _speaker_key(_remove_speaker_title(candidate))
-    for known in known_speakers:
-        known_key = _speaker_key(known)
-        if candidate_key == known_key or candidate_titleless_key == _speaker_key(_remove_speaker_title(known)):
-            return known
+    aliases = _known_speaker_alias_lookup(known_speakers)
+    if candidate_key in aliases:
+        return aliases[candidate_key]
+    if candidate_titleless_key in aliases:
+        return aliases[candidate_titleless_key]
     return candidate
 
 
