@@ -2470,6 +2470,140 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ("identified", str(final_recording), "John", "John's Testimony"),
         )
 
+    def test_recorder_review_does_not_restore_completed_staged_recording(self):
+        intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
+        review_root = intake_root / "TestimonyReviewQueue"
+        staged_root = intake_root / "DN700R-primary"
+        review_root.mkdir(parents=True)
+        staged_root.mkdir(parents=True)
+        staged_recording = staged_root / "07262026114845_DN-700R.mp3"
+        staged_recording.write_bytes(b"raw-edmond-testimony")
+        final_recording = self.testimony_root / "2026" / "Sunday Testimonies" / "July 26, 2026 - Edmond Spencer's Testimony.mp3"
+        final_recording.parent.mkdir(parents=True)
+        final_recording.write_bytes(b"final-edmond-testimony")
+        manifest_path = Path(self.tempdir.name) / "stale-staged-manifest.sqlite3"
+        with sqlite3.connect(manifest_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE recorder_files (
+                    staged_path TEXT NOT NULL,
+                    matched_path TEXT NOT NULL DEFAULT '',
+                    matched_kind TEXT NOT NULL DEFAULT '',
+                    duration_seconds REAL,
+                    transcript_text TEXT NOT NULL DEFAULT '',
+                    transcript_source TEXT NOT NULL DEFAULT '',
+                    transcript_at TEXT NOT NULL DEFAULT '',
+                    classification TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    agent_decision_json TEXT NOT NULL DEFAULT '',
+                    agent_decision_at TEXT NOT NULL DEFAULT '',
+                    agent_review_reason TEXT NOT NULL DEFAULT '',
+                    last_seen_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO recorder_files (
+                    staged_path,
+                    duration_seconds,
+                    classification,
+                    status,
+                    last_seen_at
+                ) VALUES (?, 26.784, 'testimony_candidate', 'staged', ?)
+                """,
+                (str(staged_recording), datetime.now(timezone.utc).isoformat()),
+            )
+
+        db_path = Path(self.tempdir.name) / "stale-staged-requests.db"
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "stale-staged-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(db_path),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(review_root),
+                "NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS": str(intake_root),
+                "NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS": str(manifest_path),
+                "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
+                "NTC_RECORDINGS_TESTIMONY_REJECTED_DIR": str(self.rejected_root),
+            }
+        )
+        staged_recording_id = _recording_id(staged_recording)
+        final_recording_id = _recording_id(final_recording)
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    duration_seconds,
+                    updated_at
+                ) VALUES (?, ?, 'needs_review', '2026-07-26', 26.784, ?)
+                """,
+                (staged_recording_id, str(staged_recording), now),
+            )
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    speaker_name,
+                    testimony_title,
+                    proposed_path,
+                    duration_seconds,
+                    updated_at
+                ) VALUES (?, ?, 'identified', '2026-07-26', 'Edmond Spencer',
+                          'Edmond Spencer''s Testimony', ?, 26.784, ?)
+                """,
+                (final_recording_id, str(final_recording), str(final_recording), now),
+            )
+            connection.execute(
+                """
+                INSERT INTO recorder_review_history (
+                    recording_id,
+                    previous_recording_id,
+                    action,
+                    previous_status,
+                    new_status,
+                    service_date,
+                    speaker_name,
+                    recording_kind,
+                    source_path,
+                    target_path,
+                    created_at
+                ) VALUES (?, ?, 'save_review', 'needs_review', 'identified',
+                          '2026-07-26', 'Edmond Spencer', 'testimony', ?, ?, ?)
+                """,
+                (
+                    final_recording_id,
+                    staged_recording_id,
+                    str(staged_recording),
+                    str(final_recording),
+                    now,
+                ),
+            )
+
+        ignored_paths = _sync_testimony_recorder_manifest_reviews(app)
+
+        self.assertIn(str(staged_recording), ignored_paths)
+        with sqlite3.connect(db_path) as connection:
+            stale_row = connection.execute(
+                "SELECT 1 FROM testimony_reviews WHERE recording_id = ?",
+                (staged_recording_id,),
+            ).fetchone()
+            final_row = connection.execute(
+                "SELECT status, speaker_name FROM testimony_reviews WHERE recording_id = ?",
+                (final_recording_id,),
+            ).fetchone()
+        self.assertIsNone(stale_row)
+        self.assertEqual(final_row, ("identified", "Edmond Spencer"))
+
     def test_recorder_review_hides_promoted_message_and_removes_stale_review(self):
         intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
         review_root = intake_root / "TestimonyReviewQueue"

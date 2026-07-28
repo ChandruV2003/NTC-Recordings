@@ -2432,6 +2432,32 @@ def _testimony_review_rows(app: Flask) -> dict[str, sqlite3.Row]:
     return {row["recording_id"]: row for row in rows}
 
 
+def _completed_testimony_review_target(app: Flask, previous_recording_id: str) -> Path | None:
+    if not previous_recording_id:
+        return None
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        row = connection.execute(
+            """
+            SELECT target_path
+            FROM recorder_review_history
+            WHERE previous_recording_id = ?
+              AND new_status IN ('identified', 'grouped')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (previous_recording_id,),
+        ).fetchone()
+    if not row:
+        return None
+    target_path = Path(str(row["target_path"] or ""))
+    testimony_root = Path(str(app.config["NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR"]))
+    if not _path_within(target_path, testimony_root):
+        return None
+    if not target_path.exists() or not target_path.is_file():
+        return None
+    return target_path
+
+
 def _testimony_recorder_manifest_paths(app: Flask) -> list[Path]:
     return _configured_path_list(str(app.config.get("NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS") or ""))
 
@@ -2525,6 +2551,16 @@ def _sync_testimony_recorder_manifest_reviews(app: Flask) -> set[str]:
 
         for row in rows:
             staged_path = Path(str(row["staged_path"] or ""))
+            staged_recording_id = _recording_id(staged_path) if str(row["staged_path"] or "").strip() else ""
+            completed_target = (
+                _completed_testimony_review_target(app, staged_recording_id)
+                if str(row["status"] or "") != "already_archived"
+                else None
+            )
+            if completed_target:
+                archived_non_review_paths.add(str(staged_path))
+                _delete_testimony_review(app, staged_recording_id)
+                continue
             archived_kind = _normalize_recording_kind(str(row["matched_kind"] or ""))
             archived_non_review = (
                 str(row["status"] or "") == "already_archived"
