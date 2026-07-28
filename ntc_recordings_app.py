@@ -402,6 +402,8 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.testimony_transcript_job_lock = threading.Lock()
     app.testimony_transcript_job = _initial_testimony_transcript_job_state()
     app.testimony_transcript_pending_ids: set[str] = set()
+    app.testimony_delivery_job_lock = threading.Lock()
+    app.testimony_delivery_job_running = False
 
     @app.context_processor
     def _recordings_url_context():
@@ -625,9 +627,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             status_filter = "identified" if status_filter == "already_named" else "needs_review"
         if status_filter not in TESTIMONY_REVIEW_FILTERS:
             status_filter = "needs_review"
-        sort = (request.args.get("sort") or "shortest").strip().lower()
+        sort = (request.args.get("sort") or "newest").strip().lower()
         if sort not in {"shortest", "newest", "name"}:
-            sort = "shortest"
+            sort = "newest"
         try:
             limit = int(request.args.get("limit") or "100")
         except ValueError:
@@ -675,6 +677,57 @@ def create_app(test_config: dict | None = None) -> Flask:
             transcript_job=_testimony_transcript_job_status(app),
         )
 
+    @app.get("/admin/testimony-delivery")
+    def testimony_delivery_rules():
+        guard = _require_admin()
+        if guard:
+            return guard
+        _start_testimony_delivery_job(app)
+        return render_template_string(
+            TESTIMONY_DELIVERY_TEMPLATE,
+            title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
+            rules=_testimony_delivery_rules(app),
+            deliveries=_testimony_delivery_history(app),
+            today=date.today().isoformat(),
+            message=request.args.get("message"),
+            error=request.args.get("error"),
+            format_date=_format_date,
+            format_datetime=_format_datetime,
+        )
+
+    @app.post("/admin/testimony-delivery/rules")
+    def save_testimony_delivery_rule():
+        guard = _require_admin()
+        if guard:
+            return guard
+        rule_id_text = (request.form.get("rule_id") or "").strip()
+        try:
+            rule_id = int(rule_id_text) if rule_id_text else None
+        except ValueError:
+            rule_id = None
+        canonical_name = _clean_speaker_name(request.form.get("canonical_name") or "")
+        aliases = _split_delivery_values(request.form.get("aliases") or "")
+        emails = _split_delivery_values(request.form.get("emails") or "")
+        effective_from = _date_from_iso((request.form.get("effective_from") or "").strip())
+        enabled = bool(request.form.get("enabled"))
+        error = _validate_testimony_delivery_rule(canonical_name, aliases, emails, effective_from)
+        if error:
+            return _redirect_to(app, "testimony_delivery_rules", error=error)
+        _save_testimony_delivery_rule(
+            app,
+            rule_id=rule_id,
+            canonical_name=canonical_name,
+            aliases=aliases,
+            emails=emails,
+            effective_from=effective_from or date.today().isoformat(),
+            enabled=enabled,
+        )
+        return _redirect_to(
+            app,
+            "testimony_delivery_rules",
+            message=f"Automatic delivery rule saved for {canonical_name}.",
+        )
+
     @app.post("/admin/testimonies/probe")
     def probe_testimony_durations():
         guard = _require_admin()
@@ -695,7 +748,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             app,
             "testimony_review",
             status=current_filter,
-            sort=request.form.get("sort") or "shortest",
+            sort=request.form.get("sort") or "newest",
             message=f"Checked {probed + skipped} recorder source file{'s' if probed + skipped != 1 else ''}; saved {probed} duration{'s' if probed != 1 else ''}.",
         )
 
@@ -718,7 +771,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             app,
             "testimony_review",
             status=current_filter,
-            sort=request.form.get("sort") or "shortest",
+            sort=request.form.get("sort") or "newest",
             message=message,
         )
 
@@ -753,7 +806,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             app,
             "testimony_review",
             status=current_filter,
-            sort=request.form.get("sort") or "shortest",
+            sort=request.form.get("sort") or "newest",
             message=message,
         )
 
@@ -859,7 +912,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             app,
             "testimony_review",
             status=current_filter,
-            sort=request.form.get("sort") or "shortest",
+            sort=request.form.get("sort") or "newest",
             message=message,
         )
 
@@ -889,7 +942,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             app,
             "testimony_review",
             status=current_filter,
-            sort=request.form.get("sort") or "shortest",
+            sort=request.form.get("sort") or "newest",
             message=message,
         )
 
@@ -938,7 +991,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     app,
                     "testimony_review",
                     status=current_filter,
-                    sort=request.form.get("sort") or "shortest",
+                    sort=request.form.get("sort") or "newest",
                     error=review_error,
                 )
             if recording_kind == "testimony":
@@ -951,7 +1004,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                         app,
                         "testimony_review",
                         status=current_filter,
-                        sort=request.form.get("sort") or "shortest",
+                        sort=request.form.get("sort") or "newest",
                         error=review_error,
                     )
             else:
@@ -968,7 +1021,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 app,
                 "testimony_review",
                 status=current_filter,
-                sort=request.form.get("sort") or "shortest",
+                sort=request.form.get("sort") or "newest",
                 error=review_error,
             )
         known_speakers = _testimony_known_speakers(app)
@@ -982,7 +1035,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     app,
                     "testimony_review",
                     status=current_filter,
-                    sort=request.form.get("sort") or "shortest",
+                    sort=request.form.get("sort") or "newest",
                     error=review_error,
                 )
         if status == "grouped":
@@ -1021,7 +1074,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 app,
                 "testimony_review",
                 status=current_filter,
-                sort=request.form.get("sort") or "shortest",
+                sort=request.form.get("sort") or "newest",
                 error=review_error,
             )
         if status in {"identified", "grouped"}:
@@ -1092,6 +1145,15 @@ def create_app(test_config: dict | None = None) -> Flask:
                 transcript_source=transcript_source,
                 transcript_error=transcript_error,
             )
+        if not review_error and status == "identified" and recording_kind == "testimony":
+            _queue_testimony_deliveries(
+                app,
+                recording_id=recording_id,
+                recording_path=candidate.path,
+                recording_title=candidate.title,
+                speaker_name=speaker_name,
+                service_date=service_date,
+            )
         if _wants_json_response():
             display_transcript_text = _display_transcript_text(transcript_text)
             response = jsonify(
@@ -1132,14 +1194,14 @@ def create_app(test_config: dict | None = None) -> Flask:
                 app,
                 "testimony_review",
                 status=current_filter,
-                sort=request.form.get("sort") or "shortest",
+                sort=request.form.get("sort") or "newest",
                 error=save_message,
             )
         return _redirect_to(
             app,
             "testimony_review",
             status=current_filter,
-            sort=request.form.get("sort") or "shortest",
+            sort=request.form.get("sort") or "newest",
             message=save_message,
         )
 
@@ -1408,6 +1470,48 @@ def _init_db(db_path: str) -> None:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_recorder_review_history_recording "
             "ON recorder_review_history(recording_id, created_at)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS testimony_delivery_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                emails_json TEXT NOT NULL DEFAULT '[]',
+                effective_from TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS testimony_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id INTEGER NOT NULL,
+                source_recording_id TEXT NOT NULL,
+                recording_id TEXT NOT NULL,
+                recording_path TEXT NOT NULL,
+                recording_title TEXT NOT NULL DEFAULT '',
+                speaker_name TEXT NOT NULL,
+                service_date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                share_url TEXT NOT NULL DEFAULT '',
+                share_external_id TEXT NOT NULL DEFAULT '',
+                attempted_at TEXT NOT NULL DEFAULT '',
+                sent_at TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(rule_id, source_recording_id),
+                FOREIGN KEY(rule_id) REFERENCES testimony_delivery_rules(id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_testimony_deliveries_status "
+            "ON testimony_deliveries(status, attempted_at)"
         )
         connection.execute(
             """
@@ -2934,7 +3038,14 @@ def _testimony_status_counts(items: Iterable[dict]) -> dict[str, int]:
 
 def _sort_testimony_items(items: list[dict], sort: str) -> None:
     if sort == "newest":
-        items.sort(key=lambda item: (item.get("modified_at") or "", item.get("title") or ""), reverse=True)
+        items.sort(
+            key=lambda item: (
+                item.get("service_date") or item.get("recording_date") or "0000-00-00",
+                item.get("modified_at") or "",
+                item.get("title") or "",
+            ),
+            reverse=True,
+        )
         return
     if sort == "name":
         items.sort(key=lambda item: (item.get("title") or "").lower())
@@ -3403,6 +3514,7 @@ def _run_testimony_transcript_job(
                 processed_ids.add(str(row["recording_id"]))
                 _update_testimony_transcript_job(app, current=Path(candidate.path).name)
                 transcript_text = _display_transcript_text(_row_optional_text(row, "transcript_text"))
+                reused_transcript = bool(transcript_text)
                 transcript_error = ""
                 if transcript_text:
                     saved += 1
@@ -3419,13 +3531,14 @@ def _run_testimony_transcript_job(
                         transcript_error = f"Transcript failed: {exc}"
                         app.logger.exception("testimony transcript failed for %s", candidate.path)
                 recording_id = str(row["recording_id"])
-                _save_testimony_transcript(
-                    app,
-                    recording_id=recording_id,
-                    transcript_text=transcript_text,
-                    transcript_source=_row_optional_text(row, "transcript_source") or ("transcript_excerpt" if transcript_text else ""),
-                    transcript_error=transcript_error,
-                )
+                if not reused_transcript or transcript_error:
+                    _save_testimony_transcript(
+                        app,
+                        recording_id=recording_id,
+                        transcript_text=transcript_text,
+                        transcript_source=_row_optional_text(row, "transcript_source") or ("transcript_excerpt" if transcript_text else ""),
+                        transcript_error=transcript_error,
+                    )
                 agent_decision = _classify_recorder_review_transcript(
                     app,
                     row=row,
@@ -3440,7 +3553,12 @@ def _run_testimony_transcript_job(
                 )
                 if transcript_text and not str(row["speaker_name"] or ""):
                     transcript_speaker = _valid_person_name_suggestion(_extract_intro_speaker(transcript_text, known_speakers), known_speakers)
-                if agent_decision or transcript_speaker or not str(row["suggestion_source"] or ""):
+                completed_without_agent = (
+                    not agent_decision
+                    and bool(transcript_text)
+                    and str(row["status"] or "") in {"identified", "grouped", "already_named"}
+                )
+                if agent_decision or transcript_speaker or not str(row["suggestion_source"] or "") or completed_without_agent:
                     decision_speaker = _valid_person_name_suggestion(
                         str((agent_decision or {}).get("speaker") or ""),
                         known_speakers,
@@ -3448,6 +3566,13 @@ def _run_testimony_transcript_job(
                     decision_kind = str((agent_decision or {}).get("recording_kind") or "")
                     decision_action = str((agent_decision or {}).get("action") or "")
                     decision_reason = str((agent_decision or {}).get("reason") or "")
+                    if completed_without_agent:
+                        decision_kind = decision_kind or _row_optional_text(row, "recorder_agent_kind") or "testimony"
+                        decision_action = decision_action or _row_optional_text(row, "recorder_agent_action") or "review"
+                        decision_reason = (
+                            f"{RECORDER_REVIEW_ANALYSIS_VERSION}: "
+                            "Retained the completed review because automatic classification was unavailable."
+                        )
                     _save_testimony_review(
                         app,
                         recording_id=recording_id,
@@ -5203,6 +5328,374 @@ def _nextcloud_config(app: Flask) -> tuple[str, str, str] | None:
     return base_url, username, password
 
 
+def _split_delivery_values(value: str) -> list[str]:
+    values = []
+    seen = set()
+    for item in re.split(r"[,;\n]+", value or ""):
+        item = item.strip()
+        key = item.lower()
+        if item and key not in seen:
+            seen.add(key)
+            values.append(item)
+    return values
+
+
+def _delivery_json_values(value: str) -> list[str]:
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+def _validate_testimony_delivery_rule(
+    canonical_name: str,
+    aliases: list[str],
+    emails: list[str],
+    effective_from: str | None,
+) -> str:
+    if not canonical_name:
+        return "Enter the person's canonical name."
+    if not aliases:
+        return "Enter at least one exact speaker-name alias."
+    if not emails:
+        return "Enter at least one delivery email address."
+    invalid_emails = [email for email in emails if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)]
+    if invalid_emails:
+        return f"Invalid email address: {invalid_emails[0]}"
+    if not effective_from:
+        return "Choose the date when automatic delivery should begin."
+    return ""
+
+
+def _save_testimony_delivery_rule(
+    app: Flask,
+    *,
+    rule_id: int | None,
+    canonical_name: str,
+    aliases: list[str],
+    emails: list[str],
+    effective_from: str,
+    enabled: bool,
+) -> None:
+    now = _utc_now()
+    aliases_json = json.dumps(aliases, separators=(",", ":"))
+    emails_json = json.dumps(emails, separators=(",", ":"))
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        if rule_id is None:
+            connection.execute(
+                """
+                INSERT INTO testimony_delivery_rules (
+                    canonical_name,
+                    aliases_json,
+                    emails_json,
+                    effective_from,
+                    enabled,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(canonical_name) DO UPDATE SET
+                    aliases_json = excluded.aliases_json,
+                    emails_json = excluded.emails_json,
+                    effective_from = excluded.effective_from,
+                    enabled = excluded.enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (canonical_name, aliases_json, emails_json, effective_from, int(enabled), now, now),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE testimony_delivery_rules
+                SET canonical_name = ?,
+                    aliases_json = ?,
+                    emails_json = ?,
+                    effective_from = ?,
+                    enabled = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (canonical_name, aliases_json, emails_json, effective_from, int(enabled), now, rule_id),
+            )
+
+
+def _testimony_delivery_rules(app: Flask) -> list[dict]:
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM testimony_delivery_rules
+            ORDER BY enabled DESC, canonical_name COLLATE NOCASE
+            """
+        ).fetchall()
+    return [
+        {
+            "id": int(row["id"]),
+            "canonical_name": str(row["canonical_name"] or ""),
+            "aliases": _delivery_json_values(row["aliases_json"]),
+            "aliases_text": "\n".join(_delivery_json_values(row["aliases_json"])),
+            "emails": _delivery_json_values(row["emails_json"]),
+            "emails_text": "\n".join(_delivery_json_values(row["emails_json"])),
+            "effective_from": str(row["effective_from"] or ""),
+            "enabled": bool(row["enabled"]),
+            "updated_at": str(row["updated_at"] or ""),
+        }
+        for row in rows
+    ]
+
+
+def _testimony_delivery_history(app: Flask, limit: int = 50) -> list[dict]:
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        rows = connection.execute(
+            """
+            SELECT d.*, r.canonical_name, r.emails_json
+            FROM testimony_deliveries AS d
+            JOIN testimony_delivery_rules AS r ON r.id = d.rule_id
+            ORDER BY d.id DESC
+            LIMIT ?
+            """,
+            (max(1, min(limit, 200)),),
+        ).fetchall()
+    return [
+        {
+            "id": int(row["id"]),
+            "canonical_name": str(row["canonical_name"] or ""),
+            "emails": _delivery_json_values(row["emails_json"]),
+            "speaker_name": str(row["speaker_name"] or ""),
+            "service_date": str(row["service_date"] or ""),
+            "recording_title": str(row["recording_title"] or ""),
+            "status": str(row["status"] or ""),
+            "share_url": str(row["share_url"] or ""),
+            "attempted_at": str(row["attempted_at"] or ""),
+            "sent_at": str(row["sent_at"] or ""),
+            "error": str(row["error"] or ""),
+        }
+        for row in rows
+    ]
+
+
+def _queue_testimony_deliveries(
+    app: Flask,
+    *,
+    recording_id: str,
+    recording_path: str,
+    recording_title: str,
+    speaker_name: str,
+    service_date: str,
+) -> int:
+    if not speaker_name or not service_date:
+        return 0
+    speaker_key = _speaker_key(speaker_name)
+    queued = 0
+    now = _utc_now()
+    source_recording_id = _testimony_delivery_origin_id(app, recording_id)
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        rules = connection.execute(
+            "SELECT * FROM testimony_delivery_rules WHERE enabled = 1 AND effective_from <= ?",
+            (service_date,),
+        ).fetchall()
+        for rule in rules:
+            names = [str(rule["canonical_name"] or ""), *_delivery_json_values(rule["aliases_json"])]
+            if speaker_key not in {_speaker_key(name) for name in names if name}:
+                continue
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO testimony_deliveries (
+                    rule_id,
+                    source_recording_id,
+                    recording_id,
+                    recording_path,
+                    recording_title,
+                    speaker_name,
+                    service_date,
+                    status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    int(rule["id"]),
+                    source_recording_id,
+                    recording_id,
+                    recording_path,
+                    recording_title,
+                    speaker_name,
+                    service_date,
+                    now,
+                    now,
+                ),
+            )
+            queued += max(0, cursor.rowcount)
+    if queued:
+        _start_testimony_delivery_job(app)
+    return queued
+
+
+def _testimony_delivery_origin_id(app: Flask, recording_id: str) -> str:
+    current_id = recording_id
+    seen = set()
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        while current_id and current_id not in seen:
+            seen.add(current_id)
+            row = connection.execute(
+                """
+                SELECT previous_recording_id
+                FROM recorder_review_history
+                WHERE recording_id = ?
+                  AND previous_recording_id <> ''
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (current_id,),
+            ).fetchone()
+            previous_id = str(row["previous_recording_id"] or "") if row else ""
+            if not previous_id:
+                break
+            current_id = previous_id
+    return current_id or recording_id
+
+
+def _start_testimony_delivery_job(app: Flask) -> bool:
+    with app.testimony_delivery_job_lock:
+        if app.testimony_delivery_job_running:
+            return False
+        app.testimony_delivery_job_running = True
+    thread = threading.Thread(
+        target=_run_testimony_delivery_job,
+        args=(app,),
+        name="testimony-delivery-job",
+        daemon=True,
+    )
+    thread.start()
+    return True
+
+
+def _run_testimony_delivery_job(app: Flask) -> None:
+    try:
+        with app.app_context():
+            retry_before = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="seconds")
+            while True:
+                with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+                    row = connection.execute(
+                        """
+                        SELECT d.*, r.emails_json
+                        FROM testimony_deliveries AS d
+                        JOIN testimony_delivery_rules AS r ON r.id = d.rule_id
+                        WHERE r.enabled = 1
+                          AND (
+                              d.status = 'pending'
+                              OR (d.status = 'failed' AND d.attempted_at < ?)
+                          )
+                        ORDER BY d.id
+                        LIMIT 1
+                        """,
+                        (retry_before,),
+                    ).fetchone()
+                    if not row:
+                        break
+                    attempted_at = _utc_now()
+                    claimed = connection.execute(
+                        """
+                        UPDATE testimony_deliveries
+                        SET status = 'sending',
+                            attempted_at = ?,
+                            error = '',
+                            updated_at = ?
+                        WHERE id = ?
+                          AND status IN ('pending', 'failed')
+                        """,
+                        (attempted_at, attempted_at, int(row["id"])),
+                    )
+                    if claimed.rowcount != 1:
+                        continue
+                _deliver_testimony_recording(app, row)
+    finally:
+        with app.testimony_delivery_job_lock:
+            app.testimony_delivery_job_running = False
+
+
+def _deliver_testimony_recording(app: Flask, row: sqlite3.Row) -> None:
+    path = Path(str(row["recording_path"] or ""))
+    candidate = _testimony_source_candidate_from_path(app, path)
+    error = ""
+    share_url = str(row["share_url"] or "")
+    share_id = str(row["share_external_id"] or "")
+    if not candidate:
+        error = "The testimony recording file is unavailable."
+    elif not share_url:
+        share_url, share_id, error = _create_nextcloud_share_link(app, candidate)
+    recipients = _delivery_json_values(row["emails_json"])
+    if not error and not recipients:
+        error = "The delivery rule has no email recipients."
+    if not error:
+        body = _testimony_delivery_email_html(
+            app,
+            candidate=candidate,
+            share_url=share_url,
+            speaker_name=str(row["speaker_name"] or ""),
+            service_date=str(row["service_date"] or ""),
+        )
+        sent, error = _send_html_email(
+            app,
+            recipients=recipients,
+            subject="NTC Newark Testimony Recording",
+            body=body,
+        )
+        if not sent and not error:
+            error = "Email delivery failed."
+    now = _utc_now()
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute(
+            """
+            UPDATE testimony_deliveries
+            SET status = ?,
+                share_url = ?,
+                share_external_id = ?,
+                sent_at = ?,
+                error = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                "failed" if error else "sent",
+                share_url,
+                share_id,
+                "" if error else now,
+                error,
+                now,
+                int(row["id"]),
+            ),
+        )
+
+
+def _testimony_delivery_email_html(
+    app: Flask,
+    *,
+    candidate: RecordingCandidate,
+    share_url: str,
+    speaker_name: str,
+    service_date: str,
+) -> str:
+    message = (
+        "Praise the Lord,\n\n"
+        f"Your testimony recording from {_format_date(service_date)} is ready.\n\n"
+        "Please use the link below to listen to the recording.\n\n"
+        "God bless,\n"
+        "NTC Newark"
+    )
+    return _recording_email_html(
+        app,
+        {"requested_date": service_date},
+        candidate,
+        share_url,
+        message,
+    )
+
+
 def _list_nextcloud_shares(app: Flask, nextcloud_path: str) -> tuple[list[dict[str, str]], str]:
     config = _nextcloud_config(app)
     if not config:
@@ -5251,14 +5744,26 @@ def _send_recording_email(
     share_url: str,
     email_message: str,
 ) -> tuple[bool, str]:
-    if not _email_enabled(app):
-        return False, "email disabled"
     subject = "NTC Newark Recording Request"
     body = _recording_email_html(app, row, candidate, share_url, email_message)
+    recipients = [email for email in (row["email"], row["secondary_email"]) if email]
+    return _send_html_email(app, recipients=recipients, subject=subject, body=body)
+
+
+def _send_html_email(
+    app: Flask,
+    *,
+    recipients: list[str],
+    subject: str,
+    body: str,
+) -> tuple[bool, str]:
+    if not _email_enabled(app):
+        return False, "email disabled"
+    if not recipients:
+        return False, "no email recipients"
     message = MIMEText(body, "html")
     message["Subject"] = subject
     message["From"] = app.config["NTC_RECORDINGS_EMAIL_FROM"]
-    recipients = [email for email in (row["email"], row["secondary_email"]) if email]
     message["To"] = ", ".join(recipients)
     try:
         with smtplib.SMTP(app.config["NTC_RECORDINGS_SMTP_HOST"], app.config["NTC_RECORDINGS_SMTP_PORT"], timeout=12) as smtp:
@@ -5271,7 +5776,7 @@ def _send_recording_email(
             smtp.send_message(message, to_addrs=recipients)
         return True, ""
     except Exception as exc:  # pragma: no cover - depends on external SMTP
-        app.logger.exception("failed to send recording request email")
+        app.logger.exception("failed to send recording email")
         return False, str(exc)
 
 
@@ -6516,6 +7021,182 @@ RECORDING_ADMIN_TEMPLATE = """
 """
 
 
+TESTIMONY_DELIVERY_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }} Testimony Delivery</title>
+    <style>
+      :root {
+        color-scheme:dark;
+        --bg:#07121e;
+        --surface:rgba(10,21,36,.94);
+        --surface-2:rgba(18,34,53,.9);
+        --line:rgba(143,211,255,.22);
+        --text:#edf7ff;
+        --muted:#9fb2c6;
+        --accent:#8fd3ff;
+        --good:#74ddb4;
+        --warn:#ffc875;
+        --bad:#ffaaa8;
+        --mono:ui-monospace,"SFMono-Regular",Consolas,monospace;
+      }
+      * { box-sizing:border-box; }
+      body {
+        margin:0;
+        min-height:100vh;
+        color:var(--text);
+        background:radial-gradient(circle at 10% 0%,rgba(143,211,255,.18),transparent 28rem),linear-gradient(145deg,#050913,var(--bg));
+        font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      }
+      main { width:min(1180px,calc(100vw - 32px)); margin:0 auto; padding:30px 0 52px; }
+      header { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:1rem; align-items:start; margin-bottom:1.25rem; }
+      h1,h2,p { margin:0; }
+      h1 { margin-top:.35rem; font-size:clamp(34px,5vw,58px); line-height:.96; letter-spacing:0; }
+      h2 { font-size:1.15rem; }
+      .eyebrow,.meta { color:var(--accent); font:800 .72rem var(--mono); letter-spacing:.12em; text-transform:uppercase; }
+      .muted { color:var(--muted); line-height:1.45; }
+      header .muted { margin-top:.55rem; }
+      .actions { display:flex; gap:.5rem; flex-wrap:wrap; justify-content:flex-end; }
+      a,button,input,textarea {
+        border:1px solid var(--line);
+        border-radius:12px;
+        background:var(--surface-2);
+        color:var(--text);
+        padding:.7rem .85rem;
+        font:inherit;
+        text-decoration:none;
+      }
+      a,button { font-weight:850; cursor:pointer; }
+      input,textarea { width:100%; background:rgba(5,13,23,.64); }
+      textarea { min-height:5.5rem; resize:vertical; line-height:1.4; }
+      label { display:grid; gap:.35rem; color:var(--muted); font-weight:800; }
+      label > span { font:800 .66rem var(--mono); letter-spacing:.1em; text-transform:uppercase; }
+      .panel { border:1px solid var(--line); border-radius:18px; background:var(--surface); padding:1rem; margin-top:1rem; }
+      .panel-head { display:flex; justify-content:space-between; align-items:end; gap:1rem; margin-bottom:.85rem; }
+      .rule-list { display:grid; gap:.75rem; }
+      .rule {
+        display:grid;
+        grid-template-columns:minmax(180px,1fr) minmax(180px,1.1fr) minmax(220px,1.25fr) 150px auto;
+        gap:.7rem;
+        align-items:end;
+        border:1px solid var(--line);
+        border-radius:14px;
+        padding:.85rem;
+        background:rgba(15,32,51,.72);
+      }
+      .enabled { display:flex; align-items:center; gap:.5rem; min-height:45px; }
+      .enabled input { width:auto; }
+      .banner { border:1px solid rgba(116,221,180,.35); border-radius:14px; background:rgba(116,221,180,.1); color:var(--good); padding:.8rem; font-weight:850; margin-bottom:.75rem; }
+      .banner.error { border-color:rgba(255,170,168,.4); background:rgba(255,170,168,.1); color:var(--bad); }
+      .history { width:100%; border-collapse:collapse; }
+      .history th,.history td { padding:.75rem .55rem; border-top:1px solid var(--line); text-align:left; vertical-align:top; }
+      .history th { color:var(--muted); font:800 .65rem var(--mono); letter-spacing:.1em; text-transform:uppercase; }
+      .status { font:800 .68rem var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+      .status.sent { color:var(--good); }
+      .status.failed { color:var(--bad); }
+      .status.pending,.status.sending { color:var(--warn); }
+      .empty { color:var(--muted); padding:.8rem 0; }
+      @media (max-width:900px) {
+        .rule { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .rule label:nth-of-type(2),.rule label:nth-of-type(3) { grid-column:span 1; }
+        .rule button { width:100%; }
+        .history,.history tbody,.history tr,.history td { display:block; }
+        .history thead { display:none; }
+        .history tr { border-top:1px solid var(--line); padding:.65rem 0; }
+        .history td { border:0; padding:.2rem 0; }
+      }
+      @media (max-width:620px) {
+        main { width:min(100% - 20px,1180px); padding-top:18px; }
+        header { grid-template-columns:1fr; }
+        header .actions { justify-content:flex-start; }
+        .rule { grid-template-columns:1fr; }
+        .rule label:nth-of-type(2),.rule label:nth-of-type(3) { grid-column:auto; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <div class="eyebrow">NTC Newark</div>
+          <h1>Testimony Delivery</h1>
+          <p class="muted">Automatic delivery begins on each rule's effective date.</p>
+        </div>
+        <div class="actions">
+          <a href="{{ recordings_url_for('testimony_review') }}">Recorder Review</a>
+          <a href="{{ recordings_url_for('admin_panel') }}">Requests</a>
+        </div>
+      </header>
+      {% if message %}<div class="banner">{{ message }}</div>{% endif %}
+      {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="meta">Rules</div>
+            <h2>Configured Recipients</h2>
+          </div>
+        </div>
+        <div class="rule-list">
+          {% for rule in rules %}
+            <form class="rule" method="post" action="{{ recordings_url_for('save_testimony_delivery_rule') }}">
+              <input type="hidden" name="rule_id" value="{{ rule.id }}">
+              <label><span>Canonical Name</span><input name="canonical_name" value="{{ rule.canonical_name }}" required></label>
+              <label><span>Exact Speaker Aliases</span><textarea name="aliases" required>{{ rule.aliases_text }}</textarea></label>
+              <label><span>Email Recipients</span><textarea name="emails" inputmode="email" required>{{ rule.emails_text }}</textarea></label>
+              <label><span>Effective From</span><input name="effective_from" type="date" value="{{ rule.effective_from }}" required></label>
+              <div>
+                <label class="enabled"><input name="enabled" type="checkbox" value="1" {% if rule.enabled %}checked{% endif %}> Enabled</label>
+                <button type="submit">Save Rule</button>
+              </div>
+            </form>
+          {% endfor %}
+          <form class="rule" method="post" action="{{ recordings_url_for('save_testimony_delivery_rule') }}">
+            <label><span>Canonical Name</span><input name="canonical_name" placeholder="Rachel George" required></label>
+            <label><span>Exact Speaker Aliases</span><textarea name="aliases" placeholder="Sister Rachel&#10;Sister Rachel George" required></textarea></label>
+            <label><span>Email Recipients</span><textarea name="emails" inputmode="email" placeholder="name@example.com" required></textarea></label>
+            <label><span>Effective From</span><input name="effective_from" type="date" value="{{ today }}" required></label>
+            <div>
+              <label class="enabled"><input name="enabled" type="checkbox" value="1" checked> Enabled</label>
+              <button type="submit">Add Rule</button>
+            </div>
+          </form>
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="meta">Delivery Log</div>
+            <h2>Recent Testimonies</h2>
+          </div>
+        </div>
+        {% if deliveries %}
+          <table class="history">
+            <thead><tr><th>Person</th><th>Recording</th><th>Recipients</th><th>Status</th><th>Updated</th></tr></thead>
+            <tbody>
+              {% for delivery in deliveries %}
+                <tr>
+                  <td><strong>{{ delivery.canonical_name }}</strong><div class="muted">{{ delivery.speaker_name }}</div></td>
+                  <td>{{ format_date(delivery.service_date) }}<div class="muted">{{ delivery.recording_title }}</div></td>
+                  <td>{{ delivery.emails|join(", ") }}</td>
+                  <td><span class="status {{ delivery.status }}">{{ delivery.status }}</span>{% if delivery.error %}<div class="muted">{{ delivery.error }}</div>{% endif %}</td>
+                  <td>{{ format_datetime(delivery.sent_at or delivery.attempted_at) }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <div class="empty">No automatic deliveries yet.</div>
+        {% endif %}
+      </section>
+    </main>
+  </body>
+</html>
+"""
+
+
 TESTIMONY_REVIEW_TEMPLATE = """
 <!doctype html>
 <html lang="en">
@@ -7076,6 +7757,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         </div>
         <div class="actions">
           <a href="{{ recordings_url_for('admin_panel') }}">Requests</a>
+          <a href="{{ recordings_url_for('testimony_delivery_rules') }}">Delivery Rules</a>
           <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
           <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
         </div>
@@ -7142,8 +7824,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
             <label>
               <span>Sort</span>
               <select name="sort">
-                <option value="shortest" {% if sort == "shortest" %}selected{% endif %}>Shortest first</option>
                 <option value="newest" {% if sort == "newest" %}selected{% endif %}>Newest first</option>
+                <option value="shortest" {% if sort == "shortest" %}selected{% endif %}>Shortest first</option>
                 <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
               </select>
             </label>

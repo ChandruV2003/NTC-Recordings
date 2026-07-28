@@ -11,17 +11,23 @@ from unittest.mock import Mock, patch
 import requests
 
 from ntc_recordings_app import (
+    _automatic_review_analysis_ids,
     _date_from_file_metadata,
     _display_transcript_text,
     _extract_intro_speaker,
     _humanize_classifier_evidence,
     _normalize_recording_email_message,
     _post_transcription_audio,
+    _queue_testimony_deliveries,
+    _record_testimony_review_history,
     _recording_id,
     _run_testimony_transcript_job,
+    _run_testimony_delivery_job,
+    _save_testimony_delivery_rule,
     _save_testimony_review,
     _sanitize_existing_testimony_transcript_errors,
     _sanitize_existing_testimony_transcripts,
+    _sort_testimony_items,
     _sync_testimony_recorder_manifest_reviews,
     _testimony_filename_speaker_suggestion,
     _testimony_looks_like_message_recording,
@@ -2746,6 +2752,179 @@ class RecordingRequestPanelTests(unittest.TestCase):
             _humanize_classifier_evidence(r"personal experience: \bgod (has|had|did|was)\b"),
             "Personal experience language detected",
         )
+
+    def test_recorder_review_defaults_to_newest_service_date(self):
+        self._login()
+
+        response = self.client.get("/admin/recorder-review")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'<option value="newest" selected>Newest first</option>', response.data)
+        items = [
+            {"service_date": "2025-12-31", "modified_at": "2026-07-28T12:00:00+00:00", "title": "Older"},
+            {"service_date": "2026-07-26", "modified_at": "2026-07-26T12:00:00+00:00", "title": "Newer"},
+        ]
+        _sort_testimony_items(items, "newest")
+        self.assertEqual([item["title"] for item in items], ["Newer", "Older"])
+
+    def test_completed_review_gets_current_analysis_marker_when_agent_is_unavailable(self):
+        source_root = self.root / "TestimonyReviewQueue"
+        source_root.mkdir()
+        recording = source_root / "REC00991.mp3"
+        recording.write_bytes(b"completed-testimony")
+        recording_id = _recording_id(recording)
+        _save_testimony_review(
+            self.app,
+            recording_id=recording_id,
+            source_path=str(recording),
+            status="identified",
+            service_date="2026-07-26",
+            speaker_name="Sister Test",
+            testimony_title="Sister Test's Testimony",
+            notes="",
+            proposed_path="",
+            duration_seconds=75,
+            suggested_speaker="Sister Test",
+            suggestion_source="history",
+            suggestion_text="Confirmed previously.",
+        )
+        _save_testimony_transcript(
+            self.app,
+            recording_id,
+            transcript_text="Praise the Lord. I want to thank God.",
+            transcript_source="transcript_excerpt",
+            transcript_error="",
+        )
+
+        with patch("ntc_recordings_app._classify_recorder_review_transcript", return_value=None):
+            _run_testimony_transcript_job(
+                self.app,
+                limit=1,
+                statuses={"identified"},
+                recording_ids={recording_id},
+            )
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM testimony_reviews WHERE recording_id = ?",
+                (recording_id,),
+            ).fetchone()
+        self.assertIn("recorder-review-v2", row["recorder_agent_reason"])
+        self.assertEqual(_automatic_review_analysis_ids([dict(row)]), set())
+
+    def test_testimony_delivery_rule_is_future_only_idempotent_and_uses_both_recipients(self):
+        effective_from = "2026-07-28"
+        _save_testimony_delivery_rule(
+            self.app,
+            rule_id=None,
+            canonical_name="Rachel George",
+            aliases=["Sister Rachel", "Sister Rachel George"],
+            emails=["rachelgeorge106@gmail.com", "rachelgeorge106@yahoo.com"],
+            effective_from=effective_from,
+            enabled=True,
+        )
+        recording = self.testimony_root / "July 28, 2026 - Sister Rachel's Testimony.mp3"
+        recording.write_bytes(b"future-testimony")
+        recording_id = _recording_id(recording)
+        source_recording_id = "raw-intake-id"
+        _record_testimony_review_history(
+            self.app,
+            recording_id=recording_id,
+            previous_recording_id=source_recording_id,
+            action="save_speaker",
+            previous_status="needs_review",
+            new_status="identified",
+            service_date=effective_from,
+            speaker_name="Sister Rachel",
+            recording_kind="testimony",
+            source_path="/incoming/raw.mp3",
+            target_path=str(recording),
+        )
+        with patch("ntc_recordings_app._start_testimony_delivery_job") as starter:
+            historical = _queue_testimony_deliveries(
+                self.app,
+                recording_id=recording_id,
+                recording_path=str(recording),
+                recording_title=recording.stem,
+                speaker_name="Sister Rachel",
+                service_date="2026-07-05",
+            )
+            queued = _queue_testimony_deliveries(
+                self.app,
+                recording_id=recording_id,
+                recording_path=str(recording),
+                recording_title=recording.stem,
+                speaker_name="Sister Rachel",
+                service_date=effective_from,
+            )
+            renamed_recording = self.testimony_root / "July 28, 2026 - Rachel George's Testimony.mp3"
+            renamed_recording.write_bytes(recording.read_bytes())
+            renamed_recording_id = _recording_id(renamed_recording)
+            _record_testimony_review_history(
+                self.app,
+                recording_id=renamed_recording_id,
+                previous_recording_id=recording_id,
+                action="save_speaker",
+                previous_status="identified",
+                new_status="identified",
+                service_date=effective_from,
+                speaker_name="Rachel George",
+                recording_kind="testimony",
+                source_path=str(recording),
+                target_path=str(renamed_recording),
+            )
+            duplicate = _queue_testimony_deliveries(
+                self.app,
+                recording_id=renamed_recording_id,
+                recording_path=str(renamed_recording),
+                recording_title=renamed_recording.stem,
+                speaker_name="Rachel George",
+                service_date=effective_from,
+            )
+        self.assertEqual((historical, queued, duplicate), (0, 1, 0))
+        starter.assert_called_once()
+
+        with (
+            patch(
+                "ntc_recordings_app._create_nextcloud_share_link",
+                return_value=("https://nextcloud.example.test/s/rachel", "42", ""),
+            ),
+            patch("ntc_recordings_app._send_html_email", return_value=(True, "")) as sender,
+        ):
+            _run_testimony_delivery_job(self.app)
+
+        self.assertEqual(
+            sender.call_args.kwargs["recipients"],
+            ["rachelgeorge106@gmail.com", "rachelgeorge106@yahoo.com"],
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            delivery = connection.execute(
+                "SELECT status, share_url, sent_at FROM testimony_deliveries"
+            ).fetchone()
+        self.assertEqual(delivery[0], "sent")
+        self.assertEqual(delivery[1], "https://nextcloud.example.test/s/rachel")
+        self.assertTrue(delivery[2])
+
+    def test_delivery_rules_page_can_save_rule(self):
+        self._login()
+
+        response = self.client.post(
+            "/admin/testimony-delivery/rules",
+            data={
+                "canonical_name": "Rachel George",
+                "aliases": "Sister Rachel\nSister Rachel George",
+                "emails": "rachelgeorge106@gmail.com\nrachelgeorge106@yahoo.com",
+                "effective_from": "2026-07-28",
+                "enabled": "1",
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Automatic delivery rule saved for Rachel George", response.data)
+        self.assertIn(b"rachelgeorge106@gmail.com", response.data)
+        self.assertIn(b"rachelgeorge106@yahoo.com", response.data)
 
 
 if __name__ == "__main__":
