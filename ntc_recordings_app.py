@@ -214,28 +214,36 @@ TRANSCRIPT_NAME_REJECT_FIRST_WORDS = {
     "blessed",
     "completely",
     "deeply",
+    "definitely",
     "driving",
+    "excited",
+    "faithful",
     "for",
     "going",
     "grateful",
     "happy",
     "here",
+    "holy",
     "his",
     "living",
     "looking",
     "not",
     "on",
+    "one",
     "personally",
     "privileged",
     "really",
     "set",
     "she",
     "sorry",
+    "standing",
+    "something",
     "such",
     "sure",
     "thankful",
     "that",
     "the",
+    "tasting",
     "this",
     "to",
     "waiting",
@@ -246,15 +254,19 @@ TRANSCRIPT_NAME_REJECT_WORDS = {
     "able",
     "all",
     "always",
+    "awkward",
     "blessing",
     "body",
     "burdensome",
     "come",
     "completely",
     "deeply",
+    "definitely",
     "discomfort",
     "emotional",
+    "excited",
     "family",
+    "faithful",
     "give",
     "goodness",
     "grateful",
@@ -262,6 +274,7 @@ TRANSCRIPT_NAME_REJECT_WORDS = {
     "heart",
     "honor",
     "honored",
+    "holy",
     "hopeless",
     "in",
     "just",
@@ -277,6 +290,7 @@ TRANSCRIPT_NAME_REJECT_WORDS = {
     "not",
     "of",
     "on",
+    "one",
     "praise",
     "privileged",
     "really",
@@ -284,7 +298,11 @@ TRANSCRIPT_NAME_REJECT_WORDS = {
     "saying",
     "sinner",
     "song",
+    "standing",
+    "something",
     "testimony",
+    "that",
+    "tasting",
     "to",
     "trials",
     "us",
@@ -3041,6 +3059,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "recorder_agent_action": recorder_agent_action,
         "recorder_agent_action_label": _recorder_agent_action_label(recorder_agent_action),
         "recorder_agent_reason": recorder_agent_reason,
+        "recorder_agent_reason_label": _recorder_agent_reason_label(recorder_agent_reason),
         "recorder_agent_updated_at": recorder_agent_updated_at,
         "recorder_agent_updated_label": _format_datetime(recorder_agent_updated_at),
         "recorder_segment_kind": recorder_segment_kind,
@@ -3824,6 +3843,24 @@ def _recorder_agent_kind_label(kind: str) -> str:
 def _recorder_agent_action_label(action: str) -> str:
     normalized = re.sub(r"[^a-z]+", "_", str(action or "").strip().lower()).strip("_")
     return normalized.replace("_", " ").title() if normalized else ""
+
+
+def _recorder_agent_reason_label(reason: str) -> str:
+    raw = re.sub(r"\s+", " ", str(reason or "")).strip()
+    if not raw:
+        return ""
+    if raw.startswith(f"{RECORDER_REVIEW_ANALYSIS_VERSION}:"):
+        raw = raw.split(":", 1)[1].strip()
+    normalized = raw.rstrip(".").lower()
+    labels = {
+        "applied recorder decision rules": "",
+        "automatic transcript classification completed": "Automatic recording review completed.",
+        "used metadata speaker evidence for testimony title": "Speaker confirmed from recording metadata.",
+        "used explicit_name speaker evidence for testimony title": "Speaker name found in the transcript.",
+        "transcript sounds like worship/service music or rehearsal audio": "Worship or service music detected.",
+        "personal testimony evidence": "Personal testimony language detected.",
+    }
+    return labels.get(normalized, raw.rstrip(".") + ".")
 
 
 def _recorder_segment_kind_label(kind: str) -> str:
@@ -4862,21 +4899,34 @@ def _extract_intro_speaker(transcript: str, known_speakers: Iterable[str]) -> st
     if not text:
         return ""
     patterns = [
-        r"\bmy\s+name\s+is\s+([a-z][a-z' -]{1,60})",
-        r"\bmy\s+name'?s\s+([a-z][a-z' -]{1,60})",
-        r"\bi\s+am\s+([a-z][a-z' -]{1,60})",
-        r"\bi'?m\s+([a-z][a-z' -]{1,60})",
-        r"\bthis\s+is\s+((?:brother|bro|sister|sis)\s+[a-z][a-z' -]{1,50})",
+        (r"\bmy\s+name\s+is\s+([a-z][a-z' -]{1,60})", True),
+        (r"\bmy\s+name'?s\s+([a-z][a-z' -]{1,60})", True),
+        (r"\bthis\s+is\s+((?:brother|bro|sister|sis)\s+[a-z][a-z' -]{1,50})", True),
+        (r"\bi\s+am\s+([a-z][a-z' -]{1,60})", False),
+        (r"\bi'?m\s+([a-z][a-z' -]{1,60})", False),
     ]
-    for pattern in patterns:
+    for pattern, strong_identity in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if not match:
             continue
         name = _clean_transcript_name(match.group(1))
         if not _person_name_candidate(name, known_speakers):
             continue
+        if not strong_identity and not _weak_identity_name_candidate(name, known_speakers):
+            continue
         return _canonical_speaker_name(name, known_speakers)
     return ""
+
+
+def _weak_identity_name_candidate(value: str, known_speakers: Iterable[str]) -> bool:
+    candidate = _clean_speaker_name(value)
+    aliases = _known_speaker_alias_lookup(known_speakers)
+    if _speaker_key(candidate) in aliases or _speaker_key(_remove_speaker_title(candidate)) in aliases:
+        return True
+    words = candidate.split()
+    if words and words[0].lower() in {"brother", "sister"}:
+        return len(words) >= 2
+    return len(words) >= 2
 
 
 def _clean_transcript_name(value: str) -> str:
@@ -8142,7 +8192,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                           <div>
                             <span>Recording Type</span>
                             <strong>{{ item.recorder_agent_kind_label }}</strong>
-                            {% if item.recorder_agent_reason %}<small>{{ item.recorder_agent_reason }}</small>{% endif %}
+                            {% if item.recorder_agent_reason_label %}<small>{{ item.recorder_agent_reason_label }}</small>{% endif %}
                           </div>
                           {% if item.recorder_agent_action_label %}
                             <small>{{ item.recorder_agent_action_label }}</small>

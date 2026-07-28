@@ -20,6 +20,7 @@ from ntc_recordings_app import (
     _post_transcription_audio,
     _queue_testimony_deliveries,
     _record_testimony_review_history,
+    _recorder_agent_reason_label,
     _recording_id,
     _run_testimony_transcript_job,
     _run_testimony_delivery_job,
@@ -1864,6 +1865,10 @@ class RecordingRequestPanelTests(unittest.TestCase):
             "Sister Shirley",
         )
         self.assertEqual(
+            _extract_intro_speaker("Praise the Lord, I'm John Prabu and I want to thank the Lord.", []),
+            "John Prabu",
+        )
+        self.assertEqual(
             _extract_intro_speaker("Praise the Lord, my name is Rachel and I want to testify.", ["Sister Rachel"]),
             "Sister Rachel",
         )
@@ -1873,13 +1878,42 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(_extract_intro_speaker("I am deeply thankful for what God has done.", []), "")
         self.assertEqual(_extract_intro_speaker("Praise the Lord. I am happening to me in this situation.", []), "")
         self.assertEqual(_extract_intro_speaker("Praise the Lord. I'm really, really blessed to testify today.", []), "")
+        self.assertEqual(_extract_intro_speaker("I'm excited to see what God has in store.", []), "")
+        self.assertEqual(_extract_intro_speaker("I am holy and grateful for this opportunity.", []), "")
         self.assertEqual(_valid_person_name_suggestion("Happening To Me", []), "")
         self.assertEqual(_valid_person_name_suggestion("Really", []), "")
         self.assertEqual(_valid_person_name_suggestion("Testimony", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Definitely One", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Really Awkward", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Something That", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Standing Here", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Tasting", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Holy", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Excited", []), "")
+        self.assertEqual(_valid_person_name_suggestion("Faithful", []), "")
         self.assertEqual(_testimony_filename_speaker_suggestion(Path("March 15, 2026 - Testimony.mp3")), "")
         self.assertEqual(
             _testimony_filename_speaker_suggestion(Path("March 15, 2026 - Sister Shirley's Testimony.mp3")),
             "Sister Shirley",
+        )
+
+    def test_recorder_agent_reason_label_hides_internal_rule_versions(self):
+        self.assertEqual(_recorder_agent_reason_label("recorder-review-v2: Applied recorder decision rules."), "")
+        self.assertEqual(
+            _recorder_agent_reason_label(
+                "recorder-review-v2: Used metadata speaker evidence for testimony title."
+            ),
+            "Speaker confirmed from recording metadata.",
+        )
+        self.assertEqual(
+            _recorder_agent_reason_label(
+                "recorder-review-v2: Used explicit_name speaker evidence for testimony title."
+            ),
+            "Speaker name found in the transcript.",
+        )
+        self.assertEqual(
+            _recorder_agent_reason_label("Classification confirmed in Recorder Review."),
+            "Classification confirmed in Recorder Review.",
         )
 
     def test_email_message_normalizes_escaped_newlines(self):
