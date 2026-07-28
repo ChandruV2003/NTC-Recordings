@@ -7625,6 +7625,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         margin:0;
         opacity:0;
         cursor:pointer;
+        pointer-events:none;
       }
       .row-number {
         display:grid;
