@@ -31,6 +31,7 @@ from ntc_recordings_app import (
     _sync_testimony_recorder_manifest_reviews,
     _testimony_filename_speaker_suggestion,
     _testimony_looks_like_message_recording,
+    _testimony_review_items,
     _testimony_suggestion_targets,
     _testimony_transcript_statuses_for_filter,
     _testimony_transcript_targets,
@@ -2054,6 +2055,30 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(first, {"archived-path"})
         self.assertEqual(second, {"archived-path"})
         sync.assert_called_once()
+
+    def test_recorder_review_items_are_reused_for_concurrent_refreshes(self):
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "review-cache-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(Path(self.tempdir.name) / "review-cache-requests.db"),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
+                "NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS": str(Path(self.tempdir.name) / "missing-review-manifest.sqlite3"),
+            }
+        )
+        app.testing = False
+
+        with patch(
+            "ntc_recordings_app._testimony_review_items_uncached",
+            return_value=[{"id": "recording-one"}],
+        ) as build:
+            first = _testimony_review_items(app, known_speakers=())
+            second = _testimony_review_items(app, known_speakers=())
+
+        self.assertEqual(first, [{"id": "recording-one"}])
+        self.assertEqual(second, [{"id": "recording-one"}])
+        self.assertIsNot(first, second)
+        build.assert_called_once()
 
     def test_recorder_review_rejects_prompt_echo_manifest_decision(self):
         intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"

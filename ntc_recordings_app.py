@@ -412,6 +412,10 @@ def create_app(test_config: dict | None = None) -> Flask:
     app.testimony_allowed_roots_cache: tuple[Path, ...] = ()
     app.testimony_resolved_allowed_roots_cache_key = None
     app.testimony_resolved_allowed_roots_cache: tuple[Path, ...] = ()
+    app.testimony_review_items_lock = threading.Lock()
+    app.testimony_review_items_signature = None
+    app.testimony_review_items_cached_at = 0.0
+    app.testimony_review_items_cache: tuple[dict, ...] = ()
 
     @app.context_processor
     def _recordings_url_context():
@@ -3071,6 +3075,29 @@ def _testimony_review_items(
     known_speakers: Iterable[str] | None = None,
 ) -> list[dict]:
     known_speakers = tuple(known_speakers) if known_speakers is not None else tuple(_testimony_known_speakers(app))
+    if app.testing:
+        return _testimony_review_items_uncached(app, known_speakers)
+    signature = (
+        _sqlite_path_signature(Path(str(app.config["NTC_RECORDINGS_DB_PATH"]))),
+        _testimony_manifest_signature(app),
+    )
+    with app.testimony_review_items_lock:
+        if (
+            signature == app.testimony_review_items_signature
+            and time.monotonic() - app.testimony_review_items_cached_at < 1.0
+        ):
+            return list(app.testimony_review_items_cache)
+        items = _testimony_review_items_uncached(app, known_speakers)
+        app.testimony_review_items_signature = (
+            _sqlite_path_signature(Path(str(app.config["NTC_RECORDINGS_DB_PATH"]))),
+            _testimony_manifest_signature(app),
+        )
+        app.testimony_review_items_cached_at = time.monotonic()
+        app.testimony_review_items_cache = tuple(items)
+        return list(items)
+
+
+def _testimony_review_items_uncached(app: Flask, known_speakers: tuple[str, ...]) -> list[dict]:
     archived_non_review_paths = _sync_testimony_recorder_manifest_reviews(app, known_speakers)
     rows = _testimony_review_rows(app)
     items = []
