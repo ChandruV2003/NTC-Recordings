@@ -701,7 +701,6 @@ def create_app(test_config: dict | None = None) -> Flask:
             title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
             rules=_testimony_delivery_rules(app),
             deliveries=_testimony_delivery_history(app),
-            today=date.today().isoformat(),
             message=request.args.get("message"),
             error=request.args.get("error"),
             format_date=_format_date,
@@ -721,9 +720,9 @@ def create_app(test_config: dict | None = None) -> Flask:
         canonical_name = _clean_speaker_name(request.form.get("canonical_name") or "")
         aliases = _split_delivery_values(request.form.get("aliases") or "")
         emails = _split_delivery_values(request.form.get("emails") or "")
-        effective_from = _date_from_iso((request.form.get("effective_from") or "").strip())
+        effective_from = _testimony_delivery_rule_effective_from(app, rule_id) or date.today().isoformat()
         enabled = bool(request.form.get("enabled"))
-        error = _validate_testimony_delivery_rule(canonical_name, aliases, emails, effective_from)
+        error = _validate_testimony_delivery_rule(canonical_name, aliases, emails)
         if error:
             return _redirect_to(app, "testimony_delivery_rules", error=error)
         _save_testimony_delivery_rule(
@@ -947,7 +946,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         if len(statuses) == 1 and "duplicate" in statuses:
             label = "duplicate file"
         elif len(statuses) == 1 and "not_testimony" in statuses:
-            label = "not-testimony file"
+            label = "discarded file"
         else:
             label = "rejected file"
         message = f"Moved {moved} {label}{'s' if moved != 1 else ''} to quarantine; skipped {skipped}; errors {errors}."
@@ -3187,7 +3186,7 @@ def _testimony_status_label(status: str) -> str:
         "message_review": "Needs Review",
         "identified": "Identified",
         "grouped": "Grouped",
-        "not_testimony": "Not Needed",
+        "not_testimony": "Discarded",
         "duplicate": "Duplicate",
         "already_named": "Already Named",
         "all": "All",
@@ -5489,7 +5488,6 @@ def _validate_testimony_delivery_rule(
     canonical_name: str,
     aliases: list[str],
     emails: list[str],
-    effective_from: str | None,
 ) -> str:
     if not canonical_name:
         return "Enter the person's canonical name."
@@ -5500,9 +5498,18 @@ def _validate_testimony_delivery_rule(
     invalid_emails = [email for email in emails if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)]
     if invalid_emails:
         return f"Invalid email address: {invalid_emails[0]}"
-    if not effective_from:
-        return "Choose the date when automatic delivery should begin."
     return ""
+
+
+def _testimony_delivery_rule_effective_from(app: Flask, rule_id: int | None) -> str:
+    if rule_id is None:
+        return ""
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        row = connection.execute(
+            "SELECT effective_from FROM testimony_delivery_rules WHERE id = ?",
+            (rule_id,),
+        ).fetchone()
+    return str(row["effective_from"] or "") if row else ""
 
 
 def _save_testimony_delivery_rule(
@@ -7214,7 +7221,7 @@ TESTIMONY_DELIVERY_TEMPLATE = """
       .rule-list { display:grid; gap:.75rem; }
       .rule {
         display:grid;
-        grid-template-columns:minmax(180px,1fr) minmax(180px,1.1fr) minmax(220px,1.25fr) 150px auto;
+        grid-template-columns:minmax(180px,1fr) minmax(180px,1.1fr) minmax(220px,1.25fr) auto;
         gap:.7rem;
         align-items:end;
         border:1px solid var(--line);
@@ -7258,7 +7265,7 @@ TESTIMONY_DELIVERY_TEMPLATE = """
         <div>
           <div class="eyebrow">NTC Newark</div>
           <h1>Testimony Delivery</h1>
-          <p class="muted">Automatic delivery begins on each rule's effective date.</p>
+          <p class="muted">Send identified testimonies automatically to configured recipients.</p>
         </div>
         <div class="actions">
           <a href="{{ recordings_url_for('testimony_review') }}">Recorder Review</a>
@@ -7281,7 +7288,6 @@ TESTIMONY_DELIVERY_TEMPLATE = """
               <label><span>Canonical Name</span><input name="canonical_name" value="{{ rule.canonical_name }}" required></label>
               <label><span>Exact Speaker Aliases</span><textarea name="aliases" required>{{ rule.aliases_text }}</textarea></label>
               <label><span>Email Recipients</span><textarea name="emails" inputmode="email" required>{{ rule.emails_text }}</textarea></label>
-              <label><span>Effective From</span><input name="effective_from" type="date" value="{{ rule.effective_from }}" required></label>
               <div>
                 <label class="enabled"><input name="enabled" type="checkbox" value="1" {% if rule.enabled %}checked{% endif %}> Enabled</label>
                 <button type="submit">Save Rule</button>
@@ -7292,7 +7298,6 @@ TESTIMONY_DELIVERY_TEMPLATE = """
             <label><span>Canonical Name</span><input name="canonical_name" placeholder="Rachel George" required></label>
             <label><span>Exact Speaker Aliases</span><textarea name="aliases" placeholder="Sister Rachel&#10;Sister Rachel George" required></textarea></label>
             <label><span>Email Recipients</span><textarea name="emails" inputmode="email" placeholder="name@example.com" required></textarea></label>
-            <label><span>Effective From</span><input name="effective_from" type="date" value="{{ today }}" required></label>
             <div>
               <label class="enabled"><input name="enabled" type="checkbox" value="1" checked> Enabled</label>
               <button type="submit">Add Rule</button>
@@ -7543,6 +7548,29 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
       .job-panel strong { color:var(--text); }
       .job-panel span { color:var(--accent); font:800 .68rem var(--mono); letter-spacing:.1em; text-transform:uppercase; }
+      .bulk-toolbar {
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:.8rem;
+        margin:-.15rem 0 1rem;
+        border:1px solid rgba(143,211,255,.28);
+        border-radius:18px;
+        background:linear-gradient(135deg,rgba(143,211,255,.1),rgba(116,221,180,.07));
+        padding:.78rem .9rem;
+      }
+      .bulk-toolbar[hidden] { display:none; }
+      .bulk-summary span {
+        display:block;
+        color:var(--accent);
+        font:800 .68rem var(--mono);
+        letter-spacing:.1em;
+        text-transform:uppercase;
+      }
+      .bulk-summary strong { display:block; margin-top:.14rem; }
+      .bulk-actions { display:flex; justify-content:flex-end; gap:.5rem; flex-wrap:wrap; }
+      .bulk-actions button { min-height:2.7rem; padding:.62rem .82rem; }
+      .bulk-toolbar[aria-busy="true"] { opacity:.7; pointer-events:none; }
       .panel {
         border:1px solid var(--line);
         border-radius:24px;
@@ -7567,6 +7595,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
         overflow:hidden;
       }
       .review-card[open] { border-color:var(--line-strong); }
+      .review-card.is-selected {
+        border-color:rgba(143,245,200,.58);
+        box-shadow:inset 0 0 0 1px rgba(143,245,200,.18);
+      }
       .review-card.is-saving { opacity:.72; pointer-events:none; }
       .review-card summary { list-style:none; cursor:pointer; padding:.85rem .9rem; }
       .review-card summary::-webkit-details-marker { display:none; }
@@ -7576,6 +7608,23 @@ TESTIMONY_REVIEW_TEMPLATE = """
         grid-template-columns:minmax(2.4rem,.16fr) minmax(16rem,1.3fr) minmax(7rem,.42fr) minmax(7rem,.42fr) minmax(10rem,.6fr) minmax(8rem,.42fr);
         align-items:center;
         gap:.78rem;
+      }
+      .row-selector {
+        position:relative;
+        display:grid;
+        place-items:center;
+        width:2.1rem;
+        height:2.1rem;
+        cursor:pointer;
+      }
+      .row-selector input {
+        position:absolute;
+        inset:0;
+        width:100%;
+        height:100%;
+        margin:0;
+        opacity:0;
+        cursor:pointer;
       }
       .row-number {
         display:grid;
@@ -7588,6 +7637,26 @@ TESTIMONY_REVIEW_TEMPLATE = """
         color:#cce4f7;
         font:850 .78rem var(--mono);
         letter-spacing:.02em;
+        pointer-events:none;
+      }
+      .row-selector input:focus-visible + .row-number {
+        outline:2px solid var(--accent);
+        outline-offset:2px;
+      }
+      .row-selector input:checked + .row-number {
+        border-radius:7px;
+        border-color:rgba(143,245,200,.64);
+        background:rgba(116,221,180,.18);
+        color:transparent;
+        font-size:0;
+      }
+      .row-selector input:checked + .row-number::after {
+        content:"";
+        width:.72rem;
+        height:.38rem;
+        border-left:3px solid #dcfff0;
+        border-bottom:3px solid #dcfff0;
+        transform:rotate(-45deg) translateY(-1px);
       }
       .cell { min-width:0; }
       .cell-label {
@@ -7815,7 +7884,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .toolbar, .review-body { grid-template-columns:1fr; }
         .tabs { width:100%; }
         .toolbar-actions, .probe-form { justify-content:flex-start; }
-        .job-panel { flex-direction:column; align-items:flex-start; }
+        .job-panel, .bulk-toolbar { flex-direction:column; align-items:flex-start; }
+        .bulk-actions { justify-content:flex-start; width:100%; }
         .review-row { grid-template-columns:2.3rem minmax(0,1fr) minmax(0,1fr); align-items:start; }
         .row-number { align-self:center; }
       }
@@ -7872,6 +7942,11 @@ TESTIMONY_REVIEW_TEMPLATE = """
           width:100%;
         }
         .button-row button, .toolbar-actions, .probe-form, .probe-form input, .probe-form button { width:100%; }
+        .bulk-actions {
+          display:grid;
+          grid-template-columns:repeat(2,minmax(0,1fr));
+        }
+        .bulk-actions button { width:100%; }
       }
       @media (max-width:350px) {
         header .eyebrow { font-size:.68rem; letter-spacing:.08em; }
@@ -7910,13 +7985,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div class="metric"><span>Needs Review</span><strong data-count="needs_review">{{ counts.needs_review + counts.message_review }}</strong><small>Needs a type, speaker, or filing decision</small></div>
         <div class="metric"><span>Identified</span><strong data-count="identified">{{ counts.identified }}</strong><small>Speaker confirmed or already named</small></div>
         <div class="metric"><span>Grouped</span><strong data-count="grouped">{{ counts.grouped }}</strong><small>Event testimony sets</small></div>
-        <div class="metric"><span>Not Needed</span><strong data-count="not_testimony">{{ counts.not_testimony }}</strong><small>Reject junk or unusable clips</small></div>
+        <div class="metric"><span>Discarded</span><strong data-count="not_testimony">{{ counts.not_testimony }}</strong><small>Test clips, noise, or unusable audio</small></div>
         <div class="metric"><span>Duplicates</span><strong data-count="duplicate">{{ counts.duplicate }}</strong><small>Already covered by another file</small></div>
         <div class="metric"><span>Files Found</span><strong data-count="all">{{ counts.all }}</strong><small>Folder connected</small></div>
       </section>
       <div class="toolbar">
         <nav class="tabs" aria-label="Recorder review filters">
-          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("grouped", "Grouped"), ("not_testimony", "Not Needed"), ("duplicate", "Duplicate"), ("all", "All")] %}
+          {% for key, label in [("needs_review", "Needs Review"), ("identified", "Identified"), ("grouped", "Grouped"), ("not_testimony", "Discarded"), ("duplicate", "Duplicate"), ("all", "All")] %}
             <a class="tab {{ 'active' if status_filter == key else '' }}" {% if status_filter == key %}aria-current="page"{% endif %} href="{{ recordings_url_for('testimony_review', status=key, sort=sort, limit=limit) }}">{{ label }} <strong data-count="{{ key }}">{{ counts.needs_review + counts.message_review if key == "needs_review" else counts[key] }}</strong></a>
           {% endfor %}
         </nav>
@@ -7927,7 +8002,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
               <input type="hidden" name="sort" value="{{ sort }}">
               <button type="submit">
                 {% if status_filter == "not_testimony" %}
-                  Quarantine Not Needed
+                  Quarantine Discarded
                 {% elif status_filter == "duplicate" %}
                   Quarantine Duplicates
                 {% else %}
@@ -7947,6 +8022,18 @@ TESTIMONY_REVIEW_TEMPLATE = """
           </div>
         </div>
         <div data-job-current>{% if transcript_job.current %}Now analyzing {{ transcript_job.current }}{% endif %}</div>
+      </div>
+      <div class="bulk-toolbar" data-bulk-toolbar hidden>
+        <div class="bulk-summary">
+          <span>Selected Rows</span>
+          <strong data-bulk-count>0 selected</strong>
+        </div>
+        <div class="bulk-actions">
+          <button class="danger" type="button" data-bulk-action="not_testimony">Discard Selected</button>
+          <button class="secondary" type="button" data-bulk-action="duplicate">Mark Selected Duplicate</button>
+          <button class="save" type="button" data-bulk-action="save_review">Save Selected Reviews</button>
+          <button class="secondary" type="button" data-bulk-clear>Clear</button>
+        </div>
       </div>
       <section class="panel">
         <div class="panel-head">
@@ -7979,7 +8066,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
               <details class="review-card {{ item.status }}" data-review-id="{{ item.id }}" data-status="{{ item.status }}">
                 <summary>
                   <div class="review-row">
-                    <span class="row-number" data-row-number aria-label="Row {{ loop.index }}">#{{ loop.index }}</span>
+                    <label class="row-selector" data-row-selector title="Select row {{ loop.index }}">
+                      <input type="checkbox" data-row-select aria-label="Select row {{ loop.index }}">
+                      <span class="row-number" data-row-number>#{{ loop.index }}</span>
+                    </label>
                     <div class="cell">
                       <span class="cell-label">Recording</span>
                       <span class="cell-value" data-field="title">{{ item.title }}</span>
@@ -8152,7 +8242,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                       {% if item.status not in ["needs_review", "message_review"] %}
                         <button class="secondary" type="submit" name="status" value="needs_review">Return to Review</button>
                       {% endif %}
-                      <button class="danger" type="submit" name="status" value="not_testimony">Mark Not Needed</button>
+                      <button class="danger" type="submit" name="status" value="not_testimony">Discard</button>
                       <button class="secondary" type="submit" name="status" value="duplicate">Mark Duplicate</button>
                       <button class="save" type="submit" name="action" value="save_review">Save Review</button>
                     </div>
@@ -8172,6 +8262,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       const bannerStack = document.querySelector("[data-banner-stack]");
       const reviewList = document.querySelector("[data-review-list]");
       const activeReviewFilter = reviewList ? reviewList.dataset.activeFilter || "needs_review" : "needs_review";
+      const bulkToolbar = document.querySelector("[data-bulk-toolbar]");
 
       function storedOpenCards() {
         try {
@@ -8266,6 +8357,41 @@ TESTIMONY_REVIEW_TEMPLATE = """
         });
       }
 
+      function selectedReviewCards() {
+        if (!reviewList) return [];
+        return Array.from(reviewList.querySelectorAll(".review-card")).filter((card) => {
+          return Boolean(card.querySelector("[data-row-select]")?.checked);
+        });
+      }
+
+      function updateBulkToolbar() {
+        if (!bulkToolbar) return;
+        const selected = selectedReviewCards();
+        bulkToolbar.hidden = selected.length === 0;
+        const count = bulkToolbar.querySelector("[data-bulk-count]");
+        if (count) {
+          count.textContent = `${selected.length} selected`;
+        }
+        document.querySelectorAll(".review-card").forEach((card) => {
+          card.classList.toggle("is-selected", selected.includes(card));
+        });
+      }
+
+      function clearBulkSelection() {
+        document.querySelectorAll("[data-row-select]").forEach((input) => {
+          input.checked = false;
+        });
+        updateBulkToolbar();
+      }
+
+      function setBulkBusy(isBusy) {
+        if (!bulkToolbar) return;
+        bulkToolbar.setAttribute("aria-busy", isBusy ? "true" : "false");
+        bulkToolbar.querySelectorAll("button").forEach((button) => {
+          button.disabled = isBusy;
+        });
+      }
+
       function replaceEmptyReviewList() {
         if (!reviewList || reviewList.querySelector(".review-card")) return;
         const empty = document.createElement("div");
@@ -8281,7 +8407,14 @@ TESTIMONY_REVIEW_TEMPLATE = """
           if (!number) return;
           const value = index + 1;
           number.textContent = `#${value}`;
-          number.setAttribute("aria-label", `Row ${value}`);
+          const selector = card.querySelector("[data-row-selector]");
+          const input = card.querySelector("[data-row-select]");
+          if (selector) {
+            selector.title = `Select row ${value}`;
+          }
+          if (input) {
+            input.setAttribute("aria-label", `Select row ${value}`);
+          }
         });
       }
 
@@ -8346,6 +8479,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
             card.remove();
             renumberReviewRows();
             replaceEmptyReviewList();
+            updateBulkToolbar();
           }
         }
         saveOpenCards();
@@ -8440,7 +8574,108 @@ TESTIMONY_REVIEW_TEMPLATE = """
         return new URL(target, window.location.href).toString();
       }
 
+      function formDataForSubmitter(form, submitter) {
+        try {
+          return new FormData(form, submitter);
+        } catch (error) {
+          const formData = new FormData(form);
+          if (submitter && submitter.name) {
+            formData.append(submitter.name, submitter.value);
+          }
+          return formData;
+        }
+      }
+
+      async function submitReviewForm(form, submitter, showSuccess = true) {
+        const card = form.closest(".review-card");
+        const url = submissionUrl(form, submitter);
+        const formData = formDataForSubmitter(form, submitter);
+
+        card.classList.add("is-saving");
+        setFormBusy(form, true);
+        try {
+          const response = await fetch(url, {
+            method: "POST",
+            body: formData,
+            headers: { "Accept": "application/json", "X-Requested-With": "fetch" },
+          });
+          const data = await readJsonResponse(response);
+          if (!response.ok || !data.ok) {
+            throw new Error(data.error || data.message || "The recorder update failed.");
+          }
+          if (showSuccess) {
+            showBanner(data.message || "Recorder review updated.");
+          }
+          updateReviewCard(card, data);
+          if (data.suggested_speaker || data.suggestion_source || data.suggestion_text || data.transcript_preview || data.transcript_text || data.transcript_error) {
+            renderSuggestion(card, data);
+          }
+          if (data.analysis_queued) {
+            pollTranscriptJob();
+          }
+          return { ok: true, data };
+        } catch (error) {
+          if (showSuccess) {
+            showBanner(error.message || "The recorder update failed.", true);
+          }
+          return { ok: false, error: error.message || "The recorder update failed." };
+        } finally {
+          card.classList.remove("is-saving");
+          setFormBusy(form, false);
+        }
+      }
+
+      async function runBulkReview(action) {
+        const cards = selectedReviewCards();
+        if (!cards.length) return;
+        setBulkBusy(true);
+        let completed = 0;
+        const errors = [];
+        for (const card of cards) {
+          const form = card.querySelector(".review-form");
+          if (!form) continue;
+          const selector = action === "save_review"
+            ? 'button[name="action"][value="save_review"]'
+            : `button[name="status"][value="${action}"]`;
+          const submitter = form.querySelector(selector);
+          if (!submitter) continue;
+          const result = await submitReviewForm(form, submitter, false);
+          if (result.ok) {
+            completed += 1;
+          } else {
+            errors.push(result.error);
+          }
+        }
+        setBulkBusy(false);
+        updateBulkToolbar();
+        if (errors.length) {
+          showBanner(`${completed} updated; ${errors.length} failed. ${errors[0]}`, true);
+        } else {
+          showBanner(`${completed} selected recording${completed === 1 ? "" : "s"} updated.`);
+        }
+      }
+
       document.addEventListener("click", (event) => {
+        const selector = event.target.closest("[data-row-selector]");
+        if (selector) {
+          event.preventDefault();
+          event.stopPropagation();
+          const input = selector.querySelector("[data-row-select]");
+          if (input) {
+            input.checked = !input.checked;
+            updateBulkToolbar();
+          }
+          return;
+        }
+        const bulkAction = event.target.closest("[data-bulk-action]");
+        if (bulkAction) {
+          runBulkReview(bulkAction.dataset.bulkAction || "");
+          return;
+        }
+        if (event.target.closest("[data-bulk-clear]")) {
+          clearBulkSelection();
+          return;
+        }
         const button = event.target.closest(".apply-suggestion");
         if (!button) return;
         const form = button.closest("form");
@@ -8449,6 +8684,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
         input.value = button.dataset.speaker || "";
         input.focus();
       });
+
+      document.addEventListener("change", (event) => {
+        if (!event.target.matches("[data-row-select]")) return;
+        updateBulkToolbar();
+      });
+
       function hydrateReviewAudio(card) {
         const audio = card.querySelector("audio[data-src]");
         if (!audio || audio.src) return;
@@ -8497,46 +8738,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         saveOpenCards();
         if (!form || !window.fetch) return;
         event.preventDefault();
-
-        const card = form.closest(".review-card");
-        const submitter = event.submitter;
-        const url = submissionUrl(form, submitter);
-        let formData;
-        try {
-          formData = new FormData(form, submitter);
-        } catch (error) {
-          formData = new FormData(form);
-          if (submitter && submitter.name) {
-            formData.append(submitter.name, submitter.value);
-          }
-        }
-
-        card.classList.add("is-saving");
-        setFormBusy(form, true);
-        try {
-          const response = await fetch(url, {
-            method: "POST",
-            body: formData,
-            headers: { "Accept": "application/json", "X-Requested-With": "fetch" },
-          });
-          const data = await readJsonResponse(response);
-          if (!response.ok || !data.ok) {
-            throw new Error(data.error || data.message || "The recorder update failed.");
-          }
-          showBanner(data.message || "Recorder review updated.");
-          updateReviewCard(card, data);
-          if (data.suggested_speaker || data.suggestion_source || data.suggestion_text || data.transcript_preview || data.transcript_text || data.transcript_error) {
-            renderSuggestion(card, data);
-          }
-          if (data.analysis_queued) {
-            pollTranscriptJob();
-          }
-        } catch (error) {
-          showBanner(error.message || "The recorder update failed.", true);
-        } finally {
-          card.classList.remove("is-saving");
-          setFormBusy(form, false);
-        }
+        await submitReviewForm(form, event.submitter);
       });
 
       function updateTranscriptJob(job) {
@@ -8583,6 +8785,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
 
       restoreOpenCards();
+      updateBulkToolbar();
       document.querySelectorAll(".review-card[open]").forEach(hydrateReviewAudio);
       if (document.querySelector("[data-transcript-job]")?.dataset.state === "running") {
         pollTranscriptJob();

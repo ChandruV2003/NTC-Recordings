@@ -672,6 +672,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertNotIn(b"Check Durations", review.data)
         self.assertNotIn(b">Probe</span>", review.data)
         self.assertIn(b"Save Review", review.data)
+        self.assertIn(b"Save Selected Reviews", review.data)
+        self.assertIn(b"Discard Selected", review.data)
         self.assertNotIn(b"Keep for Review", review.data)
         self.assertNotIn(b"Return to Review", review.data)
         self.assertIn(b"Mark Duplicate", review.data)
@@ -698,7 +700,9 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b'data-transcript-job', review.data)
         self.assertIn(b'data-status-url="/admin/testimonies/transcript-status"', review.data)
         self.assertIn(b'data-review-id="', review.data)
-        self.assertIn(b'data-row-number aria-label="Row 1">#1</span>', review.data)
+        self.assertIn(b'data-row-select aria-label="Select row 1"', review.data)
+        self.assertIn(b'<span class="row-number" data-row-number>#1</span>', review.data)
+        self.assertIn(b"runBulkReview", review.data)
         self.assertIn(b"renumberReviewRows", review.data)
         self.assertIn(b"pauseCardAudio", review.data)
         self.assertIn(b"pauseOtherReviewAudio", review.data)
@@ -2963,7 +2967,6 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "canonical_name": "Rachel George",
                 "aliases": "Sister Rachel\nSister Rachel George",
                 "emails": "rachelgeorge106@gmail.com\nrachelgeorge106@yahoo.com",
-                "effective_from": "2026-07-28",
                 "enabled": "1",
             },
             follow_redirects=True,
@@ -2973,6 +2976,44 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Automatic delivery rule saved for Rachel George", response.data)
         self.assertIn(b"rachelgeorge106@gmail.com", response.data)
         self.assertIn(b"rachelgeorge106@yahoo.com", response.data)
+        self.assertNotIn(b"Effective From", response.data)
+
+    def test_delivery_rule_edit_preserves_hidden_effective_date(self):
+        _save_testimony_delivery_rule(
+            self.app,
+            rule_id=None,
+            canonical_name="Rachel George",
+            aliases=["Sister Rachel"],
+            emails=["rachelgeorge106@gmail.com"],
+            effective_from="2026-07-28",
+            enabled=True,
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            rule_id = connection.execute(
+                "SELECT id FROM testimony_delivery_rules WHERE canonical_name = ?",
+                ("Rachel George",),
+            ).fetchone()[0]
+
+        self._login()
+        response = self.client.post(
+            "/admin/testimony-delivery/rules",
+            data={
+                "rule_id": str(rule_id),
+                "canonical_name": "Rachel George",
+                "aliases": "Sister Rachel\nSister Rachel George",
+                "emails": "rachelgeorge106@gmail.com\nrachelgeorge106@yahoo.com",
+                "enabled": "1",
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        with sqlite3.connect(self.db_path) as connection:
+            effective_from = connection.execute(
+                "SELECT effective_from FROM testimony_delivery_rules WHERE id = ?",
+                (rule_id,),
+            ).fetchone()[0]
+        self.assertEqual(effective_from, "2026-07-28")
 
 
 if __name__ == "__main__":
