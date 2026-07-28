@@ -7639,7 +7639,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         letter-spacing:.02em;
         pointer-events:none;
       }
-      .row-selector input:focus-visible + .row-number {
+      .row-selector:focus-visible .row-number {
         outline:2px solid var(--accent);
         outline-offset:2px;
       }
@@ -8066,10 +8066,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
               <details class="review-card {{ item.status }}" data-review-id="{{ item.id }}" data-status="{{ item.status }}">
                 <summary>
                   <div class="review-row">
-                    <label class="row-selector" data-row-selector title="Select row {{ loop.index }}">
-                      <input type="checkbox" data-row-select aria-label="Select row {{ loop.index }}">
+                    <span class="row-selector" data-row-selector role="checkbox" aria-checked="false" tabindex="0" aria-label="Select row {{ loop.index }}" title="Select row {{ loop.index }}">
+                      <input type="checkbox" data-row-select tabindex="-1" aria-hidden="true">
                       <span class="row-number" data-row-number>#{{ loop.index }}</span>
-                    </label>
+                    </span>
                     <div class="cell">
                       <span class="cell-label">Recording</span>
                       <span class="cell-value" data-field="title">{{ item.title }}</span>
@@ -8374,6 +8374,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
         document.querySelectorAll(".review-card").forEach((card) => {
           card.classList.toggle("is-selected", selected.includes(card));
+          const selector = card.querySelector("[data-row-selector]");
+          if (selector) {
+            selector.setAttribute("aria-checked", card.querySelector("[data-row-select]")?.checked ? "true" : "false");
+          }
         });
       }
 
@@ -8411,9 +8415,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           const input = card.querySelector("[data-row-select]");
           if (selector) {
             selector.title = `Select row ${value}`;
-          }
-          if (input) {
-            input.setAttribute("aria-label", `Select row ${value}`);
+            selector.setAttribute("aria-label", `Select row ${value}`);
           }
         });
       }
@@ -8688,6 +8690,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
       document.addEventListener("change", (event) => {
         if (!event.target.matches("[data-row-select]")) return;
         updateBulkToolbar();
+      });
+
+      document.addEventListener("keydown", (event) => {
+        const selector = event.target.closest("[data-row-selector]");
+        if (!selector || !["Enter", " "].includes(event.key)) return;
+        event.preventDefault();
+        selector.click();
       });
 
       function hydrateReviewAudio(card) {
