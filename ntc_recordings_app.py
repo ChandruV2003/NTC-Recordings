@@ -7645,19 +7645,23 @@ TESTIMONY_REVIEW_TEMPLATE = """
         outline-offset:2px;
       }
       .row-selector input:checked + .row-number {
-        border-radius:7px;
-        border-color:rgba(143,245,200,.64);
-        background:rgba(116,221,180,.18);
+        position:relative;
+        border-radius:999px;
+        border-color:var(--good);
+        background:var(--good);
         color:transparent;
         font-size:0;
       }
       .row-selector input:checked + .row-number::after {
         content:"";
+        position:absolute;
+        left:50%;
+        top:50%;
         width:.72rem;
         height:.38rem;
-        border-left:3px solid #dcfff0;
-        border-bottom:3px solid #dcfff0;
-        transform:rotate(-45deg) translateY(-1px);
+        border-left:3px solid var(--ink);
+        border-bottom:3px solid var(--ink);
+        transform:translate(-50%,-62%) rotate(-45deg);
       }
       .cell { min-width:0; }
       .cell-label {
