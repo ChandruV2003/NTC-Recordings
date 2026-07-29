@@ -13,6 +13,7 @@ import requests
 from ntc_recordings_app import (
     RecordingCandidate,
     _automatic_review_analysis_ids,
+    _background_review_analysis_ids,
     _date_from_file_metadata,
     _display_transcript_text,
     _extract_intro_speaker,
@@ -2519,7 +2520,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row["recorder_agent_kind"], "testimony")
         self.assertEqual(row["recorder_agent_action"], "review")
-        self.assertIn("recorder-review-v3", row["recorder_agent_reason"])
+        self.assertIn("recorder-review-v4", row["recorder_agent_reason"])
         self.assertIn("Personal testimony evidence", row["recorder_agent_reason"])
         self.assertEqual(row["transcript_text"], transcript)
         self.assertEqual(row["recorder_agent_version"], "recording-decision-v3")
@@ -2544,6 +2545,78 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Personal testimony with extended doctrinal exhortation.", review.data)
         self.assertIn(b"Compared with 1 similar reviewed recording.", review.data)
         self.assertIn(b"91% confidence", review.data)
+
+    def test_manual_recording_type_survives_forced_transcript_reanalysis(self):
+        review_root = self.root / "TestimonyReviewQueue"
+        review_root.mkdir()
+        recording = review_root / "REC00248.mp3"
+        recording.write_bytes(b"long-testimony-audio")
+        recording_id = _recording_id(recording)
+        transcript = (
+            "Praise the Lord. Hallelujah. Before I enter the testimony, "
+            "I want to thank God for everything he has done in my life."
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO testimony_reviews (
+                    recording_id,
+                    source_path,
+                    status,
+                    service_date,
+                    transcript_text,
+                    transcript_source,
+                    recorder_agent_kind,
+                    recorder_agent_action,
+                    recorder_agent_reason,
+                    recorder_agent_updated_at,
+                    updated_at
+                )
+                VALUES (?, ?, 'needs_review', '2025-08-31', ?, 'transcript_excerpt',
+                        'testimony', 'review', 'Classification confirmed in Recorder Review.', ?, ?)
+                """,
+                (
+                    recording_id,
+                    str(recording),
+                    transcript,
+                    "2026-07-29T13:00:00+00:00",
+                    "2026-07-29T13:00:00+00:00",
+                ),
+            )
+
+        self.app.config["NTC_RECORDINGS_AGENT_URL"] = "http://agent.test"
+        agent_response = Mock()
+        agent_response.raise_for_status.return_value = None
+        agent_response.json.return_value = {
+            "ok": True,
+            "recording_kind": "worship",
+            "action": "review",
+            "reasons": ["Praise language was found."],
+            "speaker": "",
+        }
+        with patch("ntc_recordings_app.requests.post", return_value=agent_response):
+            _run_testimony_transcript_job(
+                self.app,
+                statuses={"needs_review"},
+                recording_ids={recording_id},
+            )
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT recorder_agent_kind, recorder_agent_action, recorder_agent_reason
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            ).fetchone()
+        self.assertEqual(row["recorder_agent_kind"], "testimony")
+        self.assertEqual(row["recorder_agent_action"], "review")
+        self.assertEqual(
+            row["recorder_agent_reason"],
+            "Classification confirmed in Recorder Review.",
+        )
 
     def test_recorder_transcript_windows_preserve_timed_and_segment_context(self):
         row = {
@@ -3133,8 +3206,73 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "SELECT * FROM testimony_reviews WHERE recording_id = ?",
                 (recording_id,),
             ).fetchone()
-        self.assertIn("recorder-review-v3", row["recorder_agent_reason"])
+        self.assertIn("recorder-review-v4", row["recorder_agent_reason"])
         self.assertEqual(_automatic_review_analysis_ids([dict(row)]), set())
+
+    def test_recorder_review_get_does_not_start_analysis_for_visible_rows(self):
+        self.app.config["NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL"] = "http://transcription.example.test"
+        self._login()
+
+        with patch("ntc_recordings_app._start_testimony_transcript_job") as start_job:
+            response = self.client.get("/admin/recorder-review?status=identified&limit=1")
+
+        self.assertEqual(response.status_code, 200)
+        start_job.assert_not_called()
+
+    def test_background_analysis_selects_missing_rows_across_review_statuses(self):
+        items = [
+            {
+                "id": "needs-review",
+                "status": "needs_review",
+                "transcript_text": "",
+                "transcript_error": "",
+                "recorder_agent_reason": "",
+            },
+            {
+                "id": "identified",
+                "status": "identified",
+                "transcript_text": "",
+                "transcript_error": "",
+                "recorder_agent_reason": "",
+            },
+            {
+                "id": "discarded",
+                "status": "not_testimony",
+                "transcript_text": "",
+                "transcript_error": "",
+                "recorder_agent_reason": "",
+            },
+        ]
+        with (
+            patch("ntc_recordings_app._testimony_known_speakers", return_value=[]),
+            patch("ntc_recordings_app._testimony_review_items", return_value=items),
+        ):
+            recording_ids = _background_review_analysis_ids(self.app, limit=20)
+
+        self.assertEqual(recording_ids, {"needs-review", "identified"})
+
+    def test_background_analysis_builds_review_items_without_browser_request(self):
+        review_root = self.root / "TestimonyReviewQueue"
+        review_root.mkdir()
+        recording = review_root / "REC00992.mp3"
+        recording.write_bytes(b"background-analysis-audio")
+        recording_id = _recording_id(recording)
+        _save_testimony_review(
+            self.app,
+            recording_id=recording_id,
+            source_path=str(recording),
+            status="needs_review",
+            service_date="2026-07-29",
+            speaker_name="",
+            testimony_title="",
+            notes="",
+            proposed_path="",
+            duration_seconds=90,
+        )
+
+        recording_ids = _background_review_analysis_ids(self.app, limit=20)
+
+        self.assertIn(recording_id, recording_ids)
 
     def test_testimony_delivery_rule_is_future_only_idempotent_and_uses_both_recipients(self):
         effective_from = "2026-07-28"

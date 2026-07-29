@@ -19,6 +19,10 @@ plain language, and records confirmed corrections. Upstream labels such as
 the destination folder. Ambiguous, combined, or policy-disallowed recordings
 remain in review instead of being filed automatically.
 
+Missing and outdated analysis is selected from the complete review queue by a
+single background worker. Opening Recorder Review, changing tabs, sorting, or
+changing the row limit never starts analysis for the visible rows.
+
 Completed Recorder Review actions store their source and completion time without
 assigning rows to individual reviewers. Failed file moves remain unresolved and
 do not overwrite the last successful review state.

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import html
 import hmac
+import fcntl
 import json
 import os
 import re
@@ -57,7 +58,7 @@ DEFAULT_TESTIMONY_RECORDER_MANIFESTS = "/app/data/autosyncmix/recorders/DN700R/m
 DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rejected"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
-RECORDER_REVIEW_ANALYSIS_VERSION = "recorder-review-v3"
+RECORDER_REVIEW_ANALYSIS_VERSION = "recorder-review-v4"
 RECORDER_REVIEW_CLASSIFICATION_KINDS = ("testimony", "message", "worship", "combined")
 RECORDER_REVIEW_FINAL_KINDS = ("testimony", "message", "worship")
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
@@ -379,6 +380,20 @@ def create_app(test_config: dict | None = None) -> Flask:
         NTC_RECORDINGS_AGENT_URL=os.getenv("NTC_RECORDINGS_AGENT_URL", ""),
         NTC_RECORDINGS_AGENT_TOKEN=os.getenv("NTC_RECORDINGS_AGENT_TOKEN", ""),
         NTC_RECORDINGS_AGENT_TIMEOUT=float(os.getenv("NTC_RECORDINGS_AGENT_TIMEOUT", "30")),
+        NTC_RECORDINGS_BACKGROUND_ANALYSIS_ENABLED=os.getenv(
+            "NTC_RECORDINGS_BACKGROUND_ANALYSIS_ENABLED",
+            "1",
+        ),
+        NTC_RECORDINGS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS=float(
+            os.getenv("NTC_RECORDINGS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS", "30")
+        ),
+        NTC_RECORDINGS_BACKGROUND_ANALYSIS_BATCH_SIZE=int(
+            os.getenv("NTC_RECORDINGS_BACKGROUND_ANALYSIS_BATCH_SIZE", "20")
+        ),
+        NTC_RECORDINGS_BACKGROUND_ANALYSIS_LOCK_PATH=os.getenv(
+            "NTC_RECORDINGS_BACKGROUND_ANALYSIS_LOCK_PATH",
+            "/tmp/ntc-recordings-analysis-worker.lock",
+        ),
         NTC_RECORDINGS_INDEX_REFRESH_SECONDS=float(
             os.getenv(
                 "NTC_RECORDINGS_INDEX_REFRESH_SECONDS",
@@ -710,15 +725,6 @@ def create_app(test_config: dict | None = None) -> Flask:
             visible_items = [item for item in items if item["status"] == status_filter]
         _sort_testimony_items(visible_items, sort)
         visible_items = visible_items[:limit]
-        if app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL"):
-            automatic_analysis_ids = _automatic_review_analysis_ids(visible_items)
-            if automatic_analysis_ids:
-                _start_testimony_transcript_job(
-                    app,
-                    limit=len(automatic_analysis_ids),
-                    statuses={"needs_review", "message_review", "identified", "grouped", "already_named"},
-                    recording_ids=automatic_analysis_ids,
-                )
         root = _testimony_source_root(app)
         return render_template_string(
             TESTIMONY_REVIEW_TEMPLATE,
@@ -1476,6 +1482,7 @@ def create_app(test_config: dict | None = None) -> Flask:
     def download_recording(token: str):
         return jsonify({"error": "recording downloads are disabled for shared links"}), 403
 
+    _start_recorder_analysis_worker(app)
     return app
 
 
@@ -3639,6 +3646,89 @@ def _automatic_review_analysis_ids(items: Iterable[dict], limit: int = 20) -> se
     return recording_ids
 
 
+def _background_review_analysis_ids(app: Flask, limit: int = 20) -> set[str]:
+    if not has_request_context():
+        with app.test_request_context("/"):
+            return _background_review_analysis_ids(app, limit=limit)
+    eligible_statuses = {"needs_review", "message_review", "identified", "grouped", "already_named"}
+    items = [
+        item
+        for item in _testimony_review_items(app, known_speakers=_testimony_known_speakers(app))
+        if str(item.get("status") or "") in eligible_statuses
+    ]
+    return _automatic_review_analysis_ids(items, limit=max(1, limit))
+
+
+def _background_analysis_enabled(app: Flask) -> bool:
+    value = str(app.config.get("NTC_RECORDINGS_BACKGROUND_ANALYSIS_ENABLED") or "").strip().lower()
+    return (
+        value not in {"", "0", "false", "no", "off"}
+        and not app.config.get("TESTING")
+        and bool(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL"))
+    )
+
+
+def _start_recorder_analysis_worker(app: Flask) -> None:
+    if not _background_analysis_enabled(app):
+        return
+    worker = threading.Thread(
+        target=_run_recorder_analysis_worker,
+        args=(app,),
+        name="recorder-analysis-worker",
+        daemon=True,
+    )
+    app.recorder_analysis_worker = worker
+    worker.start()
+
+
+def _run_recorder_analysis_worker(app: Flask) -> None:
+    interval_seconds = max(
+        5.0,
+        float(app.config.get("NTC_RECORDINGS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS") or 30),
+    )
+    batch_size = max(
+        1,
+        min(int(app.config.get("NTC_RECORDINGS_BACKGROUND_ANALYSIS_BATCH_SIZE") or 20), 100),
+    )
+    lock_path = Path(
+        str(app.config.get("NTC_RECORDINGS_BACKGROUND_ANALYSIS_LOCK_PATH") or "").strip()
+        or "/tmp/ntc-recordings-analysis-worker.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            app.logger.info("Recorder analysis worker is already active in another process.")
+            return
+        app.logger.info(
+            "Recorder analysis worker started with a %ss interval and batch size %s.",
+            round(interval_seconds, 1),
+            batch_size,
+        )
+        while True:
+            try:
+                if _testimony_transcript_job_status(app).get("state") != "running":
+                    with app.app_context():
+                        recording_ids = _background_review_analysis_ids(app, limit=batch_size)
+                        if recording_ids:
+                            _start_testimony_transcript_job(
+                                app,
+                                limit=len(recording_ids),
+                                statuses={
+                                    "needs_review",
+                                    "message_review",
+                                    "identified",
+                                    "grouped",
+                                    "already_named",
+                                },
+                                recording_ids=recording_ids,
+                            )
+            except Exception:
+                app.logger.exception("Recorder background analysis cycle failed.")
+            time.sleep(interval_seconds)
+
+
 def _initial_testimony_suggestion_job_state() -> dict:
     return {
         "state": "idle",
@@ -4163,8 +4253,18 @@ def _run_testimony_transcript_job(
                     decision_kind = str((agent_decision or {}).get("recording_kind") or "")
                     decision_action = str((agent_decision or {}).get("action") or "")
                     decision_reason = str((agent_decision or {}).get("reason") or "")
+                    manual_type_confirmed = (
+                        _row_optional_text(row, "recorder_agent_reason")
+                        == "Classification confirmed in Recorder Review."
+                    )
                     completed_path_kind = _filed_recording_kind(app, Path(candidate.path))
-                    if (
+                    if manual_type_confirmed:
+                        decision_kind = _normalize_recording_kind(
+                            _row_optional_text(row, "recorder_agent_kind")
+                        )
+                        decision_action = "review"
+                        decision_reason = "Classification confirmed in Recorder Review."
+                    elif (
                         str(row["status"] or "") in {"identified", "grouped", "already_named"}
                         and completed_path_kind in RECORDER_REVIEW_FINAL_KINDS
                     ):
