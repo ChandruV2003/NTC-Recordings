@@ -104,7 +104,16 @@ TESTIMONY_EXPLICIT_INTRO_PATTERNS = [
     r"\bmy\s+testimony\b",
     r"\btestimony\s+is\b",
 ]
+TRANSCRIPTION_PROMPT_STRIP_PATTERNS = [
+    re.compile(
+        r"\btranscribe\s+this\s+church\s+recording\s+verbatim\s+from\s+the\s+very\s+first\s+audible\s+word\.?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bkeep\s+names\s+exactly\s+as\s+spoken\.?", re.IGNORECASE),
+    re.compile(r"\bdo\s+not\s+summarize\s+or\s+add\s+instructions\.?", re.IGNORECASE),
+]
 TRANSCRIPTION_PROMPT_ECHO_PATTERNS = [
+    *TRANSCRIPTION_PROMPT_STRIP_PATTERNS,
     re.compile(r"\bpreserve\s+speaker\s+names\b", re.IGNORECASE),
     re.compile(r"\bscripture\s+references,?\s+sermon\s+(?:titles|introductions)\b", re.IGNORECASE),
     re.compile(
@@ -5615,6 +5624,7 @@ def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple
                 chunk_text = str(payload.get("text") or "").strip()
             except ValueError:
                 chunk_text = response.text.strip()
+            chunk_text = _strip_transcription_prompt_echo(chunk_text)
             chunk_text = _display_transcript_text(chunk_text)
             if not chunk_text:
                 return "\n\n".join(transcript_chunks), "Transcript was empty."
@@ -5830,6 +5840,16 @@ def _display_transcript_text(text: str) -> str:
         return "\n\n".join(chunks)
     cleaned = re.sub(r"(?m)^\[(?:start|\+\d+s)\]\s*", "", str(text or ""))
     return cleaned.replace("[no transcription returned]", "").strip()
+
+
+def _strip_transcription_prompt_echo(text: str) -> str:
+    value = str(text or "")
+    for pattern in TRANSCRIPTION_PROMPT_STRIP_PATTERNS:
+        value = pattern.sub("", value)
+    value = re.sub(r"[ \t]+\n", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    value = re.sub(r" {2,}", " ", value)
+    return value.strip()
 
 
 def _transcript_contains_prompt_echo(text: str) -> bool:

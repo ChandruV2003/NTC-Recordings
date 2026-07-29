@@ -3318,7 +3318,10 @@ class RecordingRequestPanelTests(unittest.TestCase):
         for text in (
             "Can I just personally confess that I am really blessed to be here.",
             "Today I had a simple desire to attend a few songs of worship.",
-            "I am here to request prayers for my auntie.",
+            (
+                "I am here to request prayers for my auntie. "
+                "Keep names exactly as spoken. Do not summarize or add instructions."
+            ),
         ):
             response = Mock()
             response.json.return_value = {"text": text}
@@ -3342,6 +3345,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("[start] Can I just personally confess", transcript)
         self.assertIn("[+60s] Today I had a simple desire", transcript)
         self.assertIn("[+120s] I am here to request prayers", transcript)
+        self.assertNotIn("Keep names exactly as spoken", transcript)
+        self.assertNotIn("Do not summarize", transcript)
         self.assertEqual(transcribe.call_count, 3)
         commands = [call.args[0] for call in ffmpeg.call_args_list]
         self.assertEqual(
