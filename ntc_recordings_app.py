@@ -57,7 +57,7 @@ DEFAULT_TESTIMONY_RECORDER_MANIFESTS = "/app/data/autosyncmix/recorders/DN700R/m
 DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rejected"
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
-RECORDER_REVIEW_ANALYSIS_VERSION = "recorder-review-v2"
+RECORDER_REVIEW_ANALYSIS_VERSION = "recorder-review-v3"
 RECORDER_REVIEW_CLASSIFICATION_KINDS = ("testimony", "message", "worship", "combined")
 RECORDER_REVIEW_FINAL_KINDS = ("testimony", "message", "worship")
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
@@ -1547,6 +1547,10 @@ def _init_db(db_path: str) -> None:
         _ensure_column(connection, "testimony_reviews", "recorder_agent_action", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "recorder_agent_reason", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "recorder_agent_updated_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_agent_version", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_agent_confidence", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(connection, "testimony_reviews", "recorder_agent_traits_json", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "recorder_agent_evidence_json", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "recorder_segment_kind", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "recorder_segment_count", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(connection, "testimony_reviews", "recorder_segment_likelihood", "REAL NOT NULL DEFAULT 0")
@@ -3086,6 +3090,16 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     recorder_agent_action = _row_optional_text(row, "recorder_agent_action")
     recorder_agent_reason = _row_optional_text(row, "recorder_agent_reason")
     recorder_agent_updated_at = _row_optional_text(row, "recorder_agent_updated_at")
+    recorder_agent_version = _row_optional_text(row, "recorder_agent_version")
+    try:
+        recorder_agent_confidence = float(_row_optional_text(row, "recorder_agent_confidence") or 0)
+    except ValueError:
+        recorder_agent_confidence = 0
+    recorder_agent_traits = [
+        str(item)
+        for item in _json_list(_row_optional_text(row, "recorder_agent_traits_json"))
+    ]
+    recorder_agent_evidence = _json_object(_row_optional_text(row, "recorder_agent_evidence_json"))
     if transcript_has_prompt_echo or transcript_error == TRANSCRIPTION_PROMPT_ECHO_ERROR:
         suggested_speaker = ""
         suggestion_source = ""
@@ -3176,6 +3190,16 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "recorder_agent_action_label": _recorder_agent_action_label(recorder_agent_action),
         "recorder_agent_reason": recorder_agent_reason,
         "recorder_agent_reason_label": _recorder_agent_reason_label(recorder_agent_reason),
+        "recorder_agent_version": recorder_agent_version,
+        "recorder_agent_confidence": recorder_agent_confidence,
+        "recorder_agent_confidence_label": (
+            f"{round(recorder_agent_confidence * 100)}% confidence"
+            if recorder_agent_confidence
+            else ""
+        ),
+        "recorder_agent_traits": recorder_agent_traits,
+        "recorder_agent_traits_label": _recorder_agent_traits_label(recorder_agent_traits),
+        "recorder_agent_reference_label": _recorder_agent_reference_label(recorder_agent_evidence),
         "recorder_agent_updated_at": recorder_agent_updated_at,
         "recorder_agent_updated_label": _format_datetime(recorder_agent_updated_at),
         "recorder_segment_kind": recorder_segment_kind,
@@ -3632,6 +3656,7 @@ def _classify_recorder_review_transcript(
         "noise": "noise_or_snippet",
     }.get(existing_kind, existing_kind or "unknown")
     payload = {
+        "recording_id": str(row["recording_id"] or candidate.id),
         "classification": classification,
         "transcript_text": transcript_text,
         "duration_seconds": _row_duration(row),
@@ -3671,11 +3696,21 @@ def _classify_recorder_review_transcript(
     else:
         reason = str(result.get("reason") or "").strip()
     reason = f"{RECORDER_REVIEW_ANALYSIS_VERSION}: {reason or 'Automatic transcript classification completed.'}"
+    evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+    traits = evidence.get("traits") if isinstance(evidence.get("traits"), list) else []
+    try:
+        confidence = float(result.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
     return {
         "recording_kind": recording_kind,
         "action": str(result.get("action") or "review").strip().lower() or "review",
         "reason": reason,
         "speaker": str(result.get("speaker") or "").strip(),
+        "version": str(result.get("decision_version") or evidence.get("decision_version") or "").strip(),
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "traits": [str(value) for value in traits if str(value).strip()],
+        "evidence": evidence,
     }
 
 
@@ -3908,6 +3943,12 @@ def _run_testimony_transcript_job(
                         recorder_agent_reason=decision_reason or None,
                         update_review_fields=False,
                     )
+                    if agent_decision:
+                        _save_recorder_agent_evidence(
+                            app,
+                            recording_id=recording_id,
+                            decision=agent_decision,
+                        )
                 processed += 1
                 _update_testimony_transcript_job(
                     app,
@@ -4041,6 +4082,29 @@ def _recorder_agent_reason_label(reason: str) -> str:
     return labels.get(normalized, raw.rstrip(".") + ".")
 
 
+def _recorder_agent_traits_label(traits: Iterable[str]) -> str:
+    normalized = {str(value or "").strip().lower() for value in traits}
+    if "preachimony" in normalized:
+        return "Personal testimony with extended doctrinal exhortation."
+    if "sustained_teaching" in normalized:
+        return "Sustained doctrinal teaching detected."
+    if "explicit_testimony" in normalized and "personal_narrative" in normalized:
+        return "Explicit personal testimony detected."
+    if "personal_narrative" in normalized:
+        return "Personal testimony language detected."
+    if "worship_language" in normalized:
+        return "Worship or service music language detected."
+    return ""
+
+
+def _recorder_agent_reference_label(evidence: dict) -> str:
+    references = evidence.get("historical_references") if isinstance(evidence, dict) else []
+    if not isinstance(references, list) or not references:
+        return ""
+    count = len(references)
+    return f"Compared with {count} similar reviewed recording{'' if count == 1 else 's'}."
+
+
 def _recorder_segment_kind_label(kind: str) -> str:
     normalized = re.sub(r"[^a-z]+", "_", str(kind or "").strip().lower()).strip("_")
     labels = {
@@ -4062,6 +4126,16 @@ def _json_list(value: str) -> list:
         return parsed if isinstance(parsed, list) else []
     except json.JSONDecodeError:
         return []
+
+
+def _json_object(value: str) -> dict:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
 
 
 def _humanize_classifier_evidence(value: object) -> str:
@@ -4291,6 +4365,42 @@ def _save_testimony_review(
         )
 
 
+def _save_recorder_agent_evidence(
+    app: Flask,
+    *,
+    recording_id: str,
+    decision: dict,
+) -> None:
+    evidence = decision.get("evidence") if isinstance(decision.get("evidence"), dict) else {}
+    traits = decision.get("traits")
+    if not isinstance(traits, list):
+        traits = evidence.get("traits") if isinstance(evidence.get("traits"), list) else []
+    try:
+        confidence = float(decision.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute(
+            """
+            UPDATE testimony_reviews
+            SET recorder_agent_version = ?,
+                recorder_agent_confidence = ?,
+                recorder_agent_traits_json = ?,
+                recorder_agent_evidence_json = ?,
+                updated_at = ?
+            WHERE recording_id = ?
+            """,
+            (
+                str(decision.get("version") or ""),
+                max(0.0, min(confidence, 1.0)),
+                json.dumps([str(value) for value in traits if str(value).strip()], separators=(",", ":")),
+                json.dumps(evidence, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                _utc_now(),
+                recording_id,
+            ),
+        )
+
+
 def _claim_testimony_review_revision(
     app: Flask,
     recording_id: str,
@@ -4402,6 +4512,7 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
         transcript_text = _display_transcript_text(transcript_text)
         transcript_error = _friendly_transcription_error(transcript_error)
     updated_at = _utc_now()
+    transcript_rejected = transcript_error == TRANSCRIPTION_PROMPT_ECHO_ERROR
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute(
             """
@@ -4410,22 +4521,14 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
                 transcript_source = ?,
                 transcript_error = ?,
                 transcript_updated_at = ?,
-                recorder_agent_kind = CASE
-                    WHEN recorder_agent_reason = ? AND ? <> ? THEN ''
-                    ELSE recorder_agent_kind
-                END,
-                recorder_agent_action = CASE
-                    WHEN recorder_agent_reason = ? AND ? <> ? THEN ''
-                    ELSE recorder_agent_action
-                END,
-                recorder_agent_reason = CASE
-                    WHEN recorder_agent_reason = ? AND ? <> ? THEN ''
-                    ELSE recorder_agent_reason
-                END,
-                recorder_agent_updated_at = CASE
-                    WHEN recorder_agent_reason = ? AND ? <> ? THEN ''
-                    ELSE recorder_agent_updated_at
-                END,
+                recorder_agent_kind = ?,
+                recorder_agent_action = ?,
+                recorder_agent_reason = ?,
+                recorder_agent_updated_at = ?,
+                recorder_agent_version = '',
+                recorder_agent_confidence = 0,
+                recorder_agent_traits_json = '',
+                recorder_agent_evidence_json = '',
                 updated_at = ?
             WHERE recording_id = ?
             """,
@@ -4434,18 +4537,10 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
                 transcript_source,
                 transcript_error,
                 updated_at,
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
-                transcript_error,
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
-                transcript_error,
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
-                transcript_error,
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
-                transcript_error,
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                "unknown" if transcript_rejected else "",
+                "review" if transcript_rejected else "",
+                TRANSCRIPTION_PROMPT_ECHO_ERROR if transcript_rejected else "",
+                updated_at if transcript_rejected else "",
                 updated_at,
                 recording_id,
             ),
@@ -4479,6 +4574,10 @@ def _sanitize_existing_testimony_transcripts(connection: sqlite3.Connection) -> 
             recorder_agent_action = 'review',
             recorder_agent_reason = ?,
             recorder_agent_updated_at = ?,
+            recorder_agent_version = '',
+            recorder_agent_confidence = 0,
+            recorder_agent_traits_json = '',
+            recorder_agent_evidence_json = '',
             updated_at = ?
         WHERE recording_id = ?
         """,
@@ -8492,10 +8591,15 @@ TESTIMONY_REVIEW_TEMPLATE = """
                         <div>
                           <span>Recording Type</span>
                           <strong data-field="recording-kind-label">{{ item.review_recording_kind_label }}</strong>
-                          {% if item.recorder_agent_reason_label %}<small>{{ item.recorder_agent_reason_label }}</small>{% endif %}
+                          {% if item.recorder_agent_traits_label %}
+                            <small>{{ item.recorder_agent_traits_label }}</small>
+                          {% elif item.recorder_agent_reason_label %}
+                            <small>{{ item.recorder_agent_reason_label }}</small>
+                          {% endif %}
+                          {% if item.recorder_agent_reference_label %}<small>{{ item.recorder_agent_reference_label }}</small>{% endif %}
                         </div>
                         {% if item.recorder_agent_action_label %}
-                          <small>{{ item.recorder_agent_action_label }}</small>
+                          <small>{{ item.recorder_agent_confidence_label or item.recorder_agent_action_label }}</small>
                         {% endif %}
                       </div>
                       {% if item.recorder_segment_kind == "combined" or item.recorder_segment_count > 1 or item.recorder_segment_warnings %}

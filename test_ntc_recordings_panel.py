@@ -2442,6 +2442,18 @@ class RecordingRequestPanelTests(unittest.TestCase):
             "action": "review",
             "reasons": ["Personal testimony evidence was found."],
             "speaker": "",
+            "decision_version": "recording-decision-v3",
+            "confidence": 0.91,
+            "evidence": {
+                "traits": ["personal_narrative", "explicit_testimony", "preachimony"],
+                "historical_references": [
+                    {
+                        "recording_id": "known-testimony",
+                        "recording_kind": "testimony",
+                        "similarity": 0.73,
+                    }
+                ],
+            },
         }
         with patch("ntc_recordings_app.requests.post", return_value=agent_response) as post:
             _run_testimony_transcript_job(
@@ -2455,7 +2467,9 @@ class RecordingRequestPanelTests(unittest.TestCase):
             row = connection.execute(
                 """
                 SELECT recorder_agent_kind, recorder_agent_action,
-                       recorder_agent_reason, transcript_text
+                       recorder_agent_reason, transcript_text,
+                       recorder_agent_version, recorder_agent_confidence,
+                       recorder_agent_traits_json, recorder_agent_evidence_json
                 FROM testimony_reviews
                 WHERE recording_id = ?
                 """,
@@ -2463,15 +2477,31 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row["recorder_agent_kind"], "testimony")
         self.assertEqual(row["recorder_agent_action"], "review")
-        self.assertIn("recorder-review-v2", row["recorder_agent_reason"])
+        self.assertIn("recorder-review-v3", row["recorder_agent_reason"])
         self.assertIn("Personal testimony evidence", row["recorder_agent_reason"])
         self.assertEqual(row["transcript_text"], transcript)
+        self.assertEqual(row["recorder_agent_version"], "recording-decision-v3")
+        self.assertAlmostEqual(row["recorder_agent_confidence"], 0.91)
+        self.assertEqual(
+            json.loads(row["recorder_agent_traits_json"]),
+            ["personal_narrative", "explicit_testimony", "preachimony"],
+        )
+        self.assertEqual(
+            json.loads(row["recorder_agent_evidence_json"])["historical_references"][0]["recording_id"],
+            "known-testimony",
+        )
         payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["recording_id"], recording_id)
         self.assertEqual(payload["classification"], "message_candidate")
         self.assertEqual(payload["transcript_text"], transcript)
         self.assertEqual(payload["recorder_lane"], "ntc-dn700r")
         self.assertEqual(payload["allowed_recording_kinds"], ["testimony", "message", "worship", "noise"])
         self.assertEqual(payload["transcript_windows"], [])
+        self._login()
+        review = self.client.get("/admin/recorder-review?status=needs_review")
+        self.assertIn(b"Personal testimony with extended doctrinal exhortation.", review.data)
+        self.assertIn(b"Compared with 1 similar reviewed recording.", review.data)
+        self.assertIn(b"91% confidence", review.data)
 
     def test_recorder_transcript_windows_preserve_timed_and_segment_context(self):
         row = {
@@ -3061,7 +3091,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "SELECT * FROM testimony_reviews WHERE recording_id = ?",
                 (recording_id,),
             ).fetchone()
-        self.assertIn("recorder-review-v2", row["recorder_agent_reason"])
+        self.assertIn("recorder-review-v3", row["recorder_agent_reason"])
         self.assertEqual(_automatic_review_analysis_ids([dict(row)]), set())
 
     def test_testimony_delivery_rule_is_future_only_idempotent_and_uses_both_recipients(self):

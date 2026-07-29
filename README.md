@@ -4,6 +4,21 @@ Public recording request form and internal approval panel for NTC Newark recordi
 
 This service indexes available message and worship recordings, accepts listener requests, creates private share links, and sends approval emails through the configured recordings email account.
 
+## Recorder Review Ownership
+
+Recorder Review is the human review and correction surface for shared recording
+decisions. `NTC-Agent` owns the semantic decision contract and returns a
+versioned classification, confidence, evidence, traits, speaker/title
+suggestions, and similar completed reviews. Recorder ingest and publishing
+pipelines own acquisition, normalization, silence analysis, splitting, file
+movement, and recorder cleanup.
+
+This service stores the Agent evidence beside each review row, presents it in
+plain language, and records confirmed corrections. Upstream labels such as
+`message_candidate` and `testimony_candidate` are hints only; they do not decide
+the destination folder. Ambiguous, combined, or policy-disallowed recordings
+remain in review instead of being filed automatically.
+
 ## Runtime
 
 - Panel port: `1977` in-container, usually published as `7777`
