@@ -42,6 +42,7 @@ from ntc_recordings_app import (
     _testimony_suggestion_targets,
     _testimony_transcript_statuses_for_filter,
     _testimony_transcript_targets,
+    _transcribe_testimony_review_excerpt,
     _save_testimony_transcript,
     _transcript_contains_prompt_echo,
     _valid_person_name_suggestion,
@@ -1666,9 +1667,22 @@ class RecordingRequestPanelTests(unittest.TestCase):
             self.app,
             recording_id,
             "Praise the Lord. I would like to thank God for helping me this week.",
-            "transcript_excerpt",
+            "chunked-transcript-v1",
             "",
         )
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                UPDATE testimony_reviews
+                SET recorder_agent_reason = ?
+                WHERE recording_id = ?
+                """,
+                (
+                    "recorder-review-v4: Automatic transcript classification completed.",
+                    recording_id,
+                ),
+            )
 
         self.assertEqual(_testimony_transcript_targets(self.app), [])
         review_after = self.client.get("/admin/recorder-review?status=identified")
@@ -2478,7 +2492,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                     recorder_agent_updated_at,
                     updated_at
                 )
-                VALUES (?, ?, 'needs_review', '2026-07-26', ?, 'recorder_manifest',
+                VALUES (?, ?, 'needs_review', '2026-07-26', ?, 'chunked-transcript-v1',
                         'message', 'review', 'Legacy manifest decision.', ?, ?)
                 """,
                 (
@@ -3202,7 +3216,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             self.app,
             recording_id,
             transcript_text="Praise the Lord. I want to thank God.",
-            transcript_source="transcript_excerpt",
+            transcript_source="chunked-transcript-v1",
             transcript_error="",
         )
 
@@ -3265,6 +3279,79 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(recording_ids, {"needs-review", "identified"})
 
+    def test_background_analysis_reprocesses_legacy_transcripts_once(self):
+        base_item = {
+            "id": "legacy-transcript",
+            "status": "identified",
+            "transcript_text": "Praise the Lord. This transcript was stored by the old single-block pass.",
+            "transcript_error": "",
+            "recorder_agent_reason": "recorder-review-v4: Automatic transcript classification completed.",
+        }
+
+        self.assertEqual(
+            _automatic_review_analysis_ids(
+                [{**base_item, "transcript_source": "transcript_excerpt"}]
+            ),
+            {"legacy-transcript"},
+        )
+        self.assertEqual(
+            _automatic_review_analysis_ids(
+                [{**base_item, "transcript_source": "chunked-transcript-v1"}]
+            ),
+            set(),
+        )
+
+    def test_chunked_transcript_preserves_start_and_covers_full_duration(self):
+        recording = self.root / "REC00430.mp3"
+        recording.write_bytes(b"audio")
+        self.app.config.update(
+            NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL="http://transcription.example.test",
+            NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_CHUNK_SECONDS=60,
+            NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_SECONDS=180,
+        )
+
+        def prepare_chunk(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"wav")
+            return Mock(returncode=0, stderr="", stdout="")
+
+        responses = []
+        for text in (
+            "Can I just personally confess that I am really blessed to be here.",
+            "Today I had a simple desire to attend a few songs of worship.",
+            "I am here to request prayers for my auntie.",
+        ):
+            response = Mock()
+            response.json.return_value = {"text": text}
+            response.text = ""
+            responses.append(response)
+
+        with (
+            patch("ntc_recordings_app._probe_audio_duration", return_value=130),
+            patch("ntc_recordings_app.subprocess.run", side_effect=prepare_chunk) as ffmpeg,
+            patch(
+                "ntc_recordings_app._post_transcription_audio",
+                side_effect=responses,
+            ) as transcribe,
+        ):
+            transcript, error = _transcribe_testimony_review_excerpt(
+                self.app,
+                recording,
+            )
+
+        self.assertEqual(error, "")
+        self.assertIn("[start] Can I just personally confess", transcript)
+        self.assertIn("[+60s] Today I had a simple desire", transcript)
+        self.assertIn("[+120s] I am here to request prayers", transcript)
+        self.assertEqual(transcribe.call_count, 3)
+        commands = [call.args[0] for call in ffmpeg.call_args_list]
+        self.assertEqual(
+            [command[command.index("-ss") + 1] for command in commands],
+            ["0", "60", "120"],
+        )
+        self.assertTrue(
+            all("adelay=500:all=1" in command for command in commands)
+        )
+
     def test_background_analysis_builds_review_items_without_browser_request(self):
         review_root = self.root / "TestimonyReviewQueue"
         review_root.mkdir()
@@ -3287,6 +3374,30 @@ class RecordingRequestPanelTests(unittest.TestCase):
         recording_ids = _background_review_analysis_ids(self.app, limit=20)
 
         self.assertIn(recording_id, recording_ids)
+
+    def test_finished_recorder_analysis_is_hidden_after_reload(self):
+        self.app.testimony_transcript_job = {
+            "state": "finished",
+            "started_at": "",
+            "finished_at": "",
+            "current": "",
+            "processed": 1,
+            "saved": 1,
+            "errors": 0,
+            "skipped": 0,
+            "total": 1,
+            "message": "Finished. Saved 1; errors 0.",
+        }
+        self._login()
+
+        response = self.client.get("/admin/recorder-review")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'data-state="finished" hidden', response.data)
+        self.assertIn(
+            b'panel.hidden = !["running", "failed"].includes(job.state);',
+            response.data,
+        )
 
     def test_testimony_delivery_rule_is_future_only_idempotent_and_uses_both_recipients(self):
         effective_from = "2026-07-28"

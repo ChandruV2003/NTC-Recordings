@@ -11,6 +11,7 @@ import html
 import hmac
 import fcntl
 import json
+import math
 import os
 import re
 import secrets
@@ -59,6 +60,7 @@ DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rej
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
 RECORDER_REVIEW_ANALYSIS_VERSION = "recorder-review-v4"
+RECORDER_REVIEW_TRANSCRIPT_VERSION = "chunked-transcript-v1"
 RECORDER_REVIEW_CLASSIFICATION_KINDS = ("testimony", "message", "worship", "combined")
 RECORDER_REVIEW_FINAL_KINDS = ("testimony", "message", "worship")
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
@@ -375,6 +377,12 @@ def create_app(test_config: dict | None = None) -> Flask:
             "This is a church testimony. The speaker may introduce themselves by saying my name is, I am, or I'm.",
         ),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS", "240")),
+        NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_CHUNK_SECONDS=int(
+            os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_CHUNK_SECONDS", "90")
+        ),
+        NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_SECONDS=int(
+            os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_SECONDS", "1800")
+        ),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS", "384")),
         NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT=int(os.getenv("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_LIMIT", "30")),
         NTC_RECORDINGS_AGENT_URL=os.getenv("NTC_RECORDINGS_AGENT_URL", ""),
@@ -3626,7 +3634,15 @@ def _automatic_review_analysis_ids(items: Iterable[dict], limit: int = 20) -> se
         agent_reason = str(item.get("recorder_agent_reason") or "")
         manual_type_confirmed = agent_reason == "Classification confirmed in Recorder Review."
         current_analysis = RECORDER_REVIEW_ANALYSIS_VERSION in agent_reason
-        if transcript_text and not transcript_error and (manual_type_confirmed or current_analysis):
+        current_transcript = (
+            str(item.get("transcript_source") or "") == RECORDER_REVIEW_TRANSCRIPT_VERSION
+        )
+        if (
+            transcript_text
+            and not transcript_error
+            and current_transcript
+            and (manual_type_confirmed or current_analysis)
+        ):
             continue
         updated_at = str(item.get("transcript_updated_at") or "")
         if transcript_error and updated_at:
@@ -4197,7 +4213,11 @@ def _run_testimony_transcript_job(
                 processed_ids.add(str(row["recording_id"]))
                 _update_testimony_transcript_job(app, current=Path(candidate.path).name)
                 transcript_text = _row_optional_text(row, "transcript_text")
-                reused_transcript = bool(_display_transcript_text(transcript_text))
+                reused_transcript = (
+                    bool(_display_transcript_text(transcript_text))
+                    and _row_optional_text(row, "transcript_source")
+                    == RECORDER_REVIEW_TRANSCRIPT_VERSION
+                )
                 transcript_error = ""
                 if reused_transcript:
                     saved += 1
@@ -4219,7 +4239,7 @@ def _run_testimony_transcript_job(
                         app,
                         recording_id=recording_id,
                         transcript_text=transcript_text,
-                        transcript_source=_row_optional_text(row, "transcript_source") or ("transcript_excerpt" if transcript_text else ""),
+                        transcript_source=RECORDER_REVIEW_TRANSCRIPT_VERSION if transcript_text else "",
                         transcript_error=transcript_error,
                     )
                 agent_decision = _classify_recorder_review_transcript(
@@ -4355,7 +4375,18 @@ def _testimony_transcript_targets(
             continue
         if str(row["status"] or "") not in target_statuses:
             continue
-        if not target_ids and _display_transcript_text(_row_optional_text(row, "transcript_text")):
+        has_current_transcript = (
+            bool(_display_transcript_text(_row_optional_text(row, "transcript_text")))
+            and _row_optional_text(row, "transcript_source")
+            == RECORDER_REVIEW_TRANSCRIPT_VERSION
+        )
+        has_current_analysis = (
+            RECORDER_REVIEW_ANALYSIS_VERSION
+            in _row_optional_text(row, "recorder_agent_reason")
+            or _row_optional_text(row, "recorder_agent_reason")
+            == "Classification confirmed in Recorder Review."
+        )
+        if not target_ids and has_current_transcript and has_current_analysis:
             skipped += 1
             continue
         candidate = _testimony_candidate_from_review_row(app, row)
@@ -5498,10 +5529,15 @@ def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple
     if not transcribe_url:
         return "", "Testimony transcripts need a transcription URL configured."
     try:
-        seconds = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_SECONDS") or 240)
+        chunk_seconds = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_CHUNK_SECONDS") or 90)
     except (TypeError, ValueError):
-        seconds = 240
-    seconds = min(max(seconds, 30), 900)
+        chunk_seconds = 90
+    chunk_seconds = min(max(chunk_seconds, 30), 180)
+    try:
+        max_seconds = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_SECONDS") or 1800)
+    except (TypeError, ValueError):
+        max_seconds = 1800
+    max_seconds = min(max(max_seconds, chunk_seconds), 1800)
     try:
         max_tokens = int(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_TOKENS") or 384)
     except (TypeError, ValueError):
@@ -5510,53 +5546,81 @@ def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple
     timeout = float(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_TIMEOUT") or 600)
     prompt = str(
         app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_PROMPT")
-        or "Transcribe this church testimony clearly. Keep names exactly as spoken."
-    )
-    with tempfile.TemporaryDirectory(prefix="ntc-testimony-transcript-") as temp_dir:
-        wav_path = Path(temp_dir) / "testimony.wav"
-        completed = subprocess.run(
-            [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-y",
-                "-i",
-                str(source_path),
-                "-t",
-                str(seconds),
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-f",
-                "wav",
-                str(wav_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=min(max(timeout, 30), 120),
-            check=False,
+        or (
+            "Transcribe this church recording verbatim from the very first audible word. "
+            "Keep names exactly as spoken. Do not summarize or add instructions."
         )
-        if completed.returncode != 0 or not wav_path.exists():
-            detail = (completed.stderr or completed.stdout or "").strip()
-            return "", f"Could not prepare testimony audio for transcription{': ' + detail[:180] if detail else ''}."
-        try:
-            response = _post_transcription_audio(
-                app,
-                transcribe_url,
-                params={"language": "en", "prompt": prompt, "max_new_tokens": str(max_tokens)},
-                data=wav_path.read_bytes(),
-                timeout=timeout,
+    )
+    duration_seconds = _probe_audio_duration(source_path)
+    total_seconds = min(
+        max_seconds,
+        max(chunk_seconds, int(math.ceil(duration_seconds or chunk_seconds))),
+    )
+    transcript_chunks: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="ntc-testimony-transcript-") as temp_dir:
+        for chunk_index, offset in enumerate(range(0, total_seconds, chunk_seconds)):
+            current_seconds = min(chunk_seconds, total_seconds - offset)
+            wav_path = Path(temp_dir) / f"testimony-{chunk_index:03d}.wav"
+            completed = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    "-i",
+                    str(source_path),
+                    "-ss",
+                    str(offset),
+                    "-t",
+                    str(current_seconds),
+                    "-af",
+                    "adelay=500:all=1",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-f",
+                    "wav",
+                    str(wav_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=min(max(timeout, 30), 120),
+                check=False,
             )
-        except requests.RequestException as exc:
-            return "", f"Transcription request failed: {exc}"
-    try:
-        payload = response.json()
-    except ValueError:
-        return response.text.strip(), ""
-    return str(payload.get("text") or "").strip(), ""
+            if completed.returncode != 0 or not wav_path.exists():
+                detail = (completed.stderr or completed.stdout or "").strip()
+                return "\n\n".join(transcript_chunks), (
+                    "Could not prepare recording audio for transcription"
+                    f"{': ' + detail[:180] if detail else ''}."
+                )
+            try:
+                response = _post_transcription_audio(
+                    app,
+                    transcribe_url,
+                    params={
+                        "language": "en",
+                        "prompt": prompt,
+                        "max_new_tokens": str(max_tokens),
+                    },
+                    data=wav_path.read_bytes(),
+                    timeout=timeout,
+                )
+            except requests.RequestException as exc:
+                return "\n\n".join(transcript_chunks), f"Transcription request failed: {exc}"
+            try:
+                payload = response.json()
+                chunk_text = str(payload.get("text") or "").strip()
+            except ValueError:
+                chunk_text = response.text.strip()
+            chunk_text = _display_transcript_text(chunk_text)
+            if not chunk_text:
+                return "\n\n".join(transcript_chunks), "Transcript was empty."
+            marker = "[start]" if offset == 0 else f"[+{offset}s]"
+            transcript_chunks.append(f"{marker} {chunk_text}")
+    return "\n\n".join(transcript_chunks), ""
 
 
 def _post_transcription_audio(
@@ -9120,7 +9184,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
           {% endif %}
         </div>
       </div>
-      <div class="job-panel" data-transcript-job data-status-url="{{ recordings_url_for('testimony_transcript_status') }}" data-state="{{ transcript_job.state }}" {% if transcript_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
+      <div class="job-panel" data-transcript-job data-status-url="{{ recordings_url_for('testimony_transcript_status') }}" data-state="{{ transcript_job.state }}" {% if transcript_job.state not in ["running", "failed"] %}hidden{% endif %}>
         <div class="job-panel-copy">
           <div>
             <span>Recorder Analysis</span>
@@ -9910,7 +9974,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         const current = panel.querySelector("[data-job-current]");
         const priorState = panel.dataset.state || "";
 
-        panel.hidden = !["running", "finished", "failed"].includes(job.state);
+        panel.hidden = !["running", "failed"].includes(job.state);
         panel.dataset.state = job.state || "";
         if (message) message.textContent = job.message || "Idle.";
         if (counts) {
