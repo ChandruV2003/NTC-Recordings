@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from ntc_recordings_app import (
+    RecordingCandidate,
     _automatic_review_analysis_ids,
     _date_from_file_metadata,
     _display_transcript_text,
@@ -21,6 +22,8 @@ from ntc_recordings_app import (
     _queue_testimony_deliveries,
     _record_testimony_review_history,
     _recorder_agent_reason_label,
+    _recorder_review_display_kind,
+    _recorder_transcript_windows,
     _recording_id,
     _run_testimony_transcript_job,
     _run_testimony_delivery_job,
@@ -850,7 +853,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(saved.status_code, 200)
-        self.assertIn(b"Recorder review saved and renamed", saved.data)
+        self.assertIn(b"Recorder review saved and filed as", saved.data)
         self.assertIn(b"Needs Review", saved.data)
         self.assertNotIn(b"20260419 - Sister Test&#39;s Testimony.mp3", saved.data)
         self.assertNotIn(b"Sunday Testimonies", saved.data)
@@ -907,6 +910,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 "source_path": str(raw_recording),
                 "service_date": "2026-07-26",
                 "recording_kind": "message",
+                "speaker_name": "Brother Blessen",
                 "group_title": "The Lord Is Faithful",
                 "review_revision": "0",
             },
@@ -916,19 +920,30 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200)
         first_payload = first.get_json()
         self.assertTrue(first_payload["ok"])
-        self.assertEqual(first_payload["status"], "needs_review")
+        self.assertEqual(first_payload["status"], "identified")
         self.assertEqual(first_payload["recording_kind"], "message")
         self.assertEqual(first_payload["group_title"], "The Lord Is Faithful")
         self.assertEqual(first_payload["review_revision"], 1)
+        filed_path = (
+            self.root
+            / "2026"
+            / "Sunday Messages"
+            / "July"
+            / "July 26, 2026 - The Lord Is Faithful - Brother Blessen.mp3"
+        )
+        filed_recording_id = _recording_id(filed_path)
+        self.assertFalse(raw_recording.exists())
+        self.assertTrue(filed_path.exists())
 
         stale = self.client.post(
-            f"/admin/testimonies/{recording_id}/review",
+            f"/admin/testimonies/{filed_recording_id}/review",
             data={
                 "action": "save_review",
-                "status_filter": "needs_review",
-                "source_path": str(raw_recording),
+                "status_filter": "identified",
+                "source_path": str(filed_path),
                 "service_date": "2026-07-26",
                 "recording_kind": "message",
+                "speaker_name": "Brother Blessen",
                 "group_title": "Stale overwrite",
                 "review_revision": "0",
             },
@@ -944,7 +959,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 FROM testimony_reviews
                 WHERE recording_id = ?
                 """,
-                (recording_id,),
+                (filed_recording_id,),
             ).fetchone()
             history = connection.execute(
                 """
@@ -952,12 +967,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 FROM recorder_review_history
                 WHERE recording_id = ?
                 """,
-                (recording_id,),
+                (filed_recording_id,),
             ).fetchall()
-        self.assertEqual(row, ("needs_review", "The Lord Is Faithful", "message", 1))
-        self.assertEqual(history, [("save_review", "needs_review", "needs_review", "message")])
+        self.assertEqual(row, ("identified", "The Lord Is Faithful", "message", 1))
+        self.assertEqual(history, [("save_review", "needs_review", "identified", "message")])
 
-    def test_ntc_recorder_review_rejects_worship_destination(self):
+    def test_ntc_recorder_review_files_confirmed_worship_in_worship_library(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
         raw_recording = testimony_source_root / "07262026115900_DN-700R.mp3"
@@ -978,15 +993,81 @@ class RecordingRequestPanelTests(unittest.TestCase):
             headers={"Accept": "application/json", "X-Requested-With": "fetch"},
         )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "Choose Testimony or Message before saving.")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["recording_kind"], "worship")
+        self.assertEqual(payload["status"], "identified")
+        filed_path = (
+            self.worship_root
+            / "2026"
+            / "July"
+            / "July 26, 2026 - Sunday Service"
+            / "LR"
+            / "July 26, 2026 - NTCWorship1159 - LR.mp3"
+        )
+        filed_recording_id = _recording_id(filed_path)
+        self.assertFalse(raw_recording.exists())
+        self.assertTrue(filed_path.exists())
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT status, recorder_agent_kind, source_path FROM testimony_reviews WHERE recording_id = ?",
+                (filed_recording_id,),
+            ).fetchone()
+        self.assertEqual(row, ("identified", "worship", str(filed_path)))
+
+    def test_combined_recording_stays_in_review_for_splitting(self):
+        testimony_source_root = self.root / "TestimonyReviewQueue"
+        testimony_source_root.mkdir()
+        raw_recording = testimony_source_root / "07262026150000_DN-700R.mp3"
+        raw_recording.write_bytes(b"combined-recorder-audio")
+        recording_id = _recording_id(raw_recording)
+
+        _save_testimony_review(
+            self.app,
+            recording_id=recording_id,
+            source_path=str(raw_recording),
+            status="needs_review",
+            service_date="2026-07-26",
+            speaker_name="",
+            testimony_title="Sunday Service",
+            notes="",
+            proposed_path="",
+            duration_seconds=3600,
+            recorder_agent_kind="combined",
+            recorder_agent_action="split",
+            recorder_agent_reason="Multiple recording sections were detected.",
+        )
+        self._login()
+        review = self.client.get("/admin/recorder-review")
+        self.assertIn(b'<option value="combined" selected>Combined - Needs Splitting</option>', review.data)
+        self.assertIn(b'value="Sunday Service"', review.data)
+
+        response = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "action": "save_review",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2026-07-26",
+                "recording_kind": "combined",
+                "group_title": "Sunday Service",
+                "review_revision": "0",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["recording_kind"], "combined")
+        self.assertEqual(payload["status"], "needs_review")
         self.assertTrue(raw_recording.exists())
         with sqlite3.connect(self.db_path) as connection:
             row = connection.execute(
-                "SELECT recorder_agent_kind FROM testimony_reviews WHERE recording_id = ?",
+                "SELECT status, testimony_title, recorder_agent_kind, source_path FROM testimony_reviews WHERE recording_id = ?",
                 (recording_id,),
             ).fetchone()
-        self.assertIsNone(row)
+        self.assertEqual(row, ("needs_review", "Sunday Service", "combined", str(raw_recording)))
 
     def test_background_analysis_preserves_human_review_fields(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -1123,7 +1204,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         payload = response.get_json()
         self.assertFalse(payload["ok"])
-        self.assertIn("Enter a speaker name", payload["error"])
+        self.assertIn("Enter a speaker or group/event title", payload["error"])
         self.assertTrue(raw_recording.exists())
         with sqlite3.connect(self.db_path) as connection:
             row = connection.execute(
@@ -1520,9 +1601,9 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"<span>Recording Type</span>", review_before.data)
         self.assertIn(b'data-field="recording-kind-label">Testimony</strong>', review_before.data)
         self.assertIn(b"No alternate suggestion", review_before.data)
-        self.assertIn(b"choose Testimony or Message", review_before.data)
-        self.assertNotIn(b"Testimony, Message, or Worship", review_before.data)
-        self.assertNotIn(b'<option value="worship"', review_before.data)
+        self.assertIn(b"choose Testimony, Message, Worship, or Combined", review_before.data)
+        self.assertIn(b'<option value="worship"', review_before.data)
+        self.assertIn(b'<option value="combined"', review_before.data)
 
         _save_testimony_transcript(
             self.app,
@@ -1551,6 +1632,23 @@ class RecordingRequestPanelTests(unittest.TestCase):
             cleaned,
             "Praise the Lord. I thank God for His faithfulness.\n\n"
             "God has helped our family through every season.",
+        )
+
+    def test_recorder_review_display_type_uses_configured_physical_library(self):
+        candidate = RecordingCandidate(
+            id=_recording_id(self.recording),
+            path=str(self.recording),
+            title=self.recording.stem,
+            recording_date="2026-04-19",
+            kind="message",
+            size_bytes=self.recording.stat().st_size,
+            modified_at=datetime.now(timezone.utc).isoformat(),
+            relative_path=self.recording.name,
+        )
+
+        self.assertEqual(
+            _recorder_review_display_kind(self.app, candidate, None, "identified"),
+            "message",
         )
 
     def test_prompt_only_transcript_is_rejected_and_retried(self):
@@ -2372,7 +2470,34 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(payload["classification"], "message_candidate")
         self.assertEqual(payload["transcript_text"], transcript)
         self.assertEqual(payload["recorder_lane"], "ntc-dn700r")
-        self.assertEqual(payload["allowed_recording_kinds"], ["testimony", "message", "noise"])
+        self.assertEqual(payload["allowed_recording_kinds"], ["testimony", "message", "worship", "noise"])
+        self.assertEqual(payload["transcript_windows"], [])
+
+    def test_recorder_transcript_windows_preserve_timed_and_segment_context(self):
+        row = {
+            "recorder_segments_json": json.dumps(
+                [
+                    {"start_seconds": 0, "end_seconds": 60, "snippet": "Praise and worship."},
+                    {"start_seconds": 60, "end_seconds": 240, "snippet": "My name is Rachel. I want to testify."},
+                ]
+            )
+        }
+        timed = _recorder_transcript_windows(
+            row,
+            "[start] Praise and worship.\n\n[+60s] My name is Rachel. I want to testify.",
+        )
+        self.assertEqual(
+            timed,
+            [
+                {"start_seconds": 0.0, "end_seconds": 60.0, "text": "Praise and worship."},
+                {"start_seconds": 60.0, "end_seconds": None, "text": "My name is Rachel. I want to testify."},
+            ],
+        )
+
+        segmented = _recorder_transcript_windows(row, "Flattened transcript")
+        self.assertEqual(segmented[0]["start_seconds"], 0.0)
+        self.assertEqual(segmented[0]["end_seconds"], 60.0)
+        self.assertEqual(segmented[1]["text"], "My name is Rachel. I want to testify.")
 
     def test_newer_recorder_review_decision_survives_stale_manifest_sync(self):
         intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"

@@ -58,7 +58,8 @@ DEFAULT_TESTIMONY_REJECTED_DIR = f"{DEFAULT_TESTIMONY_RECORDING_DIR}/.review-rej
 DEFAULT_RECORDING_DIR = DEFAULT_MESSAGE_RECORDING_DIR
 DEFAULT_RECORDING_DIRS = f"message:{DEFAULT_MESSAGE_RECORDING_DIR},worship:{DEFAULT_WORSHIP_RECORDING_DIR},testimony:{DEFAULT_TESTIMONY_RECORDING_DIR}"
 RECORDER_REVIEW_ANALYSIS_VERSION = "recorder-review-v2"
-RECORDER_REVIEW_ALLOWED_KINDS = ("testimony", "message")
+RECORDER_REVIEW_CLASSIFICATION_KINDS = ("testimony", "message", "worship", "combined")
+RECORDER_REVIEW_FINAL_KINDS = ("testimony", "message", "worship")
 TESTIMONY_REVIEW_FILTERS = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "all"}
 TESTIMONY_REVIEW_STATUSES = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate", "already_named"}
 TESTIMONY_REVIEW_EDITABLE_STATUSES = {"needs_review", "message_review", "identified", "grouped", "not_testimony", "duplicate"}
@@ -999,6 +1000,7 @@ def create_app(test_config: dict | None = None) -> Flask:
         original_recording_id = recording_id
         existing = _testimony_review_row(app, recording_id)
         requested_action = (request.form.get("action") or "").strip().lower()
+        requested_status = (request.form.get("status") or "").strip().lower()
         service_date = (
             _normalize_date((request.form.get("service_date") or "").strip())
             or (str(existing["service_date"] or "") if existing else "")
@@ -1010,12 +1012,18 @@ def create_app(test_config: dict | None = None) -> Flask:
         recording_kind = _normalize_recording_kind(request.form.get("recording_kind") or "")
         if recording_kind == "unsure":
             recording_kind = _normalize_recording_kind(_row_optional_text(existing, "recorder_agent_kind"))
-        requested_status = (request.form.get("status") or "").strip().lower()
+        if (
+            not requested_action
+            and requested_status in {"identified", "grouped"}
+            and _normalize_recording_kind(request.form.get("recording_kind") or "") == "unsure"
+        ):
+            requested_action = "save_review"
+            recording_kind = "testimony"
         if requested_status == "message_review":
             requested_status = "needs_review"
         if requested_action == "save_review":
-            if recording_kind not in RECORDER_REVIEW_ALLOWED_KINDS:
-                review_error = "Choose Testimony or Message before saving."
+            if recording_kind not in RECORDER_REVIEW_CLASSIFICATION_KINDS:
+                review_error = "Choose Testimony, Message, Worship, or Combined before saving."
                 if _wants_json_response():
                     return jsonify({"ok": False, "error": review_error}), 400
                 return _redirect_to(
@@ -1038,6 +1046,33 @@ def create_app(test_config: dict | None = None) -> Flask:
                         sort=request.form.get("sort") or "newest",
                         error=review_error,
                     )
+            elif recording_kind == "message":
+                if not speaker_name or not group_title:
+                    review_error = "Enter the message speaker and title before filing this recording."
+                    if _wants_json_response():
+                        return jsonify({"ok": False, "error": review_error}), 400
+                    return _redirect_to(
+                        app,
+                        "testimony_review",
+                        status=current_filter,
+                        sort=request.form.get("sort") or "newest",
+                        error=review_error,
+                    )
+                status = "identified"
+            elif recording_kind == "worship":
+                if not service_date:
+                    review_error = "Confirm the service date before filing worship audio."
+                    if _wants_json_response():
+                        return jsonify({"ok": False, "error": review_error}), 400
+                    return _redirect_to(
+                        app,
+                        "testimony_review",
+                        status=current_filter,
+                        sort=request.form.get("sort") or "newest",
+                        error=review_error,
+                    )
+                speaker_name = ""
+                status = "identified"
             else:
                 status = "needs_review"
         else:
@@ -1056,7 +1091,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                 error=review_error,
             )
         known_speakers = _testimony_known_speakers(app)
-        if status == "identified":
+        if status == "identified" and recording_kind in {"testimony", "message"}:
             speaker_name = _valid_person_name_suggestion(speaker_name, known_speakers)
             if not speaker_name:
                 review_error = "Enter a speaker name before saving a speaker."
@@ -1069,7 +1104,13 @@ def create_app(test_config: dict | None = None) -> Flask:
                     sort=request.form.get("sort") or "newest",
                     error=review_error,
                 )
-        if status == "grouped":
+        if recording_kind == "combined":
+            testimony_title = group_title
+        elif recording_kind == "message":
+            testimony_title = group_title
+        elif recording_kind == "worship":
+            testimony_title = group_title
+        elif status == "grouped":
             speaker_name = ""
             testimony_title = group_title or "Testimonies"
         elif status == "needs_review":
@@ -1108,15 +1149,50 @@ def create_app(test_config: dict | None = None) -> Flask:
                 sort=request.form.get("sort") or "newest",
                 error=review_error,
             )
-        if status in {"identified", "grouped"}:
-            proposed_path = _proposed_testimony_path(app, Path(candidate.path), service_date, speaker_name, testimony_title)
-            renamed_candidate, proposed_path, rename_error = _rename_testimony_recording(
-                app,
-                candidate,
-                service_date=service_date,
-                speaker_name=speaker_name,
-                testimony_title=testimony_title,
-            )
+        if requested_action == "save_review" and recording_kind in RECORDER_REVIEW_FINAL_KINDS:
+            if recording_kind == "testimony":
+                proposed_path = _proposed_testimony_path(
+                    app,
+                    Path(candidate.path),
+                    service_date,
+                    speaker_name,
+                    testimony_title,
+                )
+                renamed_candidate, proposed_path, rename_error = _rename_testimony_recording(
+                    app,
+                    candidate,
+                    service_date=service_date,
+                    speaker_name=speaker_name,
+                    testimony_title=testimony_title,
+                )
+            elif recording_kind == "message":
+                try:
+                    message_path = _proposed_message_path(
+                        app,
+                        Path(candidate.path),
+                        service_date,
+                        speaker_name,
+                        testimony_title,
+                    )
+                    renamed_candidate, proposed_path, rename_error = _move_recorder_review_recording(
+                        app,
+                        candidate,
+                        proposed_path=message_path,
+                        destination_root=_message_recording_root(app),
+                    )
+                except ValueError as exc:
+                    renamed_candidate, proposed_path, rename_error = candidate, "", str(exc)
+            else:
+                try:
+                    worship_path = _proposed_worship_path(app, candidate, service_date)
+                    renamed_candidate, proposed_path, rename_error = _move_recorder_review_recording(
+                        app,
+                        candidate,
+                        proposed_path=worship_path,
+                        destination_root=_worship_recording_root(app),
+                    )
+                except ValueError as exc:
+                    renamed_candidate, proposed_path, rename_error = candidate, "", str(exc)
             if renamed_candidate.id != recording_id:
                 _delete_testimony_review(app, recording_id)
             candidate = renamed_candidate
@@ -1128,7 +1204,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                 review_error = rename_error
                 save_message = f"Recorder review was not completed. {rename_error}"
             else:
-                save_message = f"Recorder review saved and renamed to {Path(proposed_path).name}."
+                save_message = f"Recorder review saved and filed as {Path(proposed_path).name}."
+        elif requested_action == "save_review" and recording_kind == "combined":
+            save_message = "Combined recording saved for split review."
         _save_testimony_review(
             app,
             recording_id=recording_id,
@@ -1145,8 +1223,6 @@ def create_app(test_config: dict | None = None) -> Flask:
             suggestion_text=suggestion_text,
             recorder_agent_kind=(
                 "testimony"
-                if status == "identified"
-                else "testimony"
                 if status == "grouped"
                 else recording_kind or None
             ),
@@ -1199,7 +1275,7 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "service_date": service_date,
                     "service_date_label": _format_date(service_date),
                     "speaker_name": speaker_name,
-                    "group_title": testimony_title if status == "grouped" or recording_kind == "message" else "",
+                    "group_title": testimony_title,
                     "title": candidate.title,
                     "source_label": Path(candidate.path).name,
                     "source_path": candidate.path,
@@ -2401,6 +2477,7 @@ def _testimony_allowed_roots(app: Flask) -> list[Path]:
         str(app.config.get("NTC_RECORDINGS_LIBRARY_DIRS") or ""),
         str(app.config.get("NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR") or ""),
         str(app.config.get("NTC_RECORDINGS_TESTIMONY_REJECTED_DIR") or ""),
+        str(_worship_recording_root(app)),
     )
     if getattr(app, "testimony_allowed_roots_cache_key", None) == cache_key:
         return list(getattr(app, "testimony_allowed_roots_cache", ()))
@@ -2412,6 +2489,7 @@ def _testimony_allowed_roots(app: Flask) -> list[Path]:
             Path(DEFAULT_RECORDER_INTAKE_DIR),
             _testimony_recording_root(app),
             _message_recording_root(app),
+            _worship_recording_root(app),
             _testimony_rejected_root(app),
         ]
     )
@@ -2458,6 +2536,17 @@ def _message_recording_root(app: Flask) -> Path:
         if "messagerecordings" in re.sub(r"[^a-z]+", "", str(root).lower()):
             return root
     return Path(DEFAULT_MESSAGE_RECORDING_DIR)
+
+
+def _worship_recording_root(app: Flask) -> Path:
+    roots = _library_roots(app)
+    for kind, root in roots:
+        if kind == "worship":
+            return root
+    for _, root in roots:
+        if "worshiprecordings" in re.sub(r"[^a-z]+", "", str(root).lower()):
+            return root
+    return Path(DEFAULT_WORSHIP_RECORDING_DIR)
 
 
 def _testimony_recording_root(app: Flask) -> Path:
@@ -2513,7 +2602,7 @@ def _testimony_source_candidates(app: Flask) -> list[RecordingCandidate]:
                 relative_path = _relative_to_first_root(path, known_roots)
             except ValueError:
                 relative_path = path.name
-            kind = "testimony" if _raw_testimony_name(path) else "message"
+            kind = _filed_recording_kind(app, path)
             candidates.append(
                 RecordingCandidate(
                     id=_recording_id(path),
@@ -2547,7 +2636,7 @@ def _testimony_source_candidate_from_path(app: Flask, path: Path) -> RecordingCa
         relative_path = _relative_to_first_root(path, known_roots)
     except ValueError:
         relative_path = path.name
-    kind = "testimony" if _raw_testimony_name(path) else "message"
+    kind = _filed_recording_kind(app, path)
     return RecordingCandidate(
         id=_recording_id(path),
         path=str(path),
@@ -2955,12 +3044,17 @@ def _testimony_candidate_from_review_row(app: Flask, row: sqlite3.Row) -> Record
 
 
 def _recorder_review_display_kind(
+    app: Flask,
     candidate: RecordingCandidate,
     row: sqlite3.Row | None,
     status: str,
 ) -> str:
+    stored_path_kind = _filed_recording_kind(app, Path(candidate.path))
+    if stored_path_kind in RECORDER_REVIEW_FINAL_KINDS:
+        return stored_path_kind
+
     stored_kind = _normalize_recording_kind(_row_optional_text(row, "recorder_agent_kind"))
-    if stored_kind in RECORDER_REVIEW_ALLOWED_KINDS:
+    if stored_kind in RECORDER_REVIEW_CLASSIFICATION_KINDS:
         return stored_kind
 
     if status in {"identified", "grouped"}:
@@ -3026,7 +3120,7 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
             suggestion_text = Path(candidate.path).name
     if not service_date:
         service_date = candidate.recording_date
-    review_recording_kind = _recorder_review_display_kind(candidate, row, status)
+    review_recording_kind = _recorder_review_display_kind(app, candidate, row, status)
     event_folder = _testimony_event_folder(service_date)
     if not proposed_path and status in {"identified", "grouped"}:
         proposed_path = _proposed_testimony_path(
@@ -3049,7 +3143,11 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "service_date": service_date,
         "speaker_name": speaker_name,
         "testimony_title": testimony_title,
-        "group_title": testimony_title if status == "grouped" or review_recording_kind == "message" else "",
+        "group_title": (
+            testimony_title
+            if status == "grouped" or review_recording_kind in {"message", "worship", "combined"}
+            else ""
+        ),
         "event_group": event_folder[1] if event_folder else "",
         "notes": notes,
         "proposed_path": proposed_path,
@@ -3518,7 +3616,8 @@ def _classify_recorder_review_transcript(
     candidate: RecordingCandidate,
     transcript_text: str,
 ) -> dict | None:
-    transcript_text = _display_transcript_text(transcript_text)
+    raw_transcript_text = str(transcript_text or "")
+    transcript_text = _display_transcript_text(raw_transcript_text)
     agent_url = str(app.config.get("NTC_RECORDINGS_AGENT_URL") or "").strip().rstrip("/")
     if not transcript_text or not agent_url:
         return None
@@ -3541,7 +3640,8 @@ def _classify_recorder_review_transcript(
         "filename": Path(candidate.path).name,
         "source_relative_path": str(candidate.relative_path or Path(candidate.path).name),
         "recorder_lane": "ntc-dn700r",
-        "allowed_recording_kinds": [*RECORDER_REVIEW_ALLOWED_KINDS, "noise"],
+        "allowed_recording_kinds": [*RECORDER_REVIEW_FINAL_KINDS, "noise"],
+        "transcript_windows": _recorder_transcript_windows(row, raw_transcript_text),
     }
     headers = {"Accept": "application/json"}
     agent_token = str(app.config.get("NTC_RECORDINGS_AGENT_TOKEN") or "").strip()
@@ -3563,22 +3663,13 @@ def _classify_recorder_review_transcript(
         return None
 
     recording_kind = _normalize_recording_kind(str(result.get("recording_kind") or ""))
-    invalid_kind_reason = ""
-    if recording_kind == "worship":
-        invalid_kind_reason = (
-            "Worship is not a valid destination for the NTC DN700R lane; "
-            "the recording was left for Message or Testimony review."
-        )
-        recording_kind = "unknown"
-    elif recording_kind not in RECORDER_REVIEW_ALLOWED_KINDS:
+    if recording_kind not in {*RECORDER_REVIEW_CLASSIFICATION_KINDS, "noise"}:
         recording_kind = "unknown"
     reasons = result.get("reasons")
     if isinstance(reasons, list):
         reason = "; ".join(str(value).strip() for value in reasons if str(value).strip())
     else:
         reason = str(result.get("reason") or "").strip()
-    if invalid_kind_reason:
-        reason = "; ".join(value for value in (reason, invalid_kind_reason) if value)
     reason = f"{RECORDER_REVIEW_ANALYSIS_VERSION}: {reason or 'Automatic transcript classification completed.'}"
     return {
         "recording_kind": recording_kind,
@@ -3586,6 +3677,48 @@ def _classify_recorder_review_transcript(
         "reason": reason,
         "speaker": str(result.get("speaker") or "").strip(),
     }
+
+
+def _recorder_transcript_windows(row: sqlite3.Row, transcript_text: str) -> list[dict]:
+    windows: list[dict] = []
+    marker_pattern = re.compile(r"(?m)^\[(start|\+\d+s)\]\s*")
+    matches = list(marker_pattern.finditer(str(transcript_text or "")))
+    for index, match in enumerate(matches):
+        text_start = match.end()
+        text_end = matches[index + 1].start() if index + 1 < len(matches) else len(transcript_text)
+        text = str(transcript_text[text_start:text_end]).strip()
+        if not text or text == "[no transcription returned]":
+            continue
+        marker = match.group(1)
+        start_seconds = 0.0 if marker == "start" else float(marker[1:-1])
+        end_seconds = None
+        if index + 1 < len(matches):
+            next_marker = matches[index + 1].group(1)
+            end_seconds = 0.0 if next_marker == "start" else float(next_marker[1:-1])
+        windows.append(
+            {
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+                "text": text,
+            }
+        )
+    if windows:
+        return windows
+
+    for segment in _json_list(_row_optional_text(row, "recorder_segments_json")):
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("snippet") or segment.get("text") or "").strip()
+        if not text:
+            continue
+        windows.append(
+            {
+                "start_seconds": segment.get("start_seconds"),
+                "end_seconds": segment.get("end_seconds"),
+                "text": text,
+            }
+        )
+    return windows
 
 
 def _testimony_transcript_job_status(app: Flask) -> dict:
@@ -3681,10 +3814,10 @@ def _run_testimony_transcript_job(
                 candidate = target["candidate"]
                 processed_ids.add(str(row["recording_id"]))
                 _update_testimony_transcript_job(app, current=Path(candidate.path).name)
-                transcript_text = _display_transcript_text(_row_optional_text(row, "transcript_text"))
-                reused_transcript = bool(transcript_text)
+                transcript_text = _row_optional_text(row, "transcript_text")
+                reused_transcript = bool(_display_transcript_text(transcript_text))
                 transcript_error = ""
-                if transcript_text:
+                if reused_transcript:
                     saved += 1
                 else:
                     try:
@@ -3719,8 +3852,12 @@ def _run_testimony_transcript_job(
                     str(row["suggested_speaker"] or ""),
                     known_speakers,
                 )
-                if transcript_text and not str(row["speaker_name"] or ""):
-                    transcript_speaker = _valid_person_name_suggestion(_extract_intro_speaker(transcript_text, known_speakers), known_speakers)
+                display_transcript_text = _display_transcript_text(transcript_text)
+                if display_transcript_text and not str(row["speaker_name"] or ""):
+                    transcript_speaker = _valid_person_name_suggestion(
+                        _extract_intro_speaker(display_transcript_text, known_speakers),
+                        known_speakers,
+                    )
                 completed_without_agent = (
                     not agent_decision
                     and bool(transcript_text)
@@ -3734,6 +3871,17 @@ def _run_testimony_transcript_job(
                     decision_kind = str((agent_decision or {}).get("recording_kind") or "")
                     decision_action = str((agent_decision or {}).get("action") or "")
                     decision_reason = str((agent_decision or {}).get("reason") or "")
+                    completed_path_kind = _filed_recording_kind(app, Path(candidate.path))
+                    if (
+                        str(row["status"] or "") in {"identified", "grouped", "already_named"}
+                        and completed_path_kind in RECORDER_REVIEW_FINAL_KINDS
+                    ):
+                        decision_kind = completed_path_kind
+                        decision_action = _row_optional_text(row, "recorder_agent_action") or "file"
+                        decision_reason = (
+                            f"{RECORDER_REVIEW_ANALYSIS_VERSION}: "
+                            "Retained the completed classification from the recording's filed location."
+                        )
                     if completed_without_agent:
                         decision_kind = decision_kind or _row_optional_text(row, "recorder_agent_kind") or "testimony"
                         decision_action = decision_action or _row_optional_text(row, "recorder_agent_action") or "review"
@@ -3754,7 +3902,7 @@ def _run_testimony_transcript_job(
                         duration_seconds=_row_duration(row),
                         suggested_speaker=decision_speaker or transcript_speaker or existing_suggestion,
                         suggestion_source="recorder_agent" if decision_speaker else "transcript_excerpt",
-                        suggestion_text=_compact_transcript_excerpt(transcript_text),
+                        suggestion_text=_compact_transcript_excerpt(display_transcript_text),
                         recorder_agent_kind=decision_kind or None,
                         recorder_agent_action=decision_action or None,
                         recorder_agent_reason=decision_reason or None,
@@ -3863,6 +4011,8 @@ def _recorder_agent_kind_label(kind: str) -> str:
         "noise": "Noise / Snippet",
         "noise_or_snippet": "Noise / Snippet",
         "snippet": "Noise / Snippet",
+        "combined": "Combined Recording",
+        "combined_candidate": "Combined Recording",
         "unknown": "Needs Review",
         "unsure": "Needs Review",
     }
@@ -3878,8 +4028,7 @@ def _recorder_agent_reason_label(reason: str) -> str:
     raw = re.sub(r"\s+", " ", str(reason or "")).strip()
     if not raw:
         return ""
-    if raw.startswith(f"{RECORDER_REVIEW_ANALYSIS_VERSION}:"):
-        raw = raw.split(":", 1)[1].strip()
+    raw = re.sub(r"^recorder-review(?:-v\d+)?:\s*", "", raw, flags=re.IGNORECASE)
     normalized = raw.rstrip(".").lower()
     labels = {
         "applied recorder decision rules": "",
@@ -4541,7 +4690,7 @@ def _rename_testimony_recording(
     testimony_root = _testimony_recording_root(app)
     allowed_source_roots = _unique_paths([*_testimony_allowed_roots(app), _message_recording_root(app)])
     if not any(_path_within(source_path, root) for root in allowed_source_roots):
-        return candidate, str(proposed_path), "Source file is outside the testimony recording folder."
+        return candidate, str(proposed_path), "Source file is outside the configured recording libraries."
     if not _path_within(proposed_path, testimony_root):
         return candidate, str(proposed_path), "Proposed testimony filename is outside TestimonyRecordings."
     try:
@@ -4561,6 +4710,37 @@ def _rename_testimony_recording(
     if not renamed:
         return candidate, str(target_path), "File was renamed but could not be reloaded."
     return renamed, str(target_path), ""
+
+
+def _move_recorder_review_recording(
+    app: Flask,
+    candidate: RecordingCandidate,
+    *,
+    proposed_path: Path,
+    destination_root: Path,
+) -> tuple[RecordingCandidate, str, str]:
+    source_path = Path(candidate.path)
+    if not any(_path_within(source_path, root) for root in _testimony_allowed_roots(app)):
+        return candidate, str(proposed_path), "Source file is outside the configured recording libraries."
+    if not _path_within(proposed_path, destination_root):
+        return candidate, str(proposed_path), "Proposed filename is outside the selected recording library."
+    try:
+        resolved_source = source_path.resolve()
+        resolved_target = proposed_path.resolve()
+    except FileNotFoundError:
+        return candidate, str(proposed_path), "Source file was not found."
+    if resolved_source == resolved_target:
+        return candidate, str(proposed_path), ""
+    try:
+        proposed_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path = _unique_destination_path(proposed_path)
+        _write_final_testimony_audio(source_path, target_path)
+    except OSError as exc:
+        return candidate, str(proposed_path), f"File move failed: {exc}"
+    moved = _testimony_source_candidate_from_path(app, target_path)
+    if not moved:
+        return candidate, str(target_path), "File was moved but could not be reloaded."
+    return moved, str(target_path), ""
 
 
 def _probe_missing_testimony_durations(app: Flask, limit: int) -> tuple[int, int]:
@@ -5159,6 +5339,81 @@ def _proposed_testimony_path(
     return str(_testimony_recording_root(app) / year / "Sunday Testimonies" / filename)
 
 
+def _proposed_message_path(
+    app: Flask,
+    source_path: Path,
+    service_date: str,
+    speaker_name: str,
+    message_title: str,
+) -> Path:
+    normalized_date = _normalize_date(service_date or "")
+    if not normalized_date:
+        raise ValueError("Confirm the service date before filing a message.")
+    service_day = datetime.strptime(normalized_date, "%Y-%m-%d")
+    date_prefix = _format_date(normalized_date)
+    month_name = service_day.strftime("%B")
+    if service_day.weekday() == 6:
+        folder = _message_recording_root(app) / str(service_day.year) / "Sunday Messages" / month_name
+    elif service_day.weekday() == 2:
+        folder = _message_recording_root(app) / str(service_day.year) / "Wednesday Messages" / month_name
+    else:
+        folder = (
+            _message_recording_root(app)
+            / str(service_day.year)
+            / "Special Meetings"
+            / f"{date_prefix} - Special Meeting"
+        )
+    filename = _sanitize_filename_part(
+        f"{date_prefix} - {message_title.strip()} - {speaker_name.strip()}"
+    ) + _testimony_final_suffix(source_path)
+    return folder / filename
+
+
+def _recorder_source_time_label(candidate: RecordingCandidate) -> str:
+    match = re.match(r"^\d{8}(?P<hour>\d{2})(?P<minute>\d{2})\d{2}", Path(candidate.path).stem)
+    if match:
+        return f"{match.group('hour')}{match.group('minute')}"
+    try:
+        modified = datetime.fromisoformat(str(candidate.modified_at or "").replace("Z", "+00:00"))
+        if modified.tzinfo is None:
+            modified = modified.replace(tzinfo=timezone.utc)
+        return modified.astimezone(_recording_local_timezone()).strftime("%H%M")
+    except ValueError:
+        return "Recording"
+
+
+def _proposed_worship_path(
+    app: Flask,
+    candidate: RecordingCandidate,
+    service_date: str,
+) -> Path:
+    normalized_date = _normalize_date(service_date or "")
+    if not normalized_date:
+        raise ValueError("Confirm the service date before filing worship audio.")
+    service_day = datetime.strptime(normalized_date, "%Y-%m-%d")
+    date_prefix = _format_date(normalized_date)
+    month_name = service_day.strftime("%B")
+    if service_day.weekday() == 6:
+        service_name = "Sunday Service"
+    elif service_day.weekday() == 2:
+        service_name = "Wednesday Bible Study"
+    elif service_day.weekday() == 5:
+        service_name = "Saturday Night Practice"
+    else:
+        service_name = "Service"
+    folder = (
+        _worship_recording_root(app)
+        / str(service_day.year)
+        / month_name
+        / f"{date_prefix} - {service_name}"
+        / "LR"
+    )
+    filename = _sanitize_filename_part(
+        f"{date_prefix} - NTCWorship{_recorder_source_time_label(candidate)} - LR"
+    ) + _testimony_final_suffix(Path(candidate.path))
+    return folder / filename
+
+
 def _testimony_event_folder(service_date: str) -> tuple[str, str] | None:
     normalized_date = _normalize_date(service_date or "")
     if not normalized_date:
@@ -5201,6 +5456,10 @@ def _normalize_recording_kind(value: str) -> str:
         return "worship"
     if normalized in {"message", "messagerecording", "sermon", "teaching"}:
         return "message"
+    if normalized in {"combined", "combinedrecording", "mixed", "multisection"}:
+        return "combined"
+    if normalized in {"noise", "snippet", "noiseorsnippet"}:
+        return "noise"
     return "unsure"
 
 
@@ -5215,11 +5474,24 @@ def _recording_kind_for_path(path: Path) -> str:
     return "unsure"
 
 
+def _filed_recording_kind(app: Flask, path: Path) -> str:
+    if any(_path_within(path, root) for root in _testimony_source_roots(app)):
+        return "unsure"
+    roots = (
+        ("testimony", _testimony_recording_root(app)),
+        ("message", _message_recording_root(app)),
+        ("worship", _worship_recording_root(app)),
+    )
+    return next((kind for kind, root in roots if _path_within(path, root)), "unsure")
+
+
 def _recording_kind_label(kind: str) -> str:
     labels = {
         "message": "Message",
         "worship": "Worship",
         "testimony": "Testimony",
+        "combined": "Combined",
+        "noise": "Noise / Snippet",
         "unsure": "Recording",
     }
     return labels.get(kind, "Recording")
@@ -8123,7 +8395,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         <div class="panel-head">
           <div>
             <h2>{{ status_label(status_filter) }}</h2>
-            <p class="muted">Listen, confirm the service date, then choose Testimony or Message and complete any needed details.</p>
+            <p class="muted">Listen, confirm the service date, then choose Testimony, Message, Worship, or Combined and complete any needed details.</p>
           </div>
           <form class="probe-form" method="get" action="{{ recordings_url_for('testimony_review') }}">
             <input type="hidden" name="status" value="{{ status_filter }}">
@@ -8322,9 +8594,11 @@ TESTIMONY_REVIEW_TEMPLATE = """
                     <label class="classification-field">
                       <span>Recording Type</span>
                       <select name="recording_kind">
-                        <option value="" {% if item.review_recording_kind not in ["testimony", "message"] %}selected{% endif %}>Choose type</option>
+                        <option value="" {% if item.review_recording_kind not in ["testimony", "message", "worship", "combined"] %}selected{% endif %}>Choose type</option>
                         <option value="testimony" {% if item.review_recording_kind == "testimony" %}selected{% endif %}>Testimony</option>
                         <option value="message" {% if item.review_recording_kind == "message" %}selected{% endif %}>Message</option>
+                        <option value="worship" {% if item.review_recording_kind == "worship" %}selected{% endif %}>Worship</option>
+                        <option value="combined" {% if item.review_recording_kind == "combined" %}selected{% endif %}>Combined - Needs Splitting</option>
                       </select>
                     </label>
                     <div class="button-row">
@@ -8551,7 +8825,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         setInputValue(card, "review_revision", data.review_revision);
         const recordingKind = card.querySelector('select[name="recording_kind"]');
         if (recordingKind) {
-          recordingKind.value = ["testimony", "message"].includes(data.recording_kind || "")
+          recordingKind.value = ["testimony", "message", "worship", "combined"].includes(data.recording_kind || "")
             ? data.recording_kind
             : "";
         }
