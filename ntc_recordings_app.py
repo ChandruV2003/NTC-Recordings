@@ -392,6 +392,14 @@ def create_app(test_config: dict | None = None) -> Flask:
         NTC_RECORDINGS_ADMIN_PASSWORD=os.getenv("NTC_RECORDINGS_ADMIN_PASSWORD", ""),
         NTC_ADMIN_PASSWORD=os.getenv("NTC_ADMIN_PASSWORD", ""),
         NTC_ADMIN_SESSION_HOURS=float(os.getenv("NTC_ADMIN_SESSION_HOURS", "8")),
+        NTC_RECORDINGS_DEFAULT_REVIEWER_NAME=os.getenv(
+            "NTC_RECORDINGS_DEFAULT_REVIEWER_NAME",
+            "Recordings Admin",
+        ),
+        NTC_RECORDINGS_SERVICE_LEDGER_START_DATE=os.getenv(
+            "NTC_RECORDINGS_SERVICE_LEDGER_START_DATE",
+            "2026-06-17",
+        ),
         NTC_RECORDINGS_LOGO_URL=os.getenv(
             "NTC_RECORDINGS_LOGO_URL",
             "https://drive.google.com/uc?id=1QiyDf3SW6jHcctra1qr5DKXlLn2_GCE0",
@@ -457,12 +465,14 @@ def create_app(test_config: dict | None = None) -> Flask:
         except (TypeError, ValueError):
             session.pop("recordings_admin", None)
             session.pop("recordings_admin_authenticated_at", None)
+            session.pop("recordings_admin_reviewer", None)
             session.modified = True
             return False
         timeout = timedelta(hours=max(1, float(app.config.get("NTC_ADMIN_SESSION_HOURS") or 8)))
         if datetime.now(timezone.utc) - authenticated > timeout:
             session.pop("recordings_admin", None)
             session.pop("recordings_admin_authenticated_at", None)
+            session.pop("recordings_admin_reviewer", None)
             session.modified = True
             return False
         return True
@@ -479,12 +489,27 @@ def create_app(test_config: dict | None = None) -> Flask:
         try:
             recordings = _get_recordings(app)
             counts_by_kind = _recording_counts_by_kind(recordings)
+            service_rows = _service_completeness_rows(app, recordings)
             _connect(app.config["NTC_RECORDINGS_DB_PATH"]).close()
             return jsonify(
                 {
                     "ok": True,
                     "recording_count": len(recordings),
                     "recording_counts_by_kind": counts_by_kind,
+                    "service_completeness": {
+                        "expected_count": len(service_rows),
+                        "complete_count": sum(
+                            row["status"] == "complete" for row in service_rows
+                        ),
+                        "exception_count": sum(
+                            row["status"] == "exception" for row in service_rows
+                        ),
+                        "missing_dates": [
+                            row["service_date"]
+                            for row in service_rows
+                            if row["status"] == "missing"
+                        ],
+                    },
                     "timestamp": _utc_now(),
                 }
             )
@@ -543,18 +568,25 @@ def create_app(test_config: dict | None = None) -> Flask:
                     RECORDING_ADMIN_LOGIN_TEMPLATE,
                     title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
                     error="Admin access is not configured.",
+                    reviewer_name=request.form.get("reviewer_name", ""),
                 )
             password = request.form.get("password", "")
             if hmac.compare_digest(password, expected):
+                reviewer_name = _clean_reviewer_name(
+                    request.form.get("reviewer_name")
+                    or app.config.get("NTC_RECORDINGS_DEFAULT_REVIEWER_NAME")
+                )
                 session.permanent = True
                 session["recordings_admin"] = True
                 session["recordings_admin_authenticated_at"] = datetime.now(timezone.utc).isoformat()
+                session["recordings_admin_reviewer"] = reviewer_name
                 session.modified = True
                 return _redirect_to(app, "admin_panel")
             return render_template_string(
                 RECORDING_ADMIN_LOGIN_TEMPLATE,
                 title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
                 error="Password was not accepted.",
+                reviewer_name=request.form.get("reviewer_name", ""),
             )
         if _is_admin():
             return _redirect_to(app, "admin_panel")
@@ -562,12 +594,14 @@ def create_app(test_config: dict | None = None) -> Flask:
             RECORDING_ADMIN_LOGIN_TEMPLATE,
             title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
             error=request.args.get("error"),
+            reviewer_name=app.config.get("NTC_RECORDINGS_DEFAULT_REVIEWER_NAME", ""),
         )
 
     @app.post("/admin/logout")
     def admin_logout():
         session.pop("recordings_admin", None)
         session.pop("recordings_admin_authenticated_at", None)
+        session.pop("recordings_admin_reviewer", None)
         session.modified = True
         return _redirect_to(app, "public_form")
 
@@ -638,6 +672,74 @@ def create_app(test_config: dict | None = None) -> Flask:
             status_label=_status_label,
             format_date=_format_date,
             format_datetime=_format_datetime,
+        )
+
+    @app.get("/admin/service-completeness")
+    def service_completeness():
+        guard = _require_admin()
+        if guard:
+            return guard
+        rows = _service_completeness_rows(app, _get_recordings(app))
+        counts = {
+            status: sum(1 for row in rows if row["status"] == status)
+            for status in ("missing", "complete", "exception")
+        }
+        return render_template_string(
+            SERVICE_COMPLETENESS_TEMPLATE,
+            title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
+            rows=rows,
+            counts=counts,
+            reviewer_name=_current_reviewer(app),
+            message=request.args.get("message"),
+            error=request.args.get("error"),
+            format_date=_format_date,
+            format_datetime=_format_datetime,
+        )
+
+    @app.post("/admin/service-completeness/<service_date>")
+    def update_service_completeness(service_date: str):
+        guard = _require_admin()
+        if guard:
+            return guard
+        normalized_date = _normalize_date(service_date)
+        expected = {
+            row["service_date"]: row
+            for row in _expected_service_dates(app)
+        }
+        if not normalized_date or normalized_date not in expected:
+            return _redirect_to(
+                app,
+                "service_completeness",
+                error="Choose an expected Sunday or Wednesday service date.",
+            )
+        action = (request.form.get("action") or "").strip().lower()
+        if action == "clear_exception":
+            _clear_service_exception(app, normalized_date)
+            return _redirect_to(
+                app,
+                "service_completeness",
+                message=f"Cleared the exception for {_format_date(normalized_date)}.",
+            )
+        exception_type = (request.form.get("exception_type") or "").strip().lower()
+        if exception_type not in {"convention", "no_service"}:
+            return _redirect_to(
+                app,
+                "service_completeness",
+                error="Choose Convention or No Service.",
+            )
+        _save_service_exception(
+            app,
+            service_date=normalized_date,
+            service_kind=expected[normalized_date]["service_kind"],
+            exception_type=exception_type,
+            exception_note=(request.form.get("exception_note") or "").strip(),
+            reviewed_by=_current_reviewer(app),
+            review_source="service_completeness_ui",
+        )
+        return _redirect_to(
+            app,
+            "service_completeness",
+            message=f"Saved the exception for {_format_date(normalized_date)}.",
         )
 
     @app.get("/admin/testimonies")
@@ -1230,12 +1332,27 @@ def create_app(test_config: dict | None = None) -> Flask:
             recorder_agent_reason="Classification confirmed in Recorder Review." if recording_kind else None,
         )
         reviewed_at = _utc_now()
-        _set_testimony_review_revision(app, recording_id, review_revision, reviewed_at)
+        reviewer_name = _current_reviewer(app)
+        review_source = "recorder_review_ui"
+        review_completed = not bool(review_error)
+        _set_testimony_review_revision(
+            app,
+            recording_id,
+            review_revision,
+            reviewed_at,
+            reviewed_by=reviewer_name,
+            review_source=review_source,
+            completed=review_completed,
+        )
         _record_testimony_review_history(
             app,
             recording_id=recording_id,
             previous_recording_id=original_recording_id if recording_id != original_recording_id else "",
-            action=requested_action or requested_status or status,
+            action=(
+                "save_review_failed"
+                if review_error
+                else requested_action or requested_status or status
+            ),
             previous_status=previous_status,
             new_status=status,
             service_date=service_date,
@@ -1243,6 +1360,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             recording_kind=recording_kind,
             source_path=str(existing["source_path"] or candidate.path) if existing else candidate.path,
             target_path=proposed_path or candidate.path,
+            reviewed_by=reviewer_name,
+            review_source=review_source,
+            reviewed_at=reviewed_at,
         )
         if transcript_text or transcript_source or transcript_error:
             _save_testimony_transcript(
@@ -1291,6 +1411,9 @@ def create_app(test_config: dict | None = None) -> Flask:
                     "recording_kind": recording_kind,
                     "recording_kind_label": _recorder_agent_kind_label(recording_kind),
                     "review_revision": review_revision,
+                    "reviewed_by": reviewer_name if review_completed else _row_optional_text(existing, "reviewed_by"),
+                    "reviewed_at": reviewed_at if review_completed else _row_optional_text(existing, "reviewed_at"),
+                    "review_source": review_source if review_completed else _row_optional_text(existing, "review_source"),
                     "audio_url": _recordings_url_for(app, "testimony_audio", recording_id=recording_id),
                     "review_url": _recordings_url_for(app, "update_testimony_review", recording_id=recording_id),
                 }
@@ -1560,6 +1683,8 @@ def _init_db(db_path: str) -> None:
         _ensure_column(connection, "testimony_reviews", "recorder_segment_updated_at", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(connection, "testimony_reviews", "review_revision", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(connection, "testimony_reviews", "reviewed_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "reviewed_by", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "testimony_reviews", "review_source", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS recorder_review_history (
@@ -1578,9 +1703,27 @@ def _init_db(db_path: str) -> None:
             )
             """
         )
+        _ensure_column(connection, "recorder_review_history", "reviewed_by", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "recorder_review_history", "review_source", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(connection, "recorder_review_history", "reviewed_at", "TEXT NOT NULL DEFAULT ''")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_recorder_review_history_recording "
             "ON recorder_review_history(recording_id, created_at)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS service_completeness (
+                service_date TEXT PRIMARY KEY,
+                service_kind TEXT NOT NULL,
+                exception_type TEXT NOT NULL DEFAULT '',
+                exception_note TEXT NOT NULL DEFAULT '',
+                reviewed_by TEXT NOT NULL DEFAULT '',
+                review_source TEXT NOT NULL DEFAULT '',
+                reviewed_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
         )
         connection.execute(
             """
@@ -1674,6 +1817,187 @@ def _sqlite_table_exists(connection: sqlite3.Connection, table_name: str) -> boo
             (table_name,),
         ).fetchone()
     )
+
+
+def _clean_reviewer_name(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())[:120] or "Recordings Admin"
+
+
+def _current_reviewer(app: Flask) -> str:
+    reviewer_name = session.get("recordings_admin_reviewer") if has_request_context() else ""
+    return _clean_reviewer_name(
+        reviewer_name or app.config.get("NTC_RECORDINGS_DEFAULT_REVIEWER_NAME")
+    )
+
+
+def _expected_service_dates(app: Flask, *, through_date: date | None = None) -> list[dict]:
+    start_text = _normalize_date(
+        str(app.config.get("NTC_RECORDINGS_SERVICE_LEDGER_START_DATE") or "")
+    )
+    if not start_text:
+        return []
+    start_date = date.fromisoformat(start_text)
+    final_date = through_date or (
+        datetime.now(_recording_local_timezone()).date() - timedelta(days=1)
+    )
+    if final_date < start_date:
+        return []
+    rows = []
+    current = start_date
+    while current <= final_date:
+        if current.weekday() == 2:
+            rows.append(
+                {
+                    "service_date": current.isoformat(),
+                    "service_kind": "wednesday",
+                    "service_kind_label": "Wednesday Bible Study",
+                }
+            )
+        elif current.weekday() == 6:
+            rows.append(
+                {
+                    "service_date": current.isoformat(),
+                    "service_kind": "sunday",
+                    "service_kind_label": "Sunday Service",
+                }
+            )
+        current += timedelta(days=1)
+    return rows
+
+
+def _service_completeness_rows(
+    app: Flask,
+    recordings: list[RecordingCandidate],
+    *,
+    through_date: date | None = None,
+) -> list[dict]:
+    messages_by_date: dict[str, list[RecordingCandidate]] = {}
+    for recording in recordings:
+        if recording.kind != "message" or not recording.recording_date:
+            continue
+        messages_by_date.setdefault(recording.recording_date, []).append(recording)
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        exceptions = {
+            str(row["service_date"]): row
+            for row in connection.execute(
+                """
+                SELECT service_date,
+                       service_kind,
+                       exception_type,
+                       exception_note,
+                       reviewed_by,
+                       review_source,
+                       reviewed_at,
+                       updated_at
+                FROM service_completeness
+                WHERE exception_type <> ''
+                """
+            ).fetchall()
+        }
+    rows = []
+    for expected in _expected_service_dates(app, through_date=through_date):
+        service_date = expected["service_date"]
+        exception = exceptions.get(service_date)
+        messages = sorted(
+            messages_by_date.get(service_date, []),
+            key=lambda recording: recording.title,
+        )
+        status = "exception" if exception else ("complete" if messages else "missing")
+        rows.append(
+            {
+                **expected,
+                "status": status,
+                "status_label": status.title(),
+                "message_count": len(messages),
+                "message_titles": [recording.title for recording in messages],
+                "exception_type": (
+                    str(exception["exception_type"] or "") if exception else ""
+                ),
+                "exception_label": (
+                    _service_exception_label(exception["exception_type"])
+                    if exception
+                    else ""
+                ),
+                "exception_note": (
+                    str(exception["exception_note"] or "") if exception else ""
+                ),
+                "reviewed_by": (
+                    str(exception["reviewed_by"] or "") if exception else ""
+                ),
+                "review_source": (
+                    str(exception["review_source"] or "") if exception else ""
+                ),
+                "reviewed_at": (
+                    str(exception["reviewed_at"] or "") if exception else ""
+                ),
+            }
+        )
+    rows.sort(key=lambda row: row["service_date"], reverse=True)
+    return rows
+
+
+def _service_exception_label(value: object) -> str:
+    return {
+        "convention": "Convention",
+        "no_service": "No Service",
+    }.get(str(value or "").strip().lower(), "Exception")
+
+
+def _save_service_exception(
+    app: Flask,
+    *,
+    service_date: str,
+    service_kind: str,
+    exception_type: str,
+    exception_note: str,
+    reviewed_by: str,
+    review_source: str,
+) -> None:
+    now = _utc_now()
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute(
+            """
+            INSERT INTO service_completeness (
+                service_date,
+                service_kind,
+                exception_type,
+                exception_note,
+                reviewed_by,
+                review_source,
+                reviewed_at,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(service_date) DO UPDATE SET
+                service_kind = excluded.service_kind,
+                exception_type = excluded.exception_type,
+                exception_note = excluded.exception_note,
+                reviewed_by = excluded.reviewed_by,
+                review_source = excluded.review_source,
+                reviewed_at = excluded.reviewed_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                service_date,
+                service_kind,
+                exception_type,
+                exception_note,
+                _clean_reviewer_name(reviewed_by),
+                review_source,
+                now,
+                now,
+                now,
+            ),
+        )
+
+
+def _clear_service_exception(app: Flask, service_date: str) -> None:
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        connection.execute(
+            "DELETE FROM service_completeness WHERE service_date = ?",
+            (service_date,),
+        )
 
 
 def _insert_request(
@@ -3083,6 +3407,9 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
     transcript_source = _row_optional_text(row, "transcript_source")
     transcript_error = _friendly_transcription_error(_row_optional_text(row, "transcript_error"))
     transcript_updated_at = _row_optional_text(row, "transcript_updated_at")
+    reviewed_by = _row_optional_text(row, "reviewed_by")
+    review_source = _row_optional_text(row, "review_source")
+    reviewed_at = _row_optional_text(row, "reviewed_at")
     quarantined_from_path = _row_optional_text(row, "quarantined_from_path")
     quarantined_path = _row_optional_text(row, "quarantined_path")
     quarantined_at = _row_optional_text(row, "quarantined_at")
@@ -3177,6 +3504,11 @@ def _testimony_review_item(app: Flask, candidate: RecordingCandidate, row: sqlit
         "transcript_error": transcript_error,
         "transcript_updated_at": transcript_updated_at,
         "transcript_updated_label": _format_datetime(transcript_updated_at),
+        "reviewed_by": reviewed_by,
+        "reviewed_by_label": reviewed_by or ("Legacy review" if reviewed_at else ""),
+        "review_source": review_source,
+        "reviewed_at": reviewed_at,
+        "reviewed_at_label": _format_datetime(reviewed_at),
         "quarantined": bool(quarantined_path or quarantined_at),
         "quarantined_from_path": quarantined_from_path,
         "quarantined_path": quarantined_path,
@@ -4406,7 +4738,7 @@ def _claim_testimony_review_revision(
     recording_id: str,
     expected_revision: int | None,
 ) -> tuple[int, str, bool]:
-    reviewed_at = _utc_now()
+    claimed_at = _utc_now()
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         row = connection.execute(
             "SELECT review_revision, status FROM testimony_reviews WHERE recording_id = ?",
@@ -4421,12 +4753,11 @@ def _claim_testimony_review_revision(
                 """
                 UPDATE testimony_reviews
                 SET review_revision = review_revision + 1,
-                    reviewed_at = ?,
                     updated_at = ?
                 WHERE recording_id = ?
                   AND review_revision = ?
                 """,
-                (reviewed_at, reviewed_at, recording_id, current_revision),
+                (claimed_at, recording_id, current_revision),
             )
             if cursor.rowcount != 1:
                 refreshed = connection.execute(
@@ -4441,18 +4772,47 @@ def _claim_testimony_review_revision(
         return current_revision + 1, previous_status, True
 
 
-def _set_testimony_review_revision(app: Flask, recording_id: str, revision: int, reviewed_at: str) -> None:
+def _set_testimony_review_revision(
+    app: Flask,
+    recording_id: str,
+    revision: int,
+    reviewed_at: str,
+    *,
+    reviewed_by: str,
+    review_source: str,
+    completed: bool,
+) -> None:
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
-        connection.execute(
-            """
-            UPDATE testimony_reviews
-            SET review_revision = ?,
-                reviewed_at = ?,
-                updated_at = ?
-            WHERE recording_id = ?
-            """,
-            (revision, reviewed_at, reviewed_at, recording_id),
-        )
+        if completed:
+            connection.execute(
+                """
+                UPDATE testimony_reviews
+                SET review_revision = ?,
+                    reviewed_at = ?,
+                    reviewed_by = ?,
+                    review_source = ?,
+                    updated_at = ?
+                WHERE recording_id = ?
+                """,
+                (
+                    revision,
+                    reviewed_at,
+                    _clean_reviewer_name(reviewed_by),
+                    review_source,
+                    reviewed_at,
+                    recording_id,
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE testimony_reviews
+                SET review_revision = ?,
+                    updated_at = ?
+                WHERE recording_id = ?
+                """,
+                (revision, reviewed_at, recording_id),
+            )
 
 
 def _record_testimony_review_history(
@@ -4468,7 +4828,11 @@ def _record_testimony_review_history(
     recording_kind: str,
     source_path: str,
     target_path: str,
+    reviewed_by: str = "",
+    review_source: str = "",
+    reviewed_at: str = "",
 ) -> None:
+    history_at = reviewed_at or _utc_now()
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute(
             """
@@ -4483,9 +4847,12 @@ def _record_testimony_review_history(
                 recording_kind,
                 source_path,
                 target_path,
+                reviewed_by,
+                review_source,
+                reviewed_at,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 recording_id,
@@ -4498,7 +4865,10 @@ def _record_testimony_review_history(
                 recording_kind,
                 source_path,
                 target_path,
-                _utc_now(),
+                _clean_reviewer_name(reviewed_by),
+                review_source,
+                history_at,
+                history_at,
             ),
         )
 
@@ -7030,6 +7400,8 @@ RECORDING_ADMIN_LOGIN_TEMPLATE = """
       h1 { margin:0 0 .5rem; font-size:clamp(32px,5vw,52px); line-height:1; letter-spacing:-.05em; }
       p { margin:0 0 1rem; color:var(--muted); }
       form { display:grid; gap:.8rem; }
+      label { display:grid; gap:.35rem; color:var(--muted); font-weight:800; }
+      label span { font-size:.78rem; }
       input, button { border:1px solid var(--line); border-radius:16px; background:var(--surface-2); color:var(--text); padding:.9rem; font:inherit; }
       button { cursor:pointer; font-weight:900; background:rgba(143,211,255,.16); }
       .error { border:1px solid rgba(255,154,154,.35); border-radius:16px; background:var(--bad-soft); color:var(--bad); margin-bottom:1rem; padding:.75rem .85rem; font-weight:800; }
@@ -7042,9 +7414,213 @@ RECORDING_ADMIN_LOGIN_TEMPLATE = """
         <p>Review recording requests and send approved links.</p>
         {% if error %}<div class="error">{{ error }}</div>{% endif %}
         <form method="post">
-          <input type="password" name="password" placeholder="Admin password" autocomplete="current-password" autofocus required>
+          <label>
+            <span>Your name</span>
+            <input type="text" name="reviewer_name" value="{{ reviewer_name }}" placeholder="Reviewer name" autocomplete="name">
+          </label>
+          <label>
+            <span>Admin password</span>
+            <input type="password" name="password" placeholder="Admin password" autocomplete="current-password" autofocus required>
+          </label>
           <button type="submit">Open Panel</button>
         </form>
+      </section>
+    </main>
+  </body>
+</html>
+"""
+
+
+SERVICE_COMPLETENESS_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }} Service Coverage</title>
+    <style>
+      :root {
+        color-scheme:dark;
+        --bg:#07121e;
+        --surface:rgba(10,21,36,.94);
+        --surface-2:rgba(18,34,53,.92);
+        --line:rgba(143,211,255,.2);
+        --line-strong:rgba(143,211,255,.34);
+        --text:#edf7ff;
+        --muted:#9fb2c6;
+        --accent:#8fd3ff;
+        --good:#74ddb4;
+        --warn:#ffc875;
+        --bad:#ffaaa8;
+        --mono:ui-monospace,"SFMono-Regular",Consolas,monospace;
+      }
+      * { box-sizing:border-box; }
+      body {
+        margin:0;
+        min-height:100vh;
+        color:var(--text);
+        background:radial-gradient(circle at 10% 0%,rgba(143,211,255,.18),transparent 28rem),linear-gradient(145deg,#050913,var(--bg));
+        font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      }
+      body::before {
+        content:"";
+        position:fixed;
+        inset:0;
+        z-index:-1;
+        pointer-events:none;
+        background:url("{{ recordings_url_for('ntc_brand_background') }}") center / min(1120px,118vw) auto no-repeat;
+        opacity:.28;
+      }
+      main { width:min(1180px,calc(100vw - 32px)); margin:0 auto; padding:30px 0 44px; }
+      header { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:1rem; align-items:start; margin-bottom:1rem; }
+      h1, h2, p { margin:0; }
+      h1 { margin-top:.35rem; font-size:clamp(34px,5vw,62px); line-height:.95; letter-spacing:-.045em; }
+      h2 { font-size:1rem; }
+      .eyebrow, .label {
+        color:var(--accent);
+        font:800 .68rem var(--mono);
+        letter-spacing:.12em;
+        text-transform:uppercase;
+      }
+      .muted { color:var(--muted); line-height:1.45; }
+      .actions { display:flex; gap:.5rem; flex-wrap:wrap; justify-content:flex-end; }
+      a, button, select, input {
+        border:1px solid var(--line);
+        border-radius:14px;
+        background:var(--surface-2);
+        color:var(--text);
+        padding:.7rem .85rem;
+        text-decoration:none;
+        font:inherit;
+      }
+      a, button { cursor:pointer; font-weight:850; }
+      .metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.75rem; margin:1.15rem 0; }
+      .metric, .coverage-row {
+        border:1px solid var(--line);
+        border-radius:18px;
+        background:var(--surface);
+        box-shadow:0 18px 50px rgba(0,0,0,.24);
+      }
+      .metric { padding:.95rem; }
+      .metric strong { display:block; margin:.2rem 0; font-size:1.75rem; }
+      .metric small { color:var(--muted); }
+      .coverage-list { display:grid; gap:.65rem; }
+      .coverage-row {
+        display:grid;
+        grid-template-columns:minmax(12rem,.75fr) minmax(0,1.25fr) minmax(13rem,.8fr);
+        gap:1rem;
+        align-items:center;
+        padding:.9rem 1rem;
+      }
+      .coverage-row.complete { border-color:rgba(116,221,180,.28); }
+      .coverage-row.exception { border-color:rgba(143,211,255,.32); }
+      .coverage-row.missing { border-color:rgba(255,200,117,.34); }
+      .date strong { display:block; margin-top:.18rem; font-size:1.05rem; }
+      .status {
+        display:inline-flex;
+        width:max-content;
+        border:1px solid currentColor;
+        border-radius:999px;
+        padding:.3rem .52rem;
+        font:800 .65rem var(--mono);
+        letter-spacing:.08em;
+        text-transform:uppercase;
+      }
+      .status.complete { color:var(--good); }
+      .status.exception { color:var(--accent); }
+      .status.missing { color:var(--warn); }
+      .message-list { display:grid; gap:.2rem; margin-top:.35rem; }
+      .message-list span { color:var(--muted); overflow-wrap:anywhere; }
+      .exception-form { display:grid; grid-template-columns:minmax(0,.7fr) minmax(0,1.3fr) auto; gap:.45rem; align-items:center; }
+      .exception-form input, .exception-form select { min-width:0; width:100%; }
+      .exception-form button { white-space:nowrap; }
+      .exception-meta { color:var(--muted); font-size:.8rem; line-height:1.4; }
+      .clear-form { margin-top:.5rem; }
+      .clear-form button { padding:.45rem .65rem; color:var(--muted); background:transparent; }
+      .banner { margin:1rem 0; border:1px solid rgba(116,221,180,.36); border-radius:15px; background:rgba(116,221,180,.1); color:var(--good); padding:.8rem; font-weight:800; }
+      .banner.error { border-color:rgba(255,170,168,.4); background:rgba(255,170,168,.1); color:var(--bad); }
+      @media (max-width:850px) {
+        .coverage-row { grid-template-columns:1fr; }
+        .exception-form { grid-template-columns:1fr; }
+      }
+      @media (max-width:620px) {
+        main { width:min(100vw - 22px,1180px); padding-top:18px; }
+        header { grid-template-columns:minmax(0,1fr) auto; gap:.65rem; }
+        header .actions { width:min(54vw,13rem); display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:.35rem; }
+        header .actions a, header .actions button { width:100%; min-width:0; padding:.52rem .35rem; font-size:.72rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .metrics { grid-template-columns:repeat(3,minmax(0,1fr)); gap:.4rem; }
+        .metric { padding:.68rem .55rem; }
+        .metric strong { font-size:1.35rem; }
+        .metric small { font-size:.68rem; }
+        .coverage-row { padding:.78rem; border-radius:14px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <div class="eyebrow">NTC Newark</div>
+          <h1>Service Coverage</h1>
+          <p class="muted">Regular Sunday and Wednesday messages, with explicit exceptions where no local recording is expected.</p>
+        </div>
+        <div class="actions">
+          <a href="{{ recordings_url_for('admin_panel') }}">Requests</a>
+          <a href="{{ recordings_url_for('testimony_review') }}">Recorder Review</a>
+          <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
+        </div>
+      </header>
+      {% if message %}<div class="banner">{{ message }}</div>{% endif %}
+      {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+      <section class="metrics" aria-label="Service coverage totals">
+        <div class="metric"><span class="label">Missing</span><strong>{{ counts.missing }}</strong><small>Needs investigation</small></div>
+        <div class="metric"><span class="label">Complete</span><strong>{{ counts.complete }}</strong><small>Message present</small></div>
+        <div class="metric"><span class="label">Exceptions</span><strong>{{ counts.exception }}</strong><small>Confirmed by a reviewer</small></div>
+      </section>
+      <section class="coverage-list">
+        {% for row in rows %}
+          <article class="coverage-row {{ row.status }}">
+            <div class="date">
+              <span class="label">{{ row.service_kind_label }}</span>
+              <strong>{{ format_date(row.service_date) }}</strong>
+            </div>
+            <div>
+              <span class="status {{ row.status }}">{{ row.status_label }}</span>
+              {% if row.message_titles %}
+                <div class="message-list">
+                  {% for message_title in row.message_titles %}<span>{{ message_title }}</span>{% endfor %}
+                </div>
+              {% elif row.exception_note %}
+                <div class="message-list"><span>{{ row.exception_note }}</span></div>
+              {% else %}
+                <div class="message-list"><span>No finalized message was found for this service date.</span></div>
+              {% endif %}
+            </div>
+            <div>
+              {% if row.status == "missing" %}
+                <form class="exception-form" method="post" action="{{ recordings_url_for('update_service_completeness', service_date=row.service_date) }}">
+                  <select name="exception_type" aria-label="Exception type">
+                    <option value="convention">Convention</option>
+                    <option value="no_service">No Service</option>
+                  </select>
+                  <input name="exception_note" placeholder="Short reason" aria-label="Exception note">
+                  <button type="submit">Save</button>
+                </form>
+              {% elif row.status == "exception" %}
+                <div class="exception-meta">
+                  {{ row.exception_label }}
+                  {% if row.reviewed_by %}<br>Confirmed by {{ row.reviewed_by }}{% endif %}
+                  {% if row.reviewed_at %}<br>{{ format_datetime(row.reviewed_at) }}{% endif %}
+                </div>
+                <form class="clear-form" method="post" action="{{ recordings_url_for('update_service_completeness', service_date=row.service_date) }}">
+                  <button type="submit" name="action" value="clear_exception">Clear Exception</button>
+                </form>
+              {% else %}
+                <div class="exception-meta">{{ row.message_count }} finalized message{{ "" if row.message_count == 1 else "s" }}</div>
+              {% endif %}
+            </div>
+          </article>
+        {% endfor %}
       </section>
     </main>
   </body>
@@ -7421,6 +7997,7 @@ RECORDING_ADMIN_TEMPLATE = """
         </div>
         <div class="actions">
           <a href="{{ recordings_url_for('testimony_review') }}">Recorder Review</a>
+          <a href="{{ recordings_url_for('service_completeness') }}">Coverage</a>
           <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
           <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
         </div>
@@ -8272,6 +8849,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
         color:var(--muted);
         line-height:1.45;
       }
+      .review-provenance {
+        color:var(--muted);
+        font:.72rem var(--mono);
+        line-height:1.45;
+        text-align:right;
+      }
       .segment-shape-panel {
         border-color:rgba(249,168,212,.28);
         background:rgba(249,168,212,.055);
@@ -8422,6 +9005,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         </div>
         <div class="actions">
           <a href="{{ recordings_url_for('admin_panel') }}">Requests</a>
+          <a href="{{ recordings_url_for('service_completeness') }}">Coverage</a>
           <a href="{{ recordings_url_for('testimony_delivery_rules') }}">Delivery Rules</a>
           <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
           <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
@@ -8692,6 +9276,11 @@ TESTIMONY_REVIEW_TEMPLATE = """
                             <strong>Moved to rejected holding folder</strong>
                             {% if item.quarantined_label %}<small>{{ item.quarantined_label }}</small>{% endif %}
                           </div>
+                        </div>
+                      {% endif %}
+                      {% if item.reviewed_at_label %}
+                        <div class="review-provenance">
+                          Reviewed by {{ item.reviewed_by_label }} on {{ item.reviewed_at_label }}
                         </div>
                       {% endif %}
                     </section>

@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -27,11 +27,13 @@ from ntc_recordings_app import (
     _recording_id,
     _run_testimony_transcript_job,
     _run_testimony_delivery_job,
+    _save_service_exception,
     _save_testimony_delivery_rule,
     _save_testimony_review,
     _sanitize_existing_testimony_transcript_errors,
     _sanitize_existing_testimony_transcripts,
     _sort_testimony_items,
+    _service_completeness_rows,
     _sync_testimony_recorder_manifest_reviews,
     _testimony_filename_speaker_suggestion,
     _testimony_looks_like_message_recording,
@@ -87,7 +89,14 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def _login(self):
-        return self.client.post("/admin/login", data={"password": "admin-password"}, follow_redirects=True)
+        return self.client.post(
+            "/admin/login",
+            data={
+                "reviewer_name": "Chandru Test",
+                "password": "admin-password",
+            },
+            follow_redirects=True,
+        )
 
     def _first_recording_date_from_public_form(self):
         return self._recording_date_options_from_public_form()[0]["date"]
@@ -955,7 +964,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
         with sqlite3.connect(self.db_path) as connection:
             row = connection.execute(
                 """
-                SELECT status, testimony_title, recorder_agent_kind, review_revision
+                SELECT status,
+                       testimony_title,
+                       recorder_agent_kind,
+                       review_revision,
+                       reviewed_by,
+                       review_source,
+                       reviewed_at
                 FROM testimony_reviews
                 WHERE recording_id = ?
                 """,
@@ -963,14 +978,25 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchone()
             history = connection.execute(
                 """
-                SELECT action, previous_status, new_status, recording_kind
+                SELECT action,
+                       previous_status,
+                       new_status,
+                       recording_kind,
+                       reviewed_by,
+                       review_source,
+                       reviewed_at
                 FROM recorder_review_history
                 WHERE recording_id = ?
                 """,
                 (filed_recording_id,),
             ).fetchall()
-        self.assertEqual(row, ("identified", "The Lord Is Faithful", "message", 1))
-        self.assertEqual(history, [("save_review", "needs_review", "identified", "message")])
+        self.assertEqual(row[:6], ("identified", "The Lord Is Faithful", "message", 1, "Chandru Test", "recorder_review_ui"))
+        self.assertTrue(row[6])
+        self.assertEqual(
+            history[0][:6],
+            ("save_review", "needs_review", "identified", "message", "Chandru Test", "recorder_review_ui"),
+        )
+        self.assertTrue(history[0][6])
 
     def test_ntc_recorder_review_files_confirmed_worship_in_worship_library(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -3243,6 +3269,77 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 (rule_id,),
             ).fetchone()[0]
         self.assertEqual(effective_from, "2026-07-28")
+
+    def test_service_coverage_derives_messages_and_tracks_confirmed_exceptions(self):
+        self.app.config["NTC_RECORDINGS_SERVICE_LEDGER_START_DATE"] = "2026-07-01"
+        recordings = [
+            RecordingCandidate(
+                id="message-july-1",
+                path=str(self.root / "July 1, 2026 - Wednesday Message.mp3"),
+                title="July 1, 2026 - Wednesday Message",
+                recording_date="2026-07-01",
+                kind="message",
+                size_bytes=100,
+                modified_at="2026-07-01T20:00:00+00:00",
+                relative_path="July 1, 2026 - Wednesday Message.mp3",
+            ),
+            RecordingCandidate(
+                id="message-july-5",
+                path=str(self.root / "July 5, 2026 - Sunday Message.mp3"),
+                title="July 5, 2026 - Sunday Message",
+                recording_date="2026-07-05",
+                kind="message",
+                size_bytes=100,
+                modified_at="2026-07-05T20:00:00+00:00",
+                relative_path="July 5, 2026 - Sunday Message.mp3",
+            ),
+        ]
+        for service_date in ("2026-07-08", "2026-07-12", "2026-07-15"):
+            _save_service_exception(
+                self.app,
+                service_date=service_date,
+                service_kind="sunday" if service_date == "2026-07-12" else "wednesday",
+                exception_type="convention",
+                exception_note="Church convention; no regular local service was expected.",
+                reviewed_by="Chandru Test",
+                review_source="user_confirmed",
+            )
+
+        rows = _service_completeness_rows(
+            self.app,
+            recordings,
+            through_date=date(2026, 7, 15),
+        )
+
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(
+            {row["service_date"]: row["status"] for row in rows},
+            {
+                "2026-07-01": "complete",
+                "2026-07-05": "complete",
+                "2026-07-08": "exception",
+                "2026-07-12": "exception",
+                "2026-07-15": "exception",
+            },
+        )
+        july_12 = next(row for row in rows if row["service_date"] == "2026-07-12")
+        self.assertEqual(july_12["reviewed_by"], "Chandru Test")
+        self.assertEqual(july_12["review_source"], "user_confirmed")
+
+    def test_service_coverage_page_and_reviewer_login_are_visible(self):
+        login_page = self.client.get("/admin/login")
+        self.assertEqual(login_page.status_code, 200)
+        self.assertIn(b'name="reviewer_name"', login_page.data)
+
+        self._login()
+        coverage = self.client.get("/admin/service-completeness")
+
+        self.assertEqual(coverage.status_code, 200)
+        self.assertIn(b"Service Coverage", coverage.data)
+        self.assertIn(b"Missing", coverage.data)
+        self.assertIn(b"Complete", coverage.data)
+        self.assertIn(b"Exceptions", coverage.data)
+        self.assertIn(b'href="/admin/recorder-review"', coverage.data)
 
 
 if __name__ == "__main__":
