@@ -8634,6 +8634,22 @@ TESTIMONY_REVIEW_TEMPLATE = """
         margin-bottom:.8rem;
       }
       .panel-head p { margin-top:.25rem; }
+      .panel-controls {
+        display:flex;
+        align-items:flex-end;
+        justify-content:flex-end;
+        gap:.55rem;
+        flex-wrap:wrap;
+      }
+      .view-actions {
+        display:flex;
+        align-items:center;
+        gap:.4rem;
+      }
+      .view-actions button {
+        min-height:3.05rem;
+        padding:.68rem .82rem;
+      }
       .review-list { display:grid; gap:.62rem; }
       .review-card {
         border:1px solid rgba(143,211,255,.16);
@@ -8963,7 +8979,18 @@ TESTIMONY_REVIEW_TEMPLATE = """
         header h1 { margin-top:.48rem; font-size:2rem; line-height:1; letter-spacing:0; }
         header .muted { margin-top:.45rem; font-size:.86rem; }
         .panel-head { display:flex; flex-direction:column; align-items:flex-start; }
-        .panel-head > .probe-form {
+        .panel-controls {
+          display:grid;
+          align-items:stretch;
+          width:100%;
+        }
+        .view-actions {
+          display:grid;
+          grid-template-columns:repeat(2,minmax(0,1fr));
+          width:100%;
+        }
+        .view-actions button { width:100%; }
+        .panel-controls > .probe-form {
           display:grid;
           grid-template-columns:minmax(0,1fr) 4.7rem auto;
           align-items:end;
@@ -9010,8 +9037,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         header .eyebrow { font-size:.68rem; letter-spacing:.08em; }
         header .actions { gap:.25rem; }
         header .actions a, header .actions button { padding:.45rem .25rem; font-size:.68rem; }
-        .panel-head > .probe-form { grid-template-columns:minmax(0,1fr) 4.7rem; }
-        .panel-head > .probe-form > button { grid-column:1 / -1; }
+        .panel-controls > .probe-form { grid-template-columns:minmax(0,1fr) 4.7rem; }
+        .panel-controls > .probe-form > button { grid-column:1 / -1; }
       }
     </style>
   </head>
@@ -9099,22 +9126,28 @@ TESTIMONY_REVIEW_TEMPLATE = """
             <h2>{{ status_label(status_filter) }}</h2>
             <p class="muted">Listen, confirm the service date, then choose Testimony, Message, Worship, or Combined and complete any needed details.</p>
           </div>
-          <form class="probe-form" method="get" action="{{ recordings_url_for('testimony_review') }}">
-            <input type="hidden" name="status" value="{{ status_filter }}">
-            <label>
-              <span>Sort</span>
-              <select name="sort">
-                <option value="newest" {% if sort == "newest" %}selected{% endif %}>Newest first</option>
-                <option value="shortest" {% if sort == "shortest" %}selected{% endif %}>Shortest first</option>
-                <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
-              </select>
-            </label>
-            <label>
-              <span>Limit</span>
-              <input name="limit" type="number" min="1" max="500" value="{{ limit }}">
-            </label>
-            <button type="submit">Apply</button>
-          </form>
+          <div class="panel-controls">
+            <div class="view-actions" aria-label="Row display controls">
+              <button class="secondary" type="button" data-expand-all>Expand All</button>
+              <button class="secondary" type="button" data-close-all>Close All</button>
+            </div>
+            <form class="probe-form" method="get" action="{{ recordings_url_for('testimony_review') }}">
+              <input type="hidden" name="status" value="{{ status_filter }}">
+              <label>
+                <span>Sort</span>
+                <select name="sort">
+                  <option value="newest" {% if sort == "newest" %}selected{% endif %}>Newest first</option>
+                  <option value="shortest" {% if sort == "shortest" %}selected{% endif %}>Shortest first</option>
+                  <option value="name" {% if sort == "name" %}selected{% endif %}>Name</option>
+                </select>
+              </label>
+              <label>
+                <span>Limit</span>
+                <input name="limit" type="number" min="1" max="500" value="{{ limit }}">
+              </label>
+              <button type="submit">Apply</button>
+            </form>
+          </div>
         </div>
         {% if not testimony_source_exists %}
           <div class="empty">Recorder source folder is not connected.</div>
@@ -9458,6 +9491,19 @@ TESTIMONY_REVIEW_TEMPLATE = """
         updateBulkToolbar();
       }
 
+      function setAllReviewCardsOpen(isOpen) {
+        if (!reviewList) return;
+        reviewList.querySelectorAll(".review-card").forEach((card) => {
+          card.open = isOpen;
+          if (isOpen) {
+            hydrateReviewAudio(card);
+          } else {
+            pauseCardAudio(card);
+          }
+        });
+        saveOpenCards();
+      }
+
       function setBulkBusy(isBusy) {
         if (!bulkToolbar) return;
         bulkToolbar.setAttribute("aria-busy", isBusy ? "true" : "false");
@@ -9747,6 +9793,14 @@ TESTIMONY_REVIEW_TEMPLATE = """
         }
         if (event.target.closest("[data-bulk-clear]")) {
           clearBulkSelection();
+          return;
+        }
+        if (event.target.closest("[data-expand-all]")) {
+          setAllReviewCardsOpen(true);
+          return;
+        }
+        if (event.target.closest("[data-close-all]")) {
+          setAllReviewCardsOpen(false);
           return;
         }
         const button = event.target.closest(".apply-suggestion");
