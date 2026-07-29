@@ -8595,6 +8595,14 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
       .job-panel strong { color:var(--text); }
       .job-panel span { color:var(--accent); font:800 .68rem var(--mono); letter-spacing:.1em; text-transform:uppercase; }
+      .job-panel-copy {
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:.8rem;
+        flex:1 1 auto;
+        min-width:0;
+      }
       .bulk-toolbar {
         display:flex;
         align-items:center;
@@ -8606,6 +8614,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         background:linear-gradient(135deg,rgba(143,211,255,.1),rgba(116,221,180,.07));
         padding:.78rem .9rem;
       }
+      .bulk-toolbar[hidden] { display:none; }
       .bulk-selection {
         display:flex;
         align-items:center;
@@ -8654,8 +8663,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
         margin-left:auto;
       }
       .view-actions button {
-        min-height:3.05rem;
-        padding:.68rem .82rem;
+        min-height:2.35rem;
+        padding:.42rem .68rem;
+        border-radius:12px;
+        font-size:.82rem;
       }
       .review-list { display:grid; gap:.62rem; }
       .review-card {
@@ -8965,7 +8976,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .toolbar, .review-body { grid-template-columns:1fr; }
         .tabs { width:100%; }
         .toolbar-actions, .probe-form { justify-content:flex-start; }
-        .job-panel { flex-direction:column; align-items:flex-start; }
+        .job-panel { flex-direction:column; align-items:stretch; }
+        .job-panel-copy { width:100%; }
         .bulk-toolbar { flex-wrap:wrap; }
         .bulk-selection { flex:1 1 100%; flex-wrap:wrap; }
         .bulk-actions { justify-content:flex-start; width:100%; }
@@ -8996,7 +9008,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .view-actions {
           display:grid;
           grid-template-columns:repeat(2,minmax(0,1fr));
-          width:min(100%,22rem);
+          width:min(100%,16rem);
+          margin-left:0;
         }
         .view-actions button { width:100%; }
         .panel-controls > .probe-form {
@@ -9108,17 +9121,23 @@ TESTIMONY_REVIEW_TEMPLATE = """
         </div>
       </div>
       <div class="job-panel" data-transcript-job data-status-url="{{ recordings_url_for('testimony_transcript_status') }}" data-state="{{ transcript_job.state }}" {% if transcript_job.state not in ["running", "finished", "failed"] %}hidden{% endif %}>
-        <div>
-          <span>Recorder Analysis</span>
-          <strong data-job-message>{{ transcript_job.message or "Idle." }}</strong>
-          <div data-job-counts>
-            {{ transcript_job.processed }} / {{ transcript_job.total }} processed · {{ transcript_job.saved }} analyzed · {{ transcript_job.errors }} errors
+        <div class="job-panel-copy">
+          <div>
+            <span>Recorder Analysis</span>
+            <strong data-job-message>{{ transcript_job.message or "Idle." }}</strong>
+            <div data-job-counts>
+              {{ transcript_job.processed }} / {{ transcript_job.total }} processed · {{ transcript_job.saved }} analyzed · {{ transcript_job.errors }} errors
+            </div>
           </div>
+          <div data-job-current>{% if transcript_job.current %}Now analyzing {{ transcript_job.current }}{% endif %}</div>
         </div>
-        <div data-job-current>{% if transcript_job.current %}Now analyzing {{ transcript_job.current }}{% endif %}</div>
+        <div class="view-actions" aria-label="Row display controls">
+          <button class="secondary" type="button" data-expand-all>Expand All</button>
+          <button class="secondary" type="button" data-close-all>Close All</button>
+        </div>
       </div>
-      <div class="bulk-toolbar" data-bulk-toolbar>
-        <div class="bulk-selection" data-bulk-selection hidden>
+      <div class="bulk-toolbar" data-bulk-toolbar hidden>
+        <div class="bulk-selection" data-bulk-selection>
           <div class="bulk-summary">
             <span>Selected Rows</span>
             <strong data-bulk-count>0 selected</strong>
@@ -9129,10 +9148,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
             <button class="save" type="button" data-bulk-action="save_review">Save Selected Reviews</button>
             <button class="secondary" type="button" data-bulk-clear>Clear</button>
           </div>
-        </div>
-        <div class="view-actions" aria-label="Row display controls">
-          <button class="secondary" type="button" data-expand-all>Expand All</button>
-          <button class="secondary" type="button" data-close-all>Close All</button>
         </div>
       </div>
       <section class="panel">
@@ -9376,6 +9391,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       const bannerStack = document.querySelector("[data-banner-stack]");
       const reviewList = document.querySelector("[data-review-list]");
       const activeReviewFilter = reviewList ? reviewList.dataset.activeFilter || "needs_review" : "needs_review";
+      const bulkToolbar = document.querySelector("[data-bulk-toolbar]");
       const bulkSelection = document.querySelector("[data-bulk-selection]");
 
       function storedOpenCards() {
@@ -9479,9 +9495,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
 
       function updateBulkToolbar() {
-        if (!bulkSelection) return;
+        if (!bulkToolbar || !bulkSelection) return;
         const selected = selectedReviewCards();
-        bulkSelection.hidden = selected.length === 0;
+        bulkToolbar.hidden = selected.length === 0;
         const count = bulkSelection.querySelector("[data-bulk-count]");
         if (count) {
           count.textContent = `${selected.length} selected`;
