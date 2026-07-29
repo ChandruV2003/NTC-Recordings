@@ -92,7 +92,6 @@ class RecordingRequestPanelTests(unittest.TestCase):
         return self.client.post(
             "/admin/login",
             data={
-                "reviewer_name": "Chandru Test",
                 "password": "admin-password",
             },
             follow_redirects=True,
@@ -990,13 +989,30 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 """,
                 (filed_recording_id,),
             ).fetchall()
-        self.assertEqual(row[:6], ("identified", "The Lord Is Faithful", "message", 1, "Chandru Test", "recorder_review_ui"))
-        self.assertTrue(row[6])
-        self.assertEqual(
-            history[0][:6],
-            ("save_review", "needs_review", "identified", "message", "Chandru Test", "recorder_review_ui"),
-        )
-        self.assertTrue(history[0][6])
+            self.assertEqual(
+                row[:6],
+                (
+                    "identified",
+                    "The Lord Is Faithful",
+                    "message",
+                    1,
+                    "Recordings Admin",
+                    "recorder_review_ui",
+                ),
+            )
+            self.assertTrue(row[6])
+            self.assertEqual(
+                history[0][:6],
+                (
+                    "save_review",
+                    "needs_review",
+                    "identified",
+                    "message",
+                    "Recordings Admin",
+                    "recorder_review_ui",
+                ),
+            )
+            self.assertTrue(history[0][6])
 
     def test_ntc_recorder_review_files_confirmed_worship_in_worship_library(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -3323,23 +3339,25 @@ class RecordingRequestPanelTests(unittest.TestCase):
             },
         )
         july_12 = next(row for row in rows if row["service_date"] == "2026-07-12")
-        self.assertEqual(july_12["reviewed_by"], "Chandru Test")
+        self.assertEqual(july_12["reviewed_by"], "Recordings Admin")
         self.assertEqual(july_12["review_source"], "user_confirmed")
 
-    def test_service_coverage_page_and_reviewer_login_are_visible(self):
+    def test_service_coverage_is_internal_and_login_does_not_identify_reviewers(self):
         login_page = self.client.get("/admin/login")
         self.assertEqual(login_page.status_code, 200)
-        self.assertIn(b'name="reviewer_name"', login_page.data)
+        self.assertNotIn(b'name="reviewer_name"', login_page.data)
 
         self._login()
-        coverage = self.client.get("/admin/service-completeness")
+        coverage = self.client.get("/admin/service-completeness", follow_redirects=False)
 
-        self.assertEqual(coverage.status_code, 200)
-        self.assertIn(b"Service Coverage", coverage.data)
-        self.assertIn(b"Missing", coverage.data)
-        self.assertIn(b"Complete", coverage.data)
-        self.assertIn(b"Exceptions", coverage.data)
-        self.assertIn(b'href="/admin/recorder-review"', coverage.data)
+        self.assertEqual(coverage.status_code, 302)
+        self.assertTrue(coverage.headers["Location"].endswith("/admin/panel"))
+
+        admin_page = self.client.get("/admin/panel")
+        review_page = self.client.get("/admin/recorder-review")
+        self.assertNotIn(b">Coverage<", admin_page.data)
+        self.assertNotIn(b">Coverage<", review_page.data)
+        self.assertNotIn(b"Reviewed by", review_page.data)
 
 
 if __name__ == "__main__":

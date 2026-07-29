@@ -392,10 +392,6 @@ def create_app(test_config: dict | None = None) -> Flask:
         NTC_RECORDINGS_ADMIN_PASSWORD=os.getenv("NTC_RECORDINGS_ADMIN_PASSWORD", ""),
         NTC_ADMIN_PASSWORD=os.getenv("NTC_ADMIN_PASSWORD", ""),
         NTC_ADMIN_SESSION_HOURS=float(os.getenv("NTC_ADMIN_SESSION_HOURS", "8")),
-        NTC_RECORDINGS_DEFAULT_REVIEWER_NAME=os.getenv(
-            "NTC_RECORDINGS_DEFAULT_REVIEWER_NAME",
-            "Recordings Admin",
-        ),
         NTC_RECORDINGS_SERVICE_LEDGER_START_DATE=os.getenv(
             "NTC_RECORDINGS_SERVICE_LEDGER_START_DATE",
             "2026-06-17",
@@ -568,25 +564,18 @@ def create_app(test_config: dict | None = None) -> Flask:
                     RECORDING_ADMIN_LOGIN_TEMPLATE,
                     title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
                     error="Admin access is not configured.",
-                    reviewer_name=request.form.get("reviewer_name", ""),
                 )
             password = request.form.get("password", "")
             if hmac.compare_digest(password, expected):
-                reviewer_name = _clean_reviewer_name(
-                    request.form.get("reviewer_name")
-                    or app.config.get("NTC_RECORDINGS_DEFAULT_REVIEWER_NAME")
-                )
                 session.permanent = True
                 session["recordings_admin"] = True
                 session["recordings_admin_authenticated_at"] = datetime.now(timezone.utc).isoformat()
-                session["recordings_admin_reviewer"] = reviewer_name
                 session.modified = True
                 return _redirect_to(app, "admin_panel")
             return render_template_string(
                 RECORDING_ADMIN_LOGIN_TEMPLATE,
                 title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
                 error="Password was not accepted.",
-                reviewer_name=request.form.get("reviewer_name", ""),
             )
         if _is_admin():
             return _redirect_to(app, "admin_panel")
@@ -594,7 +583,6 @@ def create_app(test_config: dict | None = None) -> Flask:
             RECORDING_ADMIN_LOGIN_TEMPLATE,
             title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
             error=request.args.get("error"),
-            reviewer_name=app.config.get("NTC_RECORDINGS_DEFAULT_REVIEWER_NAME", ""),
         )
 
     @app.post("/admin/logout")
@@ -674,73 +662,13 @@ def create_app(test_config: dict | None = None) -> Flask:
             format_datetime=_format_datetime,
         )
 
-    @app.get("/admin/service-completeness")
-    def service_completeness():
+    @app.route("/admin/service-completeness", methods=["GET", "POST"])
+    @app.route("/admin/service-completeness/<service_date>", methods=["GET", "POST"])
+    def legacy_service_completeness_redirect(service_date: str = ""):
         guard = _require_admin()
         if guard:
             return guard
-        rows = _service_completeness_rows(app, _get_recordings(app))
-        counts = {
-            status: sum(1 for row in rows if row["status"] == status)
-            for status in ("missing", "complete", "exception")
-        }
-        return render_template_string(
-            SERVICE_COMPLETENESS_TEMPLATE,
-            title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
-            rows=rows,
-            counts=counts,
-            reviewer_name=_current_reviewer(app),
-            message=request.args.get("message"),
-            error=request.args.get("error"),
-            format_date=_format_date,
-            format_datetime=_format_datetime,
-        )
-
-    @app.post("/admin/service-completeness/<service_date>")
-    def update_service_completeness(service_date: str):
-        guard = _require_admin()
-        if guard:
-            return guard
-        normalized_date = _normalize_date(service_date)
-        expected = {
-            row["service_date"]: row
-            for row in _expected_service_dates(app)
-        }
-        if not normalized_date or normalized_date not in expected:
-            return _redirect_to(
-                app,
-                "service_completeness",
-                error="Choose an expected Sunday or Wednesday service date.",
-            )
-        action = (request.form.get("action") or "").strip().lower()
-        if action == "clear_exception":
-            _clear_service_exception(app, normalized_date)
-            return _redirect_to(
-                app,
-                "service_completeness",
-                message=f"Cleared the exception for {_format_date(normalized_date)}.",
-            )
-        exception_type = (request.form.get("exception_type") or "").strip().lower()
-        if exception_type not in {"convention", "no_service"}:
-            return _redirect_to(
-                app,
-                "service_completeness",
-                error="Choose Convention or No Service.",
-            )
-        _save_service_exception(
-            app,
-            service_date=normalized_date,
-            service_kind=expected[normalized_date]["service_kind"],
-            exception_type=exception_type,
-            exception_note=(request.form.get("exception_note") or "").strip(),
-            reviewed_by=_current_reviewer(app),
-            review_source="service_completeness_ui",
-        )
-        return _redirect_to(
-            app,
-            "service_completeness",
-            message=f"Saved the exception for {_format_date(normalized_date)}.",
-        )
+        return _redirect_to(app, "admin_panel")
 
     @app.get("/admin/testimonies")
     def legacy_testimony_review_redirect():
@@ -1820,14 +1748,11 @@ def _sqlite_table_exists(connection: sqlite3.Connection, table_name: str) -> boo
 
 
 def _clean_reviewer_name(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "").strip())[:120] or "Recordings Admin"
+    return "Recordings Admin"
 
 
 def _current_reviewer(app: Flask) -> str:
-    reviewer_name = session.get("recordings_admin_reviewer") if has_request_context() else ""
-    return _clean_reviewer_name(
-        reviewer_name or app.config.get("NTC_RECORDINGS_DEFAULT_REVIEWER_NAME")
-    )
+    return "Recordings Admin"
 
 
 def _expected_service_dates(app: Flask, *, through_date: date | None = None) -> list[dict]:
@@ -7415,10 +7340,6 @@ RECORDING_ADMIN_LOGIN_TEMPLATE = """
         {% if error %}<div class="error">{{ error }}</div>{% endif %}
         <form method="post">
           <label>
-            <span>Your name</span>
-            <input type="text" name="reviewer_name" value="{{ reviewer_name }}" placeholder="Reviewer name" autocomplete="name">
-          </label>
-          <label>
             <span>Admin password</span>
             <input type="password" name="password" placeholder="Admin password" autocomplete="current-password" autofocus required>
           </label>
@@ -7997,7 +7918,6 @@ RECORDING_ADMIN_TEMPLATE = """
         </div>
         <div class="actions">
           <a href="{{ recordings_url_for('testimony_review') }}">Recorder Review</a>
-          <a href="{{ recordings_url_for('service_completeness') }}">Coverage</a>
           <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
           <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
         </div>
@@ -9005,7 +8925,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
         </div>
         <div class="actions">
           <a href="{{ recordings_url_for('admin_panel') }}">Requests</a>
-          <a href="{{ recordings_url_for('service_completeness') }}">Coverage</a>
           <a href="{{ recordings_url_for('testimony_delivery_rules') }}">Delivery Rules</a>
           <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
           <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
@@ -9276,11 +9195,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
                             <strong>Moved to rejected holding folder</strong>
                             {% if item.quarantined_label %}<small>{{ item.quarantined_label }}</small>{% endif %}
                           </div>
-                        </div>
-                      {% endif %}
-                      {% if item.reviewed_at_label %}
-                        <div class="review-provenance">
-                          Reviewed by {{ item.reviewed_by_label }} on {{ item.reviewed_at_label }}
                         </div>
                       {% endif %}
                     </section>

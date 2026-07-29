@@ -19,16 +19,13 @@ plain language, and records confirmed corrections. Upstream labels such as
 the destination folder. Ambiguous, combined, or policy-disallowed recordings
 remain in review instead of being filed automatically.
 
-Completed Recorder Review actions also store the reviewer, source, and
-completion time. Failed file moves remain unresolved and do not overwrite the
-last successful review provenance.
+Completed Recorder Review actions store their source and completion time without
+assigning rows to individual reviewers. Failed file moves remain unresolved and
+do not overwrite the last successful review state.
 
-## Service Coverage
-
-The admin Service Coverage screen derives expected regular services from Sunday
-and Wednesday dates and derives completion from finalized message recordings in
-the library. The database stores only explicit exceptions such as Convention or
-No Service, including who confirmed the exception and when.
+Regular Sunday and Wednesday message coverage is checked internally from the
+finalized library. Confirmed Convention and No Service exceptions remain in the
+database, but coverage is not a separate admin workflow.
 
 ## Runtime
 
@@ -36,10 +33,8 @@ No Service, including who confirmed the exception and when.
 - Entry point: `ntc_recordings_panel:app`
 - Runtime database and indexes live under `data/` and are not committed
 - Environment variables use the `NTC_RECORDINGS_*` and `NTC_NEXTCLOUD_*` prefixes
-- `NTC_RECORDINGS_DEFAULT_REVIEWER_NAME` supplies the login form's default
-  reviewer identity.
 - `NTC_RECORDINGS_SERVICE_LEDGER_START_DATE` sets the first date considered by
-  Service Coverage.
+  the internal regular-service coverage check.
 
 ## Local Validation
 
