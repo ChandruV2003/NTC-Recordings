@@ -8216,7 +8216,7 @@ TESTIMONY_DELIVERY_TEMPLATE = """
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ title }} Testimony Delivery</title>
+    <title>{{ title }} Automatic Delivery</title>
     <style>
       :root {
         color-scheme:dark;
@@ -8311,8 +8311,8 @@ TESTIMONY_DELIVERY_TEMPLATE = """
       <header>
         <div>
           <div class="eyebrow">NTC Newark</div>
-          <h1>Testimony Delivery</h1>
-          <p class="muted">Send identified testimonies automatically to configured recipients.</p>
+          <h1>Automatic Delivery</h1>
+          <p class="muted">Automatically email identified testimonies to configured recipients.</p>
         </div>
         <div class="actions">
           <a href="{{ recordings_url_for('testimony_review') }}">Recorder Review</a>
@@ -8324,8 +8324,8 @@ TESTIMONY_DELIVERY_TEMPLATE = """
       <section class="panel">
         <div class="panel-head">
           <div>
-            <div class="meta">Rules</div>
-            <h2>Configured Recipients</h2>
+            <div class="meta">Recipients</div>
+            <h2>Automatic Email Rules</h2>
           </div>
         </div>
         <div class="rule-list">
@@ -8355,8 +8355,8 @@ TESTIMONY_DELIVERY_TEMPLATE = """
       <section class="panel">
         <div class="panel-head">
           <div>
-            <div class="meta">Delivery Log</div>
-            <h2>Recent Testimonies</h2>
+            <div class="meta">Email History</div>
+            <h2>Recent Deliveries</h2>
           </div>
         </div>
         {% if deliveries %}
@@ -8606,7 +8606,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
         background:linear-gradient(135deg,rgba(143,211,255,.1),rgba(116,221,180,.07));
         padding:.78rem .9rem;
       }
-      .bulk-toolbar[hidden] { display:none; }
+      .bulk-selection {
+        display:flex;
+        align-items:center;
+        gap:.8rem;
+        min-width:0;
+      }
+      .bulk-selection[hidden] { display:none; }
       .bulk-summary span {
         display:block;
         color:var(--accent);
@@ -8617,7 +8623,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .bulk-summary strong { display:block; margin-top:.14rem; }
       .bulk-actions { display:flex; justify-content:flex-end; gap:.5rem; flex-wrap:wrap; }
       .bulk-actions button { min-height:2.7rem; padding:.62rem .82rem; }
-      .bulk-toolbar[aria-busy="true"] { opacity:.7; pointer-events:none; }
+      .bulk-selection[aria-busy="true"] { opacity:.7; pointer-events:none; }
       .panel {
         border:1px solid var(--line);
         border-radius:24px;
@@ -8645,6 +8651,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         display:flex;
         align-items:center;
         gap:.4rem;
+        margin-left:auto;
       }
       .view-actions button {
         min-height:3.05rem;
@@ -8958,7 +8965,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .toolbar, .review-body { grid-template-columns:1fr; }
         .tabs { width:100%; }
         .toolbar-actions, .probe-form { justify-content:flex-start; }
-        .job-panel, .bulk-toolbar { flex-direction:column; align-items:flex-start; }
+        .job-panel { flex-direction:column; align-items:flex-start; }
+        .bulk-toolbar { flex-wrap:wrap; }
+        .bulk-selection { flex:1 1 100%; flex-wrap:wrap; }
         .bulk-actions { justify-content:flex-start; width:100%; }
         .review-row { grid-template-columns:2.3rem minmax(0,1fr) minmax(0,1fr); align-items:start; }
         .row-number { align-self:center; }
@@ -8987,7 +8996,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .view-actions {
           display:grid;
           grid-template-columns:repeat(2,minmax(0,1fr));
-          width:100%;
+          width:min(100%,22rem);
         }
         .view-actions button { width:100%; }
         .panel-controls > .probe-form {
@@ -9052,7 +9061,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         </div>
         <div class="actions">
           <a href="{{ recordings_url_for('admin_panel') }}">Requests</a>
-          <a href="{{ recordings_url_for('testimony_delivery_rules') }}">Delivery Rules</a>
+          <a href="{{ recordings_url_for('testimony_delivery_rules') }}">Automatic Delivery</a>
           <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
           <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
         </div>
@@ -9108,16 +9117,22 @@ TESTIMONY_REVIEW_TEMPLATE = """
         </div>
         <div data-job-current>{% if transcript_job.current %}Now analyzing {{ transcript_job.current }}{% endif %}</div>
       </div>
-      <div class="bulk-toolbar" data-bulk-toolbar hidden>
-        <div class="bulk-summary">
-          <span>Selected Rows</span>
-          <strong data-bulk-count>0 selected</strong>
+      <div class="bulk-toolbar" data-bulk-toolbar>
+        <div class="bulk-selection" data-bulk-selection hidden>
+          <div class="bulk-summary">
+            <span>Selected Rows</span>
+            <strong data-bulk-count>0 selected</strong>
+          </div>
+          <div class="bulk-actions">
+            <button class="danger" type="button" data-bulk-action="not_testimony">Discard Selected</button>
+            <button class="secondary" type="button" data-bulk-action="duplicate">Mark Selected Duplicate</button>
+            <button class="save" type="button" data-bulk-action="save_review">Save Selected Reviews</button>
+            <button class="secondary" type="button" data-bulk-clear>Clear</button>
+          </div>
         </div>
-        <div class="bulk-actions">
-          <button class="danger" type="button" data-bulk-action="not_testimony">Discard Selected</button>
-          <button class="secondary" type="button" data-bulk-action="duplicate">Mark Selected Duplicate</button>
-          <button class="save" type="button" data-bulk-action="save_review">Save Selected Reviews</button>
-          <button class="secondary" type="button" data-bulk-clear>Clear</button>
+        <div class="view-actions" aria-label="Row display controls">
+          <button class="secondary" type="button" data-expand-all>Expand All</button>
+          <button class="secondary" type="button" data-close-all>Close All</button>
         </div>
       </div>
       <section class="panel">
@@ -9127,10 +9142,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
             <p class="muted">Listen, confirm the service date, then choose Testimony, Message, Worship, or Combined and complete any needed details.</p>
           </div>
           <div class="panel-controls">
-            <div class="view-actions" aria-label="Row display controls">
-              <button class="secondary" type="button" data-expand-all>Expand All</button>
-              <button class="secondary" type="button" data-close-all>Close All</button>
-            </div>
             <form class="probe-form" method="get" action="{{ recordings_url_for('testimony_review') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
               <label>
@@ -9365,7 +9376,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       const bannerStack = document.querySelector("[data-banner-stack]");
       const reviewList = document.querySelector("[data-review-list]");
       const activeReviewFilter = reviewList ? reviewList.dataset.activeFilter || "needs_review" : "needs_review";
-      const bulkToolbar = document.querySelector("[data-bulk-toolbar]");
+      const bulkSelection = document.querySelector("[data-bulk-selection]");
 
       function storedOpenCards() {
         try {
@@ -9468,10 +9479,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
 
       function updateBulkToolbar() {
-        if (!bulkToolbar) return;
+        if (!bulkSelection) return;
         const selected = selectedReviewCards();
-        bulkToolbar.hidden = selected.length === 0;
-        const count = bulkToolbar.querySelector("[data-bulk-count]");
+        bulkSelection.hidden = selected.length === 0;
+        const count = bulkSelection.querySelector("[data-bulk-count]");
         if (count) {
           count.textContent = `${selected.length} selected`;
         }
@@ -9505,9 +9516,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
 
       function setBulkBusy(isBusy) {
-        if (!bulkToolbar) return;
-        bulkToolbar.setAttribute("aria-busy", isBusy ? "true" : "false");
-        bulkToolbar.querySelectorAll("button").forEach((button) => {
+        if (!bulkSelection) return;
+        bulkSelection.setAttribute("aria-busy", isBusy ? "true" : "false");
+        bulkSelection.querySelectorAll("button").forEach((button) => {
           button.disabled = isBusy;
         });
       }
