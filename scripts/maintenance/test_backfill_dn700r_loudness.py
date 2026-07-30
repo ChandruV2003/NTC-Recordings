@@ -13,6 +13,24 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DN700RLoudnessBackfillTests(unittest.TestCase):
+    def test_completed_hashes_include_skipped_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log_path = Path(temporary) / "audit.jsonl"
+            log_path.write_text(
+                "\n".join(
+                    [
+                        '{"status":"normalized","path":"/one.mp3","output_sha256":"output"}',
+                        '{"status":"skipped","path":"/two.mp3","input_sha256":"input"}',
+                        '{"status":"error","path":"/three.mp3","input_sha256":"error"}',
+                    ]
+                )
+            )
+
+            self.assertEqual(
+                MODULE._completed_hashes(log_path),
+                {"/one.mp3": "output", "/two.mp3": "input"},
+            )
+
     def test_json_object_ignores_ffmpeg_trailer_text(self):
         output = """
         [Parsed_loudnorm_0]

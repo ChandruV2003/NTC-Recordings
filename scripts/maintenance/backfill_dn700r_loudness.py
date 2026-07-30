@@ -7,6 +7,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -22,6 +23,10 @@ DEFAULT_REVIEW_DB = Path("/root/NTC-Runtime/recording-requests.db")
 DEFAULT_STATE_ROOT = Path("/root/NTC-Runtime/audio-normalization")
 DEFAULT_RECORDINGS_ROOT = Path("/mnt/MainRecordings/Recordings")
 SUPPORTED_SUFFIXES = {".mp3"}
+
+
+class SkipAudio(RuntimeError):
+    """The source is valid but should not be loudness-normalized."""
 
 
 def _utc_now() -> str:
@@ -102,7 +107,21 @@ def _measure(path: Path, target_lufs: float, true_peak: float, loudness_range: f
     )
     if completed.returncode:
         raise RuntimeError((completed.stderr or completed.stdout or "loudness analysis failed").strip())
-    return _json_object(completed.stderr)
+    measurement = _json_object(completed.stderr)
+    required_values = (
+        "input_i",
+        "input_tp",
+        "input_lra",
+        "input_thresh",
+        "target_offset",
+    )
+    try:
+        values = [float(measurement[key]) for key in required_values]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SkipAudio("loudness analysis did not return a usable audio signal") from exc
+    if not all(math.isfinite(value) for value in values):
+        raise SkipAudio("loudness analysis reported silence or a non-finite audio signal")
+    return measurement
 
 
 def _normalize(
@@ -224,8 +243,12 @@ def _completed_hashes(log_path: Path) -> dict[str, str]:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if entry.get("status") == "normalized" and entry.get("path") and entry.get("output_sha256"):
+        if not entry.get("path"):
+            continue
+        if entry.get("status") == "normalized" and entry.get("output_sha256"):
             completed[str(entry["path"])] = str(entry["output_sha256"])
+        elif entry.get("status") == "skipped" and entry.get("input_sha256"):
+            completed[str(entry["path"])] = str(entry["input_sha256"])
     return completed
 
 
@@ -247,6 +270,7 @@ def main() -> int:
     parser.add_argument("--target-lufs", type=float, default=-18.0)
     parser.add_argument("--true-peak", type=float, default=-1.5)
     parser.add_argument("--loudness-range", type=float, default=11.0)
+    parser.add_argument("--minimum-duration", type=float, default=5.0)
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
@@ -285,6 +309,7 @@ def main() -> int:
                 sort_keys=True,
             )
         )
+        had_errors = False
         for path, current_hash in pending:
             print(path)
             if not args.apply:
@@ -303,6 +328,11 @@ def main() -> int:
                         f"{path} is outside the configured NTC recordings root"
                     ) from exc
                 probe = _probe(path)
+                if probe["duration"] < args.minimum_duration:
+                    raise SkipAudio(
+                        f"duration {probe['duration']:.3f}s is below the "
+                        f"{args.minimum_duration:.3f}s content threshold"
+                    )
                 measurement = _measure(path, args.target_lufs, args.true_peak, args.loudness_range)
                 relative = path.resolve().relative_to(args.recordings_root.resolve())
                 backup_path = backup_root / relative
@@ -353,13 +383,14 @@ def main() -> int:
                         "duration_seconds": probe["duration"],
                     }
                 )
+            except SkipAudio as exc:
+                entry.update({"status": "skipped", "reason": str(exc)})
             except Exception as exc:
                 entry.update({"status": "error", "error": str(exc)})
+                had_errors = True
             _append_log(log_path, entry)
             print(json.dumps(entry, sort_keys=True))
-            if entry["status"] == "error":
-                return 1
-    return 0
+    return 1 if had_errors else 0
 
 
 if __name__ == "__main__":
