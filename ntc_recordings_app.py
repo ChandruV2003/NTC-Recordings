@@ -5627,9 +5627,11 @@ def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple
             chunk_text = _strip_transcription_prompt_echo(chunk_text)
             chunk_text = _display_transcript_text(chunk_text)
             if not chunk_text:
-                return "\n\n".join(transcript_chunks), "Transcript was empty."
+                continue
             marker = "[start]" if offset == 0 else f"[+{offset}s]"
             transcript_chunks.append(f"{marker} {chunk_text}")
+    if not transcript_chunks:
+        return "", "Transcript was empty."
     return "\n\n".join(transcript_chunks), ""
 
 

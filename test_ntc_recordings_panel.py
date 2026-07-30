@@ -3357,6 +3357,87 @@ class RecordingRequestPanelTests(unittest.TestCase):
             all("adelay=500:all=1" in command for command in commands)
         )
 
+    def test_chunked_transcript_skips_silent_chunks_and_keeps_later_speech(self):
+        recording = self.root / "REC00431.mp3"
+        recording.write_bytes(b"audio")
+        self.app.config.update(
+            NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL="http://transcription.example.test",
+            NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_CHUNK_SECONDS=60,
+            NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_SECONDS=180,
+        )
+
+        def prepare_chunk(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"wav")
+            return Mock(returncode=0, stderr="", stdout="")
+
+        responses = []
+        for text in (
+            "",
+            "Praise the Lord. I want to thank God for what He has done in my life.",
+            "",
+        ):
+            response = Mock()
+            response.json.return_value = {"text": text}
+            response.text = ""
+            responses.append(response)
+
+        with (
+            patch("ntc_recordings_app._probe_audio_duration", return_value=130),
+            patch("ntc_recordings_app.subprocess.run", side_effect=prepare_chunk),
+            patch(
+                "ntc_recordings_app._post_transcription_audio",
+                side_effect=responses,
+            ) as transcribe,
+        ):
+            transcript, error = _transcribe_testimony_review_excerpt(
+                self.app,
+                recording,
+            )
+
+        self.assertEqual(error, "")
+        self.assertEqual(
+            transcript,
+            "[+60s] Praise the Lord. I want to thank God for what He has done in my life.",
+        )
+        self.assertEqual(transcribe.call_count, 3)
+
+    def test_chunked_transcript_reports_empty_only_when_every_chunk_is_empty(self):
+        recording = self.root / "REC00432.mp3"
+        recording.write_bytes(b"audio")
+        self.app.config.update(
+            NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL="http://transcription.example.test",
+            NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_CHUNK_SECONDS=60,
+            NTC_RECORDINGS_TESTIMONY_TRANSCRIPT_MAX_SECONDS=120,
+        )
+
+        def prepare_chunk(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"wav")
+            return Mock(returncode=0, stderr="", stdout="")
+
+        responses = []
+        for _ in range(2):
+            response = Mock()
+            response.json.return_value = {"text": ""}
+            response.text = ""
+            responses.append(response)
+
+        with (
+            patch("ntc_recordings_app._probe_audio_duration", return_value=120),
+            patch("ntc_recordings_app.subprocess.run", side_effect=prepare_chunk),
+            patch(
+                "ntc_recordings_app._post_transcription_audio",
+                side_effect=responses,
+            ) as transcribe,
+        ):
+            transcript, error = _transcribe_testimony_review_excerpt(
+                self.app,
+                recording,
+            )
+
+        self.assertEqual(transcript, "")
+        self.assertEqual(error, "Transcript was empty.")
+        self.assertEqual(transcribe.call_count, 2)
+
     def test_background_analysis_builds_review_items_without_browser_request(self):
         review_root = self.root / "TestimonyReviewQueue"
         review_root.mkdir()
