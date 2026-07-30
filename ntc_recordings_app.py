@@ -813,6 +813,37 @@ def create_app(test_config: dict | None = None) -> Flask:
             message=f"Automatic delivery rule saved for {canonical_name}.",
         )
 
+    @app.post("/admin/recorder-review/speakers/rename")
+    def bulk_rename_recorder_review_speaker():
+        guard = _require_admin()
+        if guard:
+            return guard
+        old_name = _clean_speaker_name(request.form.get("old_speaker_name") or "")
+        new_name = _clean_speaker_name(request.form.get("new_speaker_name") or "")
+        error = ""
+        renamed = 0
+        if not old_name or not new_name:
+            error = "Choose the current speaker name and enter the corrected name."
+        elif _speaker_key(old_name) == _speaker_key(new_name):
+            error = "The corrected speaker name is unchanged."
+        else:
+            renamed, error = _bulk_rename_identified_speaker(app, old_name, new_name)
+            if not error and not renamed:
+                error = f"No identified recordings were found for {old_name}."
+        values = {
+            "status": "identified",
+            "sort": request.form.get("sort") or "newest",
+            "limit": request.form.get("limit") or "100",
+        }
+        if error:
+            return _redirect_to(app, "testimony_review", error=error, **values)
+        return _redirect_to(
+            app,
+            "testimony_review",
+            message=f"Renamed {renamed} recording{'s' if renamed != 1 else ''} from {old_name} to {new_name}.",
+            **values,
+        )
+
     @app.post("/admin/testimonies/probe")
     def probe_testimony_durations():
         guard = _require_admin()
@@ -5246,6 +5277,316 @@ def _rename_testimony_recording(
     return renamed, str(target_path), ""
 
 
+def _bulk_rename_identified_speaker(app: Flask, old_name: str, new_name: str) -> tuple[int, str]:
+    old_key = _speaker_key(old_name)
+    if not old_key or old_key == _speaker_key(new_name):
+        return 0, "Enter two different speaker names."
+    with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM testimony_reviews
+            WHERE status IN ('identified', 'already_named')
+              AND speaker_name = ? COLLATE NOCASE
+            ORDER BY service_date, source_path
+            """,
+            (old_name,),
+        ).fetchall()
+        existing_ids = {
+            str(row["recording_id"])
+            for row in connection.execute("SELECT recording_id FROM testimony_reviews").fetchall()
+        }
+        review_columns = [
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(testimony_reviews)").fetchall()
+        ]
+    if not rows:
+        return 0, ""
+
+    operations = []
+    planned_targets = set()
+    old_ids = {str(row["recording_id"]) for row in rows}
+    for row in rows:
+        source_path = Path(str(row["source_path"] or ""))
+        if not source_path.exists() or not source_path.is_file():
+            return 0, f"Could not find {source_path.name or 'one source file'}; no names were changed."
+        candidate = _testimony_source_candidate_from_path(app, source_path)
+        if not candidate:
+            return 0, f"{source_path.name} is outside the configured recording libraries."
+        recording_kind = _normalize_recording_kind(_row_optional_text(row, "recorder_agent_kind"))
+        if recording_kind == "unsure":
+            recording_kind = _filed_recording_kind(app, source_path)
+        if recording_kind == "message":
+            title = str(row["testimony_title"] or "").strip()
+            if not title:
+                return 0, f"{source_path.name} has no message title; rename that row individually."
+            try:
+                target_path = _proposed_message_path(
+                    app,
+                    source_path,
+                    str(row["service_date"] or ""),
+                    new_name,
+                    title,
+                )
+            except ValueError as exc:
+                return 0, str(exc)
+        elif recording_kind == "testimony":
+            title = _testimony_title_for_speaker(new_name)
+            target_path = Path(
+                _proposed_testimony_path(
+                    app,
+                    source_path,
+                    str(row["service_date"] or ""),
+                    new_name,
+                    title,
+                )
+            )
+        else:
+            return 0, f"{source_path.name} is not filed as a testimony or message."
+        target_key = str(target_path.resolve())
+        if target_key in planned_targets:
+            return 0, f"More than one recording would become {target_path.name}; no names were changed."
+        planned_targets.add(target_key)
+        if target_path.exists() and source_path.resolve() != target_path.resolve():
+            return 0, f"{target_path.name} already exists; no names were changed."
+        new_id = _recording_id(target_path)
+        if new_id in existing_ids and new_id not in old_ids:
+            return 0, f"{target_path.name} already has a recorder-review row."
+        operations.append(
+            {
+                "row": row,
+                "candidate": candidate,
+                "source_path": source_path,
+                "target_path": target_path,
+                "new_id": new_id,
+                "recording_kind": recording_kind,
+                "title": title,
+            }
+        )
+
+    moved = []
+    now = _utc_now()
+    reviewer = _current_reviewer(app)
+    try:
+        for operation in operations:
+            source_path = operation["source_path"]
+            target_path = operation["target_path"]
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if source_path.resolve() != target_path.resolve():
+                shutil.move(str(source_path), str(target_path))
+                moved.append((target_path, source_path))
+            candidate = _testimony_source_candidate_from_path(app, target_path)
+            if not candidate:
+                raise OSError(f"{target_path.name} could not be reloaded after rename")
+            operation["renamed_candidate"] = candidate
+
+        with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
+            for operation in operations:
+                row = operation["row"]
+                old_id = str(row["recording_id"])
+                candidate = operation["renamed_candidate"]
+                data = {column: row[column] for column in review_columns}
+                data.update(
+                    {
+                        "recording_id": candidate.id,
+                        "source_path": candidate.path,
+                        "speaker_name": new_name,
+                        "testimony_title": operation["title"],
+                        "proposed_path": candidate.path,
+                        "suggested_speaker": (
+                            new_name
+                            if _speaker_key(str(row["suggested_speaker"] or "")) == old_key
+                            else str(row["suggested_speaker"] or "")
+                        ),
+                        "review_revision": int(row["review_revision"] or 0) + 1,
+                        "reviewed_at": now,
+                        "reviewed_by": reviewer,
+                        "review_source": "bulk_speaker_rename",
+                        "updated_at": now,
+                    }
+                )
+                if candidate.id != old_id:
+                    connection.execute("DELETE FROM testimony_reviews WHERE recording_id = ?", (old_id,))
+                placeholders = ", ".join("?" for _ in review_columns)
+                updates = ", ".join(
+                    f"{column} = excluded.{column}"
+                    for column in review_columns
+                    if column != "recording_id"
+                )
+                connection.execute(
+                    f"""
+                    INSERT INTO testimony_reviews ({", ".join(review_columns)})
+                    VALUES ({placeholders})
+                    ON CONFLICT(recording_id) DO UPDATE SET {updates}
+                    """,
+                    tuple(data[column] for column in review_columns),
+                )
+                connection.execute("DELETE FROM recording_library WHERE id = ?", (old_id,))
+                connection.execute(
+                    """
+                    INSERT INTO recording_library (
+                        id, path, title, recording_date, kind, size_bytes, modified_at,
+                        relative_path, root_path, indexed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        path = excluded.path,
+                        title = excluded.title,
+                        recording_date = excluded.recording_date,
+                        kind = excluded.kind,
+                        size_bytes = excluded.size_bytes,
+                        modified_at = excluded.modified_at,
+                        relative_path = excluded.relative_path,
+                        root_path = excluded.root_path,
+                        indexed_at = excluded.indexed_at
+                    """,
+                    (
+                        candidate.id,
+                        candidate.path,
+                        candidate.title,
+                        candidate.recording_date,
+                        candidate.kind,
+                        candidate.size_bytes,
+                        candidate.modified_at,
+                        candidate.relative_path,
+                        _matched_library_root(app, Path(candidate.path)),
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE testimony_deliveries
+                    SET recording_id = ?,
+                        recording_path = ?,
+                        recording_title = ?,
+                        speaker_name = ?,
+                        updated_at = ?
+                    WHERE recording_id = ?
+                    """,
+                    (candidate.id, candidate.path, candidate.title, new_name, now, old_id),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO recorder_review_history (
+                        recording_id, previous_recording_id, action, previous_status,
+                        new_status, service_date, speaker_name, recording_kind,
+                        source_path, target_path, reviewed_by, review_source,
+                        reviewed_at, created_at
+                    )
+                    VALUES (?, ?, 'bulk_rename_speaker', ?, ?, ?, ?, ?, ?, ?, ?, 'bulk_speaker_rename', ?, ?)
+                    """,
+                    (
+                        candidate.id,
+                        old_id if candidate.id != old_id else "",
+                        str(row["status"] or ""),
+                        str(row["status"] or ""),
+                        str(row["service_date"] or ""),
+                        new_name,
+                        operation["recording_kind"],
+                        str(operation["source_path"]),
+                        candidate.path,
+                        reviewer,
+                        now,
+                        now,
+                    ),
+                )
+            _rename_testimony_delivery_rule_speaker(connection, old_name, new_name, now)
+    except (OSError, sqlite3.Error) as exc:
+        for target_path, source_path in reversed(moved):
+            try:
+                source_path.parent.mkdir(parents=True, exist_ok=True)
+                if target_path.exists() and not source_path.exists():
+                    shutil.move(str(target_path), str(source_path))
+            except OSError:
+                app.logger.exception("failed to roll back bulk speaker rename for %s", target_path)
+        app.logger.exception("bulk speaker rename failed")
+        return 0, f"Speaker names were not changed: {exc}"
+    return len(operations), ""
+
+
+def _rename_testimony_delivery_rule_speaker(
+    connection: sqlite3.Connection,
+    old_name: str,
+    new_name: str,
+    now: str,
+) -> None:
+    old_rule = connection.execute(
+        "SELECT * FROM testimony_delivery_rules WHERE canonical_name = ? COLLATE NOCASE",
+        (old_name,),
+    ).fetchone()
+    if not old_rule:
+        return
+    target_rule = connection.execute(
+        "SELECT * FROM testimony_delivery_rules WHERE canonical_name = ? COLLATE NOCASE",
+        (new_name,),
+    ).fetchone()
+    old_aliases = _delivery_json_values(old_rule["aliases_json"])
+    if target_rule and int(target_rule["id"]) != int(old_rule["id"]):
+        aliases = list(
+            dict.fromkeys(
+                [
+                    *_delivery_json_values(target_rule["aliases_json"]),
+                    old_name,
+                    str(old_rule["canonical_name"] or ""),
+                    *old_aliases,
+                ]
+            )
+        )
+        emails = list(
+            dict.fromkeys(
+                [
+                    *_delivery_json_values(target_rule["emails_json"]),
+                    *_delivery_json_values(old_rule["emails_json"]),
+                ]
+            )
+        )
+        connection.execute(
+            """
+            UPDATE testimony_delivery_rules
+            SET aliases_json = ?, emails_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(aliases, separators=(",", ":")),
+                json.dumps(emails, separators=(",", ":")),
+                now,
+                int(target_rule["id"]),
+            ),
+        )
+        connection.execute(
+            """
+            DELETE FROM testimony_deliveries
+            WHERE rule_id = ?
+              AND source_recording_id IN (
+                  SELECT source_recording_id
+                  FROM testimony_deliveries
+                  WHERE rule_id = ?
+              )
+            """,
+            (int(old_rule["id"]), int(target_rule["id"])),
+        )
+        connection.execute(
+            "UPDATE testimony_deliveries SET rule_id = ? WHERE rule_id = ?",
+            (int(target_rule["id"]), int(old_rule["id"])),
+        )
+        connection.execute("DELETE FROM testimony_delivery_rules WHERE id = ?", (int(old_rule["id"]),))
+        return
+    aliases = list(dict.fromkeys([*old_aliases, old_name]))
+    connection.execute(
+        """
+        UPDATE testimony_delivery_rules
+        SET canonical_name = ?, aliases_json = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            new_name,
+            json.dumps(aliases, separators=(",", ":")),
+            now,
+            int(old_rule["id"]),
+        ),
+    )
+
+
 def _move_recorder_review_recording(
     app: Flask,
     candidate: RecordingCandidate,
@@ -8599,6 +8940,52 @@ TESTIMONY_REVIEW_TEMPLATE = """
         gap:.6rem;
         flex-wrap:wrap;
       }
+      .speaker-rename {
+        position:relative;
+      }
+      .speaker-rename summary {
+        list-style:none;
+        cursor:pointer;
+        min-height:3.05rem;
+        display:inline-flex;
+        align-items:center;
+        padding:.72rem .9rem;
+        border:1px solid var(--line-strong);
+        border-radius:12px;
+        background:rgba(143,211,255,.08);
+        color:var(--text);
+        font-weight:800;
+      }
+      .speaker-rename summary::-webkit-details-marker { display:none; }
+      .speaker-rename[open] summary { border-color:rgba(143,245,200,.5); }
+      .speaker-rename-form {
+        position:absolute;
+        z-index:20;
+        top:calc(100% + .45rem);
+        right:0;
+        width:min(34rem,calc(100vw - 2rem));
+        display:grid;
+        grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto;
+        gap:.55rem;
+        align-items:end;
+        padding:.75rem;
+        border:1px solid var(--line-strong);
+        border-radius:14px;
+        background:rgba(6,16,29,.98);
+        box-shadow:var(--shadow);
+      }
+      .speaker-rename-form label {
+        display:grid;
+        gap:.28rem;
+      }
+      .speaker-rename-form label span {
+        color:var(--muted);
+        font:800 .64rem var(--mono);
+        letter-spacing:.1em;
+        text-transform:uppercase;
+      }
+      .speaker-rename-form input,
+      .speaker-rename-form button { min-height:2.75rem; }
       .tabs {
         display:flex;
         flex-wrap:nowrap;
@@ -9062,6 +9449,14 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .toolbar, .review-body { grid-template-columns:1fr; }
         .tabs { width:100%; }
         .toolbar-actions, .probe-form { justify-content:flex-start; }
+        .speaker-rename { width:100%; }
+        .speaker-rename summary { width:100%; justify-content:center; }
+        .speaker-rename-form {
+          position:static;
+          width:100%;
+          margin-top:.45rem;
+          grid-template-columns:1fr;
+        }
         .job-panel { flex-direction:column; align-items:stretch; }
         .job-panel-copy { width:100%; }
         .bulk-toolbar { flex-wrap:wrap; }
@@ -9189,6 +9584,24 @@ TESTIMONY_REVIEW_TEMPLATE = """
           {% endfor %}
         </nav>
         <div class="toolbar-actions">
+          {% if status_filter == "identified" %}
+            <details class="speaker-rename">
+              <summary>Rename Speaker</summary>
+              <form class="speaker-rename-form" method="post" action="{{ recordings_url_for('bulk_rename_recorder_review_speaker') }}">
+                <input type="hidden" name="sort" value="{{ sort }}">
+                <input type="hidden" name="limit" value="{{ limit }}">
+                <label>
+                  <span>Current Name</span>
+                  <input name="old_speaker_name" list="speaker-name-options" required placeholder="Choose speaker">
+                </label>
+                <label>
+                  <span>Corrected Name</span>
+                  <input name="new_speaker_name" required placeholder="Enter corrected name">
+                </label>
+                <button class="save" type="submit">Rename All</button>
+              </form>
+            </details>
+          {% endif %}
           {% if status_filter in ["not_testimony", "duplicate", "all"] %}
             <form class="probe-form action-only" method="post" action="{{ recordings_url_for('quarantine_testimony_reviews') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">

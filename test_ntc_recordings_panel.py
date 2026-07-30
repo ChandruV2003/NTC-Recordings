@@ -1992,6 +1992,125 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIn("transcript should stay", rows[0][1])
 
+    def test_identified_view_bulk_renames_exact_speaker_and_preserves_metadata(self):
+        first = self.testimony_root / "2025" / "Sunday Testimonies" / "May 4, 2025 - Sister Renny's Testimony.mp3"
+        second = self.testimony_root / "2026" / "Sunday Testimonies" / "May 3, 2026 - Sister Renny's Testimony.mp3"
+        unrelated = self.testimony_root / "2026" / "Sunday Testimonies" / "May 10, 2026 - Sister Rachel's Testimony.mp3"
+        for path, payload in (
+            (first, b"first-testimony"),
+            (second, b"second-testimony"),
+            (unrelated, b"unrelated-testimony"),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.db_path) as connection:
+            for path, service_date, speaker, transcript in (
+                (first, "2025-05-04", "Sister Renny", "first transcript"),
+                (second, "2026-05-03", "Sister Renny", "second transcript"),
+                (unrelated, "2026-05-10", "Sister Rachel", "unrelated transcript"),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO testimony_reviews (
+                        recording_id, source_path, status, service_date, speaker_name,
+                        testimony_title, transcript_text, transcript_source,
+                        transcript_updated_at, recorder_agent_kind, updated_at
+                    )
+                    VALUES (?, ?, 'identified', ?, ?, ?, ?, 'full_transcript', ?, 'testimony', ?)
+                    """,
+                    (
+                        _recording_id(path),
+                        str(path),
+                        service_date,
+                        speaker,
+                        f"{speaker}'s Testimony",
+                        transcript,
+                        now,
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO testimony_delivery_rules (
+                    canonical_name, aliases_json, emails_json, effective_from,
+                    enabled, created_at, updated_at
+                )
+                VALUES ('Sister Renny', '[]', '["renny@example.test"]', '2026-01-01', 1, ?, ?)
+                """,
+                (now, now),
+            )
+            rule_id = connection.execute(
+                "SELECT id FROM testimony_delivery_rules WHERE canonical_name = 'Sister Renny'"
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO testimony_deliveries (
+                    rule_id, source_recording_id, recording_id, recording_path,
+                    recording_title, speaker_name, service_date, status,
+                    created_at, updated_at
+                )
+                VALUES (?, 'original-source', ?, ?, ?, 'Sister Renny', '2026-05-03', 'sent', ?, ?)
+                """,
+                (rule_id, _recording_id(second), str(second), second.stem, now, now),
+            )
+
+        self._login()
+        identified = self.client.get("/admin/recorder-review?status=identified")
+        self.assertIn(b"Rename Speaker", identified.data)
+        self.assertNotIn(
+            b"Rename Speaker",
+            self.client.get("/admin/recorder-review?status=needs_review").data,
+        )
+        response = self.client.post(
+            "/admin/recorder-review/speakers/rename",
+            data={
+                "old_speaker_name": "Sister Renny",
+                "new_speaker_name": "Renny Thomas",
+                "sort": "newest",
+                "limit": "100",
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Renamed 2 recordings from Sister Renny to Renny Thomas.", response.data)
+        renamed_first = first.with_name("May 4, 2025 - Renny Thomas's Testimony.mp3")
+        renamed_second = second.with_name("May 3, 2026 - Renny Thomas's Testimony.mp3")
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertTrue(renamed_first.exists())
+        self.assertTrue(renamed_second.exists())
+        self.assertTrue(unrelated.exists())
+        with sqlite3.connect(self.db_path) as connection:
+            renamed_rows = connection.execute(
+                """
+                SELECT speaker_name, transcript_text
+                FROM testimony_reviews
+                WHERE speaker_name = 'Renny Thomas'
+                ORDER BY service_date
+                """
+            ).fetchall()
+            unrelated_row = connection.execute(
+                "SELECT speaker_name FROM testimony_reviews WHERE source_path = ?",
+                (str(unrelated),),
+            ).fetchone()
+            delivery = connection.execute(
+                "SELECT speaker_name, recording_path, status FROM testimony_deliveries"
+            ).fetchone()
+            rule = connection.execute(
+                "SELECT canonical_name, aliases_json FROM testimony_delivery_rules"
+            ).fetchone()
+            history_count = connection.execute(
+                "SELECT COUNT(*) FROM recorder_review_history WHERE action = 'bulk_rename_speaker'"
+            ).fetchone()[0]
+        self.assertEqual(renamed_rows, [("Renny Thomas", "first transcript"), ("Renny Thomas", "second transcript")])
+        self.assertEqual(unrelated_row[0], "Sister Rachel")
+        self.assertEqual(delivery, ("Renny Thomas", str(renamed_second), "sent"))
+        self.assertEqual(rule[0], "Renny Thomas")
+        self.assertIn("Sister Renny", json.loads(rule[1]))
+        self.assertEqual(history_count, 2)
+
     def test_bulk_testimony_suggestions_skip_named_message_files(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
