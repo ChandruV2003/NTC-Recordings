@@ -37,10 +37,15 @@ def _sha256(path: Path) -> str:
 
 
 def _json_object(output: str) -> dict:
-    start = output.rfind("{")
-    if start < 0:
-        raise ValueError("ffmpeg did not return loudness measurements")
-    return json.loads(output[start:])
+    decoder = json.JSONDecoder()
+    for start in reversed([index for index, value in enumerate(output) if value == "{"]):
+        try:
+            payload, _ = decoder.raw_decode(output[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and "input_i" in payload:
+            return payload
+    raise ValueError("ffmpeg did not return loudness measurements")
 
 
 def _run(command: list[str], *, timeout: int = 7200) -> subprocess.CompletedProcess:

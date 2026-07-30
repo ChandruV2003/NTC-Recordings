@@ -13,6 +13,26 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DN700RLoudnessBackfillTests(unittest.TestCase):
+    def test_json_object_ignores_ffmpeg_trailer_text(self):
+        output = """
+        [Parsed_loudnorm_0]
+        {
+            "input_i": "-25.10",
+            "input_tp": "-1.52",
+            "input_lra": "6.20",
+            "input_thresh": "-35.20",
+            "output_i": "-18.01",
+            "output_tp": "-1.50",
+            "output_lra": "5.90",
+            "output_thresh": "-28.10",
+            "normalization_type": "dynamic",
+            "target_offset": "0.01"
+        }
+        video:0KiB audio:1024KiB muxing overhead: 0.1%
+        """
+
+        self.assertEqual(MODULE._json_object(output)["output_i"], "-18.01")
+
     def test_manifest_targets_follow_review_moves_and_exclude_other_lanes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
