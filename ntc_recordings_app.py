@@ -6476,6 +6476,19 @@ def _display_title(path: Path) -> str:
 
 
 def _extract_recording_date(value: str) -> str | None:
+    dn700r_timestamp = re.search(
+        r"(?<!\d)([01]\d)([0-3]\d)(20\d{2})([0-2]\d)([0-5]\d)([0-5]\d)(?!\d)",
+        value,
+    )
+    if dn700r_timestamp:
+        parsed = _date_from_parts(
+            dn700r_timestamp.group(3),
+            dn700r_timestamp.group(1),
+            dn700r_timestamp.group(2),
+        )
+        if parsed:
+            return parsed.isoformat()
+
     candidates = [
         r"\b(20\d{2})[-_ .]?([01]\d)[-_ .]?([0-3]\d)\b",
         r"\b([01]?\d)[-_/]([0-3]?\d)[-_/](20\d{2})\b",

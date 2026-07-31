@@ -17,6 +17,7 @@ from ntc_recordings_app import (
     _queue_background_review_analysis,
     _date_from_file_metadata,
     _display_transcript_text,
+    _extract_recording_date,
     _extract_intro_speaker,
     _humanize_classifier_evidence,
     _normalize_recording_email_message,
@@ -213,6 +214,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         legacy_review = self.client.get("/admin/testimonies?status=all", base_url="https://ntcnas.myftp.org")
         self.assertEqual(legacy_review.status_code, 302)
         self.assertEqual(legacy_review.headers["Location"], "/recordings/admin/recorder-review?status=all")
+
+    def test_dn700r_filename_date_precedes_modified_date_fallback(self):
+        self.assertEqual(
+            _extract_recording_date("07292026193442_DN-700R.mp3"),
+            "2026-07-29",
+        )
 
     def test_worship_request_matches_worship_recording(self):
         created = self.client.post(
