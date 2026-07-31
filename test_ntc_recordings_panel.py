@@ -45,6 +45,7 @@ from ntc_recordings_app import (
     _transcribe_testimony_review_excerpt,
     _save_testimony_transcript,
     _transcript_contains_prompt_echo,
+    _transcript_quality_error,
     _valid_person_name_suggestion,
     create_app,
 )
@@ -1773,14 +1774,14 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(row["transcript_text"], "")
         self.assertEqual(row["transcript_source"], "")
         self.assertIn("transcription instructions", row["transcript_error"])
-        targets = _testimony_transcript_targets(self.app, statuses={"needs_review"})
-        self.assertEqual([Path(item["candidate"].path).name for item in targets], [recording.name])
-        self._login()
-        review = self.client.get("/admin/recorder-review?status=needs_review")
-        self.assertNotIn(b"whether this sounds like", review.data)
-        self.assertNotIn(b">Testimony</strong>", review.data)
-        self.assertIn(b"Automatic transcript was rejected", review.data)
-        self.assertNotIn(b">Retry Analysis</button>", review.data)
+
+    def test_malformed_transcripts_are_rejected_instead_of_displayed(self):
+        replacement_garbage = "Valid words followed by broken bytes \ufffd\ufffd and more text."
+        repeated_token_garbage = "There were words and then a a a a a a a a a a before more words."
+
+        for transcript in (replacement_garbage, repeated_token_garbage):
+            self.assertIn("malformed", _transcript_quality_error(transcript).lower())
+            self.assertEqual(_display_transcript_text(transcript), "")
 
     def test_existing_prompt_only_transcript_is_migrated_to_retry(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
@@ -3365,8 +3366,9 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         start_job.assert_not_called()
+        self.assertIn(b'.review-row > .row-selector { grid-column:1; grid-row:1 / span 5; }', response.data)
 
-    def test_background_analysis_selects_missing_rows_across_review_statuses(self):
+    def test_background_analysis_only_selects_unfinished_intake_rows(self):
         items = [
             {
                 "id": "needs-review",
@@ -3396,7 +3398,19 @@ class RecordingRequestPanelTests(unittest.TestCase):
         ):
             recording_ids = _background_review_analysis_ids(self.app, limit=20)
 
-        self.assertEqual(recording_ids, {"needs-review", "identified"})
+        self.assertEqual(recording_ids, {"needs-review"})
+
+    def test_automatic_analysis_does_not_loop_failed_rows(self):
+        item = {
+            "id": "failed-row",
+            "status": "needs_review",
+            "transcript_text": "",
+            "transcript_error": "Automatic transcription failed.",
+            "recorder_agent_reason": "",
+            "transcript_source": "",
+        }
+
+        self.assertEqual(_automatic_review_analysis_ids([item]), set())
 
     def test_background_analysis_reprocesses_legacy_transcripts_once(self):
         base_item = {

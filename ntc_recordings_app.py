@@ -114,6 +114,7 @@ TRANSCRIPTION_PROMPT_STRIP_PATTERNS = [
 ]
 TRANSCRIPTION_PROMPT_ECHO_PATTERNS = [
     *TRANSCRIPTION_PROMPT_STRIP_PATTERNS,
+    re.compile(r"\bdo\s+not\s+summarize\b", re.IGNORECASE),
     re.compile(r"\bpreserve\s+speaker\s+names\b", re.IGNORECASE),
     re.compile(r"\bscripture\s+references,?\s+sermon\s+(?:titles|introductions)\b", re.IGNORECASE),
     re.compile(
@@ -128,6 +129,10 @@ TRANSCRIPTION_PROMPT_ECHO_PATTERNS = [
 TRANSCRIPTION_PROMPT_ECHO_ERROR = (
     "Automatic transcript was rejected because it contained transcription instructions "
     "instead of recording content. Retry analysis."
+)
+TRANSCRIPTION_MALFORMED_ERROR = (
+    "Automatic transcript was rejected because the transcription output was malformed. "
+    "Retry analysis."
 )
 TRANSCRIPTION_BUSY_ERROR = (
     "Automatic transcription is busy. This recording remains queued for retry."
@@ -3666,7 +3671,6 @@ def _testimony_status_label(status: str) -> str:
 
 
 def _automatic_review_analysis_ids(items: Iterable[dict], limit: int = 20) -> set[str]:
-    now = datetime.now(timezone.utc)
     recording_ids: set[str] = set()
     for item in items:
         transcript_text = _display_transcript_text(str(item.get("transcript_text") or ""))
@@ -3684,16 +3688,11 @@ def _automatic_review_analysis_ids(items: Iterable[dict], limit: int = 20) -> se
             and (manual_type_confirmed or current_analysis)
         ):
             continue
-        updated_at = str(item.get("transcript_updated_at") or "")
-        if transcript_error and updated_at:
-            try:
-                updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-                if updated.tzinfo is None:
-                    updated = updated.replace(tzinfo=timezone.utc)
-                if now - updated < timedelta(minutes=10):
-                    continue
-            except ValueError:
-                pass
+        # A failed attempt remains visible for diagnosis and an explicit retry.
+        # Re-running it every ten minutes made permanently bad audio consume the
+        # queue forever and caused the analysis banner to reappear indefinitely.
+        if transcript_error:
+            continue
         recording_id = str(item.get("id") or "")
         if recording_id:
             recording_ids.add(recording_id)
@@ -3706,7 +3705,10 @@ def _background_review_analysis_ids(app: Flask, limit: int = 20) -> set[str]:
     if not has_request_context():
         with app.test_request_context("/"):
             return _background_review_analysis_ids(app, limit=limit)
-    eligible_statuses = {"needs_review", "message_review", "identified", "grouped", "already_named"}
+    # Intake rows are analyzed once. Completed review history must never be
+    # reconsidered by the recurring worker merely because an analysis format
+    # changed later.
+    eligible_statuses = {"needs_review", "message_review"}
     items = [
         item
         for item in _testimony_review_items(app, known_speakers=_testimony_known_speakers(app))
@@ -3771,13 +3773,7 @@ def _run_recorder_analysis_worker(app: Flask) -> None:
                             _start_testimony_transcript_job(
                                 app,
                                 limit=len(recording_ids),
-                                statuses={
-                                    "needs_review",
-                                    "message_review",
-                                    "identified",
-                                    "grouped",
-                                    "already_named",
-                                },
+                                statuses={"needs_review", "message_review"},
                                 recording_ids=recording_ids,
                             )
             except Exception:
@@ -4970,15 +4966,19 @@ def _record_testimony_review_history(
 
 
 def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: str, transcript_source: str, transcript_error: str) -> None:
-    if _transcript_contains_prompt_echo(transcript_text):
+    quality_error = _transcript_quality_error(transcript_text)
+    if quality_error:
         transcript_text = ""
         transcript_source = ""
-        transcript_error = TRANSCRIPTION_PROMPT_ECHO_ERROR
+        transcript_error = quality_error
     else:
         transcript_text = _display_transcript_text(transcript_text)
         transcript_error = _friendly_transcription_error(transcript_error)
     updated_at = _utc_now()
-    transcript_rejected = transcript_error == TRANSCRIPTION_PROMPT_ECHO_ERROR
+    transcript_rejected = transcript_error in {
+        TRANSCRIPTION_PROMPT_ECHO_ERROR,
+        TRANSCRIPTION_MALFORMED_ERROR,
+    }
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute(
             """
@@ -5005,7 +5005,7 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
                 updated_at,
                 "unknown" if transcript_rejected else "",
                 "review" if transcript_rejected else "",
-                TRANSCRIPTION_PROMPT_ECHO_ERROR if transcript_rejected else "",
+                transcript_error if transcript_rejected else "",
                 updated_at if transcript_rejected else "",
                 updated_at,
                 recording_id,
@@ -5021,12 +5021,12 @@ def _sanitize_existing_testimony_transcripts(connection: sqlite3.Connection) -> 
         WHERE COALESCE(transcript_text, '') <> ''
         """
     ).fetchall()
-    invalid_ids = [
-        str(row["recording_id"])
+    invalid_rows = [
+        (str(row["recording_id"]), quality_error)
         for row in invalid_rows
-        if _transcript_contains_prompt_echo(str(row["transcript_text"] or ""))
+        if (quality_error := _transcript_quality_error(str(row["transcript_text"] or "")))
     ]
-    if not invalid_ids:
+    if not invalid_rows:
         return 0
     updated_at = _utc_now()
     connection.executemany(
@@ -5049,17 +5049,17 @@ def _sanitize_existing_testimony_transcripts(connection: sqlite3.Connection) -> 
         """,
         [
             (
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                quality_error,
                 updated_at,
-                TRANSCRIPTION_PROMPT_ECHO_ERROR,
+                quality_error,
                 updated_at,
                 updated_at,
                 recording_id,
             )
-            for recording_id in invalid_ids
+            for recording_id, quality_error in invalid_rows
         ],
     )
-    return len(invalid_ids)
+    return len(invalid_rows)
 
 
 def _sanitize_existing_testimony_transcript_errors(connection: sqlite3.Connection) -> int:
@@ -6171,7 +6171,7 @@ def _compact_transcript_excerpt(text: str, limit: int = 360) -> str:
 
 
 def _display_transcript_text(text: str) -> str:
-    if _transcript_contains_prompt_echo(text):
+    if _transcript_quality_error(text):
         return ""
     chunks = []
     for chunk in re.split(r"\n{2,}", str(text or "")):
@@ -6200,9 +6200,20 @@ def _transcript_contains_prompt_echo(text: str) -> bool:
     return any(pattern.search(value) for pattern in TRANSCRIPTION_PROMPT_ECHO_PATTERNS)
 
 
+def _transcript_quality_error(text: str) -> str:
+    value = str(text or "")
+    if not value:
+        return ""
+    if _transcript_contains_prompt_echo(value):
+        return TRANSCRIPTION_PROMPT_ECHO_ERROR
+    if "\ufffd" in value or re.search(r"(?:\b[a-z]\b[\s,]*){8,}", value, re.IGNORECASE):
+        return TRANSCRIPTION_MALFORMED_ERROR
+    return ""
+
+
 def _friendly_transcription_error(error: str) -> str:
     value = str(error or "").strip()
-    if not value or value == TRANSCRIPTION_PROMPT_ECHO_ERROR:
+    if not value or value in {TRANSCRIPTION_PROMPT_ECHO_ERROR, TRANSCRIPTION_MALFORMED_ERROR}:
         return value
     lowered = value.lower()
     if "429" in lowered or "too many requests" in lowered or "rate limit" in lowered:
@@ -9463,6 +9474,12 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .bulk-selection { flex:1 1 100%; flex-wrap:wrap; }
         .bulk-actions { justify-content:flex-start; width:100%; }
         .review-row { grid-template-columns:2.3rem minmax(0,1fr) minmax(0,1fr); align-items:start; }
+        .review-row > .row-selector { grid-column:1; grid-row:1 / span 3; }
+        .review-row > .recording-cell { grid-column:2 / -1; grid-row:1; }
+        .review-row > .duration-cell { grid-column:2; grid-row:2; }
+        .review-row > .date-cell { grid-column:3; grid-row:2; }
+        .review-row > .speaker-cell { grid-column:2; grid-row:3; }
+        .review-row > .pill { grid-column:3; grid-row:3; justify-self:start; }
         .row-number { align-self:center; }
       }
       @media (max-width:760px) {
@@ -9520,6 +9537,17 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .file-facts { grid-template-columns:minmax(0,1fr); }
         .form-grid { grid-template-columns:1fr; }
         .review-row { grid-template-columns:2.3rem minmax(0,1fr); }
+        .review-row > .row-selector { grid-column:1; grid-row:1 / span 5; }
+        .review-row > .recording-cell,
+        .review-row > .duration-cell,
+        .review-row > .date-cell,
+        .review-row > .speaker-cell,
+        .review-row > .pill { grid-column:2; }
+        .review-row > .recording-cell { grid-row:1; }
+        .review-row > .duration-cell { grid-row:2; }
+        .review-row > .date-cell { grid-row:3; }
+        .review-row > .speaker-cell { grid-row:4; }
+        .review-row > .pill { grid-row:5; justify-self:start; }
         .wide { grid-column:auto; }
         .suggestion-panel { grid-template-columns:1fr; }
         .segment-row { grid-template-columns:1fr; }
@@ -9686,20 +9714,20 @@ TESTIMONY_REVIEW_TEMPLATE = """
                       <input type="checkbox" data-row-select tabindex="-1" aria-hidden="true">
                       <span class="row-number" data-row-number>#{{ loop.index }}</span>
                     </span>
-                    <div class="cell">
+                    <div class="cell recording-cell">
                       <span class="cell-label">Recording</span>
                       <span class="cell-value" data-field="title">{{ item.title }}</span>
                       <span class="cell-subvalue" data-field="source-label">{{ item.source_label }}</span>
                     </div>
-                    <div class="cell">
+                    <div class="cell duration-cell">
                       <span class="cell-label">Duration</span>
                       <span class="cell-value">{{ item.duration_label }}</span>
                     </div>
-                    <div class="cell">
+                    <div class="cell date-cell">
                       <span class="cell-label">Date</span>
                       <span class="cell-value" data-field="service-date-label">{{ format_date(item.service_date or item.recording_date) }}</span>
                     </div>
-                    <div class="cell">
+                    <div class="cell speaker-cell">
                       <span class="cell-label">Speaker</span>
                       <span class="cell-value" data-field="speaker">{{ item.speaker_name or "Not set" }}</span>
                     </div>
