@@ -9603,7 +9603,15 @@ TESTIMONY_REVIEW_TEMPLATE = """
           grid-template-columns:repeat(2,minmax(0,1fr));
           width:100%;
         }
-        .button-row button, .toolbar-actions, .probe-form, .probe-form input, .probe-form button { width:100%; }
+        .button-row button {
+          width:100%;
+          height:3rem;
+          min-height:3rem;
+          padding:.5rem .35rem;
+          font-size:.8rem;
+          white-space:nowrap;
+        }
+        .toolbar-actions, .probe-form, .probe-form input, .probe-form button { width:100%; }
         .bulk-actions {
           display:grid;
           grid-template-columns:repeat(2,minmax(0,1fr));
