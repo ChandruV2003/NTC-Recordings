@@ -702,8 +702,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
         analysis_position = review.data.index(b'data-transcript-job')
         expand_position = review.data.index(b'data-expand-all')
         bulk_position = review.data.index(b'data-bulk-toolbar')
-        self.assertLess(analysis_position, expand_position)
-        self.assertLess(expand_position, bulk_position)
+        self.assertLess(analysis_position, bulk_position)
+        self.assertLess(bulk_position, expand_position)
         self.assertIn(b".bulk-toolbar[hidden] { display:none; }", review.data)
         self.assertIn(b"min-height:2.35rem;", review.data)
         self.assertNotIn(b"Keep for Review", review.data)
@@ -3631,8 +3631,13 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'data-state="finished" hidden', response.data)
+        self.assertIn(b'.job-panel[hidden] { display:none; }', response.data)
         self.assertIn(
             b'panel.hidden = !["running", "failed"].includes(job.state);',
+            response.data,
+        )
+        self.assertIn(
+            b'<div class="panel-controls">\n            <div class="view-actions"',
             response.data,
         )
 

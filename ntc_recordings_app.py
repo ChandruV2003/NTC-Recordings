@@ -9030,6 +9030,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         padding:.78rem .9rem;
         color:var(--muted);
       }
+      .job-panel[hidden] { display:none; }
       .job-panel strong { color:var(--text); }
       .job-panel span { color:var(--accent); font:800 .68rem var(--mono); letter-spacing:.1em; text-transform:uppercase; }
       .job-panel-copy {
@@ -9478,7 +9479,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .view-actions {
           display:grid;
           grid-template-columns:repeat(2,minmax(0,1fr));
-          width:min(100%,16rem);
+          width:100%;
           margin-left:0;
         }
         .view-actions button { width:100%; }
@@ -9640,10 +9641,6 @@ TESTIMONY_REVIEW_TEMPLATE = """
           </div>
           <div data-job-current>{% if transcript_job.current %}Now analyzing {{ transcript_job.current }}{% endif %}</div>
         </div>
-        <div class="view-actions" aria-label="Row display controls">
-          <button class="secondary" type="button" data-expand-all>Expand All</button>
-          <button class="secondary" type="button" data-close-all>Close All</button>
-        </div>
       </div>
       <div class="bulk-toolbar" data-bulk-toolbar hidden>
         <div class="bulk-selection" data-bulk-selection>
@@ -9666,6 +9663,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
             <p class="muted">Listen, confirm the service date, then choose Testimony, Message, Worship, or Combined and complete any needed details.</p>
           </div>
           <div class="panel-controls">
+            <div class="view-actions" aria-label="Row display controls">
+              <button class="secondary" type="button" data-expand-all>Expand All</button>
+              <button class="secondary" type="button" data-close-all>Close All</button>
+            </div>
             <form class="probe-form" method="get" action="{{ recordings_url_for('testimony_review') }}">
               <input type="hidden" name="status" value="{{ status_filter }}">
               <label>
