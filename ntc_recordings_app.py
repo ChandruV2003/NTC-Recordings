@@ -3766,19 +3766,23 @@ def _run_recorder_analysis_worker(app: Flask) -> None:
         )
         while True:
             try:
-                if _testimony_transcript_job_status(app).get("state") != "running":
-                    with app.app_context():
-                        recording_ids = _background_review_analysis_ids(app, limit=batch_size)
-                        if recording_ids:
-                            _start_testimony_transcript_job(
-                                app,
-                                limit=len(recording_ids),
-                                statuses={"needs_review", "message_review"},
-                                recording_ids=recording_ids,
-                            )
+                _queue_background_review_analysis(app, batch_size=batch_size)
             except Exception:
                 app.logger.exception("Recorder background analysis cycle failed.")
             time.sleep(interval_seconds)
+
+
+def _queue_background_review_analysis(app: Flask, batch_size: int) -> set[str]:
+    with app.app_context():
+        recording_ids = _background_review_analysis_ids(app, limit=batch_size)
+        if recording_ids:
+            _start_testimony_transcript_job(
+                app,
+                limit=len(recording_ids),
+                statuses={"needs_review", "message_review"},
+                recording_ids=recording_ids,
+            )
+        return recording_ids
 
 
 def _initial_testimony_suggestion_job_state() -> dict:
@@ -4213,6 +4217,33 @@ def _run_testimony_transcript_job(
             processed_ids: set[str] = set()
             target_index = 0
             while True:
+                with app.testimony_transcript_job_lock:
+                    pending_ids = set(app.testimony_transcript_pending_ids)
+                    app.testimony_transcript_pending_ids.clear()
+                if pending_ids:
+                    queued_ids = processed_ids | {
+                        str(target["row"]["recording_id"])
+                        for target in targets[target_index:]
+                    }
+                    pending_ids.difference_update(queued_ids)
+                    if pending_ids:
+                        pending_targets = _testimony_transcript_targets(
+                            app,
+                            statuses={
+                                "needs_review",
+                                "message_review",
+                                "identified",
+                                "grouped",
+                                "already_named",
+                            },
+                            recording_ids=pending_ids,
+                        )
+                        targets[target_index:target_index] = pending_targets
+                        _update_testimony_transcript_job(
+                            app,
+                            total=len(targets),
+                            message=f"Analyzing {len(targets)} recordings.",
+                        )
                 if target_index >= len(targets):
                     with app.testimony_transcript_job_lock:
                         pending_ids = set(app.testimony_transcript_pending_ids)

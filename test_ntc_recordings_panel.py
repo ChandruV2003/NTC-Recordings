@@ -14,6 +14,7 @@ from ntc_recordings_app import (
     RecordingCandidate,
     _automatic_review_analysis_ids,
     _background_review_analysis_ids,
+    _queue_background_review_analysis,
     _date_from_file_metadata,
     _display_transcript_text,
     _extract_intro_speaker,
@@ -3399,6 +3400,63 @@ class RecordingRequestPanelTests(unittest.TestCase):
             recording_ids = _background_review_analysis_ids(self.app, limit=20)
 
         self.assertEqual(recording_ids, {"needs-review"})
+
+    def test_background_analysis_queues_live_intake_while_repair_is_running(self):
+        self.app.testimony_transcript_job["state"] = "running"
+        with (
+            patch("ntc_recordings_app._background_review_analysis_ids", return_value={"new-intake"}),
+            patch("ntc_recordings_app._start_testimony_transcript_job", return_value=False) as starter,
+        ):
+            recording_ids = _queue_background_review_analysis(self.app, batch_size=20)
+
+        self.assertEqual(recording_ids, {"new-intake"})
+        starter.assert_called_once_with(
+            self.app,
+            limit=1,
+            statuses={"needs_review", "message_review"},
+            recording_ids={"new-intake"},
+        )
+
+    def test_pending_live_intake_runs_before_remaining_repair_targets(self):
+        repair_recording = self.root / "REC-REPAIR.mp3"
+        live_recording = self.root / "REC-LIVE.mp3"
+        repair_recording.write_bytes(b"repair")
+        live_recording.write_bytes(b"live")
+        repair_id = _recording_id(repair_recording)
+        live_id = _recording_id(live_recording)
+        for recording_id, recording in ((repair_id, repair_recording), (live_id, live_recording)):
+            _save_testimony_review(
+                self.app,
+                recording_id=recording_id,
+                source_path=str(recording),
+                status="needs_review",
+                service_date="2026-07-31",
+                speaker_name="",
+                testimony_title="",
+                notes="",
+                proposed_path="",
+                duration_seconds=60,
+            )
+        self.app.testimony_transcript_pending_ids = {live_id}
+
+        call_order = []
+
+        def transcribe(_app, recording_path):
+            call_order.append(recording_path.name)
+            return (f"Transcript for {recording_path.name}", "")
+
+        with (
+            patch("ntc_recordings_app._transcribe_testimony_review_excerpt", side_effect=transcribe),
+            patch("ntc_recordings_app._classify_recorder_review_transcript", return_value=None),
+        ):
+            _run_testimony_transcript_job(
+                self.app,
+                limit=1,
+                statuses={"needs_review"},
+                recording_ids={repair_id},
+            )
+
+        self.assertEqual(call_order, [live_recording.name, repair_recording.name])
 
     def test_automatic_analysis_does_not_loop_failed_rows(self):
         item = {
