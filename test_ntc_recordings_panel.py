@@ -3477,6 +3477,60 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(_automatic_review_analysis_ids([item]), set())
 
+    def test_manual_retry_reprocesses_current_transcript_with_stored_error(self):
+        recording = self.root / "REC-RETRY.mp3"
+        recording.write_bytes(b"retry-audio")
+        recording_id = _recording_id(recording)
+        _save_testimony_review(
+            self.app,
+            recording_id=recording_id,
+            source_path=str(recording),
+            status="needs_review",
+            service_date="2026-07-31",
+            speaker_name="",
+            testimony_title="",
+            notes="",
+            proposed_path="",
+            duration_seconds=75,
+        )
+        _save_testimony_transcript(
+            self.app,
+            recording_id,
+            transcript_text="Praise the Lord.",
+            transcript_source="chunked-transcript-v1",
+            transcript_error="Transcript was empty.",
+        )
+
+        targets = _testimony_transcript_targets(
+            self.app,
+            statuses={"needs_review"},
+        )
+        self.assertEqual([target["row"]["recording_id"] for target in targets], [recording_id])
+
+        with (
+            patch(
+                "ntc_recordings_app._transcribe_testimony_review_excerpt",
+                return_value=("Praise the Lord. This is the complete repaired transcript.", ""),
+            ) as transcribe,
+            patch("ntc_recordings_app._classify_recorder_review_transcript", return_value=None),
+        ):
+            _run_testimony_transcript_job(
+                self.app,
+                limit=1,
+                statuses={"needs_review"},
+                recording_ids={recording_id},
+            )
+
+        transcribe.assert_called_once()
+        with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT transcript_text, transcript_error FROM testimony_reviews WHERE recording_id = ?",
+                (recording_id,),
+            ).fetchone()
+        self.assertIn("complete repaired transcript", row["transcript_text"])
+        self.assertEqual(row["transcript_error"], "")
+
     def test_background_analysis_reprocesses_legacy_transcripts_once(self):
         base_item = {
             "id": "legacy-transcript",

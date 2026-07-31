@@ -4284,6 +4284,7 @@ def _run_testimony_transcript_job(
                     bool(_display_transcript_text(transcript_text))
                     and _row_optional_text(row, "transcript_source")
                     == RECORDER_REVIEW_TRANSCRIPT_VERSION
+                    and not _row_optional_text(row, "transcript_error")
                 )
                 transcript_error = ""
                 if reused_transcript:
@@ -4446,6 +4447,7 @@ def _testimony_transcript_targets(
             bool(_display_transcript_text(_row_optional_text(row, "transcript_text")))
             and _row_optional_text(row, "transcript_source")
             == RECORDER_REVIEW_TRANSCRIPT_VERSION
+            and not _row_optional_text(row, "transcript_error")
         )
         has_current_analysis = (
             RECORDER_REVIEW_ANALYSIS_VERSION
