@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import html
 import hmac
-import fcntl
 import json
 import math
 import os
@@ -22,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -135,13 +135,13 @@ TRANSCRIPTION_MALFORMED_ERROR = (
     "Retry analysis."
 )
 TRANSCRIPTION_BUSY_ERROR = (
-    "Automatic transcription is busy. This recording remains queued for retry."
+    "Automatic transcription is busy. Retry analysis for this recording later."
 )
 TRANSCRIPTION_TIMEOUT_ERROR = (
-    "Automatic transcription timed out. This recording remains queued for retry."
+    "Automatic transcription timed out. Retry analysis for this recording."
 )
 TRANSCRIPTION_FAILED_ERROR = (
-    "Automatic transcription failed. This recording remains queued for retry."
+    "Automatic transcription failed. Retry analysis for this recording."
 )
 MONTHS = {
     "jan": 1,
@@ -402,20 +402,6 @@ def create_app(test_config: dict | None = None) -> Flask:
         NTC_RECORDINGS_AGENT_URL=os.getenv("NTC_RECORDINGS_AGENT_URL", ""),
         NTC_RECORDINGS_AGENT_TOKEN=os.getenv("NTC_RECORDINGS_AGENT_TOKEN", ""),
         NTC_RECORDINGS_AGENT_TIMEOUT=float(os.getenv("NTC_RECORDINGS_AGENT_TIMEOUT", "30")),
-        NTC_RECORDINGS_BACKGROUND_ANALYSIS_ENABLED=os.getenv(
-            "NTC_RECORDINGS_BACKGROUND_ANALYSIS_ENABLED",
-            "1",
-        ),
-        NTC_RECORDINGS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS=float(
-            os.getenv("NTC_RECORDINGS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS", "30")
-        ),
-        NTC_RECORDINGS_BACKGROUND_ANALYSIS_BATCH_SIZE=int(
-            os.getenv("NTC_RECORDINGS_BACKGROUND_ANALYSIS_BATCH_SIZE", "20")
-        ),
-        NTC_RECORDINGS_BACKGROUND_ANALYSIS_LOCK_PATH=os.getenv(
-            "NTC_RECORDINGS_BACKGROUND_ANALYSIS_LOCK_PATH",
-            "/tmp/ntc-recordings-analysis-worker.lock",
-        ),
         NTC_RECORDINGS_INDEX_REFRESH_SECONDS=float(
             os.getenv(
                 "NTC_RECORDINGS_INDEX_REFRESH_SECONDS",
@@ -1535,7 +1521,6 @@ def create_app(test_config: dict | None = None) -> Flask:
     def download_recording(token: str):
         return jsonify({"error": "recording downloads are disabled for shared links"}), 403
 
-    _start_recorder_analysis_worker(app)
     return app
 
 
@@ -3101,6 +3086,11 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                 if "agent_decision_at" in manifest_columns
                 else "'' AS agent_decision_at"
             )
+            transcript_error_select = (
+                "rf.transcript_error"
+                if "transcript_error" in manifest_columns
+                else "'' AS transcript_error"
+            )
             segment_select = (
                 "COALESCE(sa.file_kind, '') AS recorder_segment_kind, "
                 "COALESCE(sa.segment_count, 0) AS recorder_segment_count, "
@@ -3132,6 +3122,7 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                        rf.transcript_text,
                        rf.transcript_source,
                        rf.transcript_at,
+                       {transcript_error_select},
                        rf.classification,
                        rf.status,
                        rf.agent_decision_json,
@@ -3221,7 +3212,11 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                 except json.JSONDecodeError:
                     decision = {}
             manifest_transcript_text = str(row["transcript_text"] or "")
-            manifest_transcript_has_prompt_echo = _transcript_contains_prompt_echo(manifest_transcript_text)
+            manifest_transcript_quality_error = _transcript_quality_error(manifest_transcript_text)
+            manifest_transcript_error = (
+                _friendly_transcription_error(str(row["transcript_error"] or ""))
+                or manifest_transcript_quality_error
+            )
             agent_kind_raw = str(decision.get("recording_kind") or decision.get("kind") or "").strip().lower()
             agent_kind = _normalize_recording_kind(agent_kind_raw)
             if agent_kind == "unsure":
@@ -3230,16 +3225,16 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                 agent_kind = "testimony"
             agent_action = str(decision.get("action") or "").strip().lower()
             agent_reason = str(row["agent_review_reason"] or decision.get("reason") or decision.get("notes") or "").strip()
-            if manifest_transcript_has_prompt_echo:
+            if manifest_transcript_error:
                 agent_kind = "unknown"
                 agent_action = "review"
-                agent_reason = existing_transcript_error or TRANSCRIPTION_PROMPT_ECHO_ERROR
+                agent_reason = manifest_transcript_error
             if not agent_kind and str(row["classification"] or "") == "testimony_candidate":
                 agent_kind = "testimony"
             service_date = _normalize_date(str(decision.get("service_date") or "")) or (str(existing["service_date"] or "") if existing else "") or candidate.recording_date
             suggested_speaker = (
                 ""
-                if manifest_transcript_has_prompt_echo
+                if manifest_transcript_error
                 else _valid_person_name_suggestion(str(decision.get("speaker") or ""), known_speakers)
             )
             existing_status = str(existing["status"] or "") if existing else ""
@@ -3292,7 +3287,11 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                     duration_seconds=row["duration_seconds"],
                     suggested_speaker=suggested_speaker,
                     suggestion_source="recorder_manifest" if suggested_speaker else "",
-                    suggestion_text=_compact_transcript_excerpt(manifest_transcript_text) if suggested_speaker else "",
+                    suggestion_text=(
+                        _compact_transcript_excerpt(manifest_transcript_text)
+                        if suggested_speaker and not manifest_transcript_error
+                        else ""
+                    ),
                     recorder_agent_kind=agent_kind,
                     recorder_agent_action=agent_action,
                     recorder_agent_reason=agent_reason,
@@ -3332,7 +3331,7 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
             should_import_manifest_transcript = (
                 bool(manifest_transcript_text)
                 and (not existing or not _row_optional_text(existing, "transcript_text"))
-                and not (manifest_transcript_has_prompt_echo and existing_transcript_error)
+                and not manifest_transcript_error
             )
             if should_import_manifest_transcript:
                 _save_testimony_transcript(
@@ -3341,6 +3340,14 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                     transcript_text=manifest_transcript_text,
                     transcript_source=str(row["transcript_source"] or "recorder_manifest"),
                     transcript_error="",
+                )
+            elif manifest_transcript_error and not existing_transcript_error:
+                _save_testimony_transcript(
+                    app,
+                    review_recording_id,
+                    transcript_text="",
+                    transcript_source="",
+                    transcript_error=manifest_transcript_error,
                 )
     return archived_non_review_paths
 
@@ -3668,121 +3675,6 @@ def _testimony_status_label(status: str) -> str:
         "all": "All",
     }
     return labels.get(status, status.replace("_", " ").title())
-
-
-def _automatic_review_analysis_ids(items: Iterable[dict], limit: int = 20) -> set[str]:
-    recording_ids: set[str] = set()
-    for item in items:
-        transcript_text = _display_transcript_text(str(item.get("transcript_text") or ""))
-        transcript_error = str(item.get("transcript_error") or "")
-        agent_reason = str(item.get("recorder_agent_reason") or "")
-        manual_type_confirmed = agent_reason == "Classification confirmed in Recorder Review."
-        current_analysis = RECORDER_REVIEW_ANALYSIS_VERSION in agent_reason
-        current_transcript = (
-            str(item.get("transcript_source") or "") == RECORDER_REVIEW_TRANSCRIPT_VERSION
-        )
-        if (
-            transcript_text
-            and not transcript_error
-            and current_transcript
-            and (manual_type_confirmed or current_analysis)
-        ):
-            continue
-        # A failed attempt remains visible for diagnosis and an explicit retry.
-        # Re-running it every ten minutes made permanently bad audio consume the
-        # queue forever and caused the analysis banner to reappear indefinitely.
-        if transcript_error:
-            continue
-        recording_id = str(item.get("id") or "")
-        if recording_id:
-            recording_ids.add(recording_id)
-        if len(recording_ids) >= max(1, limit):
-            break
-    return recording_ids
-
-
-def _background_review_analysis_ids(app: Flask, limit: int = 20) -> set[str]:
-    if not has_request_context():
-        with app.test_request_context("/"):
-            return _background_review_analysis_ids(app, limit=limit)
-    # Intake rows are analyzed once. Completed review history must never be
-    # reconsidered by the recurring worker merely because an analysis format
-    # changed later.
-    eligible_statuses = {"needs_review", "message_review"}
-    items = [
-        item
-        for item in _testimony_review_items(app, known_speakers=_testimony_known_speakers(app))
-        if str(item.get("status") or "") in eligible_statuses
-    ]
-    return _automatic_review_analysis_ids(items, limit=max(1, limit))
-
-
-def _background_analysis_enabled(app: Flask) -> bool:
-    value = str(app.config.get("NTC_RECORDINGS_BACKGROUND_ANALYSIS_ENABLED") or "").strip().lower()
-    return (
-        value not in {"", "0", "false", "no", "off"}
-        and not app.config.get("TESTING")
-        and bool(app.config.get("NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL"))
-    )
-
-
-def _start_recorder_analysis_worker(app: Flask) -> None:
-    if not _background_analysis_enabled(app):
-        return
-    worker = threading.Thread(
-        target=_run_recorder_analysis_worker,
-        args=(app,),
-        name="recorder-analysis-worker",
-        daemon=True,
-    )
-    app.recorder_analysis_worker = worker
-    worker.start()
-
-
-def _run_recorder_analysis_worker(app: Flask) -> None:
-    interval_seconds = max(
-        5.0,
-        float(app.config.get("NTC_RECORDINGS_BACKGROUND_ANALYSIS_INTERVAL_SECONDS") or 30),
-    )
-    batch_size = max(
-        1,
-        min(int(app.config.get("NTC_RECORDINGS_BACKGROUND_ANALYSIS_BATCH_SIZE") or 20), 100),
-    )
-    lock_path = Path(
-        str(app.config.get("NTC_RECORDINGS_BACKGROUND_ANALYSIS_LOCK_PATH") or "").strip()
-        or "/tmp/ntc-recordings-analysis-worker.lock"
-    )
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as lock_handle:
-        try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            app.logger.info("Recorder analysis worker is already active in another process.")
-            return
-        app.logger.info(
-            "Recorder analysis worker started with a %ss interval and batch size %s.",
-            round(interval_seconds, 1),
-            batch_size,
-        )
-        while True:
-            try:
-                _queue_background_review_analysis(app, batch_size=batch_size)
-            except Exception:
-                app.logger.exception("Recorder background analysis cycle failed.")
-            time.sleep(interval_seconds)
-
-
-def _queue_background_review_analysis(app: Flask, batch_size: int) -> set[str]:
-    with app.app_context():
-        recording_ids = _background_review_analysis_ids(app, limit=batch_size)
-        if recording_ids:
-            _start_testimony_transcript_job(
-                app,
-                limit=len(recording_ids),
-                statuses={"needs_review", "message_review"},
-                recording_ids=recording_ids,
-            )
-        return recording_ids
 
 
 def _initial_testimony_suggestion_job_state() -> dict:
@@ -5039,7 +4931,7 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
                 "unknown" if transcript_rejected else "",
                 "review" if transcript_rejected else "",
                 transcript_error if transcript_rejected else "",
-                updated_at if transcript_rejected else "",
+                updated_at,
                 updated_at,
                 recording_id,
             ),
@@ -5959,7 +5851,7 @@ def _transcribe_testimony_review_excerpt(app: Flask, source_path: Path) -> tuple
                     "-t",
                     str(current_seconds),
                     "-af",
-                    "adelay=500:all=1",
+                    "adelay=1000:all=1",
                     "-ac",
                     "1",
                     "-ar",
@@ -6240,6 +6132,21 @@ def _transcript_quality_error(text: str) -> str:
     if _transcript_contains_prompt_echo(value):
         return TRANSCRIPTION_PROMPT_ECHO_ERROR
     if "\ufffd" in value or re.search(r"(?:\b[a-z]\b[\s,]*){8,}", value, re.IGNORECASE):
+        return TRANSCRIPTION_MALFORMED_ERROR
+    letter_scripts: dict[str, int] = {}
+    for character in value:
+        if not character.isalpha():
+            continue
+        name = unicodedata.name(character, "")
+        script = name.split(" ", 1)[0] if name else "UNKNOWN"
+        letter_scripts[script] = letter_scripts.get(script, 0) + 1
+    latin_letters = letter_scripts.get("LATIN", 0)
+    unrelated_letters = sum(
+        count
+        for script, count in letter_scripts.items()
+        if script not in {"LATIN", "COMMON", "INHERITED"}
+    )
+    if latin_letters >= 40 and unrelated_letters >= 3:
         return TRANSCRIPTION_MALFORMED_ERROR
     return ""
 
@@ -9362,14 +9269,25 @@ TESTIMONY_REVIEW_TEMPLATE = """
         text-transform:uppercase;
       }
       .fact strong { display:block; margin-top:.18rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-      .review-form { display:grid; gap:.75rem; align-self:start; }
+      .review-form {
+        display:grid;
+        gap:.75rem;
+        align-self:start;
+        width:100%;
+        max-width:100%;
+        min-width:0;
+      }
+      .edit-panel { width:100%; max-width:100%; }
       .classification-field {
         display:grid;
         grid-template-columns:auto minmax(12rem,18rem);
         gap:.65rem;
         align-items:center;
         justify-content:end;
+        min-width:0;
+        max-width:100%;
       }
+      .classification-field select { min-width:0; max-width:100%; }
       .classification-field > span {
         color:var(--muted);
         font:800 .66rem var(--mono);
@@ -9380,7 +9298,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
         display:grid;
         grid-template-columns:minmax(0,.72fr) minmax(0,1fr);
         gap:.72rem;
+        min-width:0;
+        max-width:100%;
       }
+      .form-grid > * { min-width:0; max-width:100%; }
       .wide { grid-column:1 / -1; }
       .path-panel {
         grid-column:1 / -1;
@@ -9413,7 +9334,10 @@ TESTIMONY_REVIEW_TEMPLATE = """
         border-radius:16px;
         background:rgba(116,221,180,.08);
         padding:.75rem;
+        min-width:0;
+        max-width:100%;
       }
+      .suggestion-panel > * { min-width:0; max-width:100%; }
       .suggestion-panel.subdued {
         border-color:rgba(143,211,255,.16);
         background:rgba(143,211,255,.045);
@@ -9425,13 +9349,14 @@ TESTIMONY_REVIEW_TEMPLATE = """
         letter-spacing:.12em;
         text-transform:uppercase;
       }
-      .suggestion-panel strong { display:block; margin-top:.14rem; color:#eff6ff; font-size:1.08rem; }
-      .suggestion-panel small { display:block; margin-top:.12rem; color:var(--muted); }
+      .suggestion-panel strong { display:block; margin-top:.14rem; color:#eff6ff; font-size:1.08rem; overflow-wrap:anywhere; }
+      .suggestion-panel small { display:block; margin-top:.12rem; color:var(--muted); overflow-wrap:anywhere; }
       .suggestion-panel p {
         grid-column:1 / -1;
         margin:0;
         color:var(--muted);
         line-height:1.45;
+        overflow-wrap:anywhere;
       }
       .review-provenance {
         color:var(--muted);
@@ -9493,6 +9418,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       .transcript-full p {
         white-space:pre-wrap;
         max-height:22rem;
+        overflow-wrap:anywhere;
       }
       .empty {
         border:1px dashed rgba(143,211,255,.25);
@@ -9581,6 +9507,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
         .metric { padding:.72rem; }
         .file-facts { grid-template-columns:minmax(0,1fr); }
+        .review-body { gap:.75rem; padding:.75rem; }
+        .listen-panel, .edit-panel { padding:.75rem; border-radius:15px; }
         .form-grid { grid-template-columns:1fr; }
         .review-row { grid-template-columns:2.3rem minmax(0,1fr); }
         .review-row > .row-selector { grid-column:1; grid-row:1 / span 5; }
@@ -9919,7 +9847,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
                         {% elif item.transcript_error %}
                           <p>{{ item.transcript_error }}</p>
                         {% else %}
-                          <small>Automatic analysis is queued.</small>
+                          <small>No transcript is available yet.</small>
                         {% endif %}
                         {% if item.transcript_text %}
                           <details class="transcript-full">
@@ -10266,7 +10194,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
         transcriptTextWrap.appendChild(transcriptLabel);
         transcriptPanel.appendChild(transcriptTextWrap);
         const paragraph = document.createElement("p");
-        paragraph.textContent = transcriptPreview || data.transcript_error || "Automatic analysis is queued.";
+        paragraph.textContent = transcriptPreview || data.transcript_error || "No transcript is available yet.";
         transcriptPanel.appendChild(paragraph);
         if (data.transcript_text) {
           const details = document.createElement("details");

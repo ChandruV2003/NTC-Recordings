@@ -12,9 +12,6 @@ import requests
 
 from ntc_recordings_app import (
     RecordingCandidate,
-    _automatic_review_analysis_ids,
-    _background_review_analysis_ids,
-    _queue_background_review_analysis,
     _date_from_file_metadata,
     _display_transcript_text,
     _extract_recording_date,
@@ -1664,7 +1661,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self._login()
         review_before = self.client.get("/admin/recorder-review?status=identified")
         self.assertEqual(review_before.status_code, 200)
-        self.assertIn(b"Automatic analysis is queued.", review_before.data)
+        self.assertIn(b"No transcript is available yet.", review_before.data)
         self.assertIn(b"<span>Recording Type</span>", review_before.data)
         self.assertIn(b'data-field="recording-kind-label">Testimony</strong>', review_before.data)
         self.assertIn(b"No alternate suggestion", review_before.data)
@@ -1786,8 +1783,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
     def test_malformed_transcripts_are_rejected_instead_of_displayed(self):
         replacement_garbage = "Valid words followed by broken bytes \ufffd\ufffd and more text."
         repeated_token_garbage = "There were words and then a a a a a a a a a a before more words."
+        mixed_script_garbage = (
+            "The transcript begins with ordinary English words before it breaks into "
+            "инк recognition 教學 and unrelated decoder output."
+        )
 
-        for transcript in (replacement_garbage, repeated_token_garbage):
+        for transcript in (replacement_garbage, repeated_token_garbage, mixed_script_garbage):
             self.assertIn("malformed", _transcript_quality_error(transcript).lower())
             self.assertEqual(_display_transcript_text(transcript), "")
 
@@ -1891,7 +1892,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(
             row["transcript_error"],
-            "Automatic transcription is busy. This recording remains queued for retry.",
+            "Automatic transcription is busy. Retry analysis for this recording later.",
         )
 
         _save_testimony_transcript(self.app, recording_id, "", "", raw_error)
@@ -2354,6 +2355,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
                     transcript_text TEXT NOT NULL DEFAULT '',
                     transcript_source TEXT NOT NULL DEFAULT '',
                     transcript_at TEXT NOT NULL DEFAULT '',
+                    transcript_error TEXT NOT NULL DEFAULT '',
                     classification TEXT NOT NULL,
                     status TEXT NOT NULL,
                     matched_path TEXT NOT NULL DEFAULT '',
@@ -2369,10 +2371,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 INSERT INTO recorder_files (
                     staged_path,
                     duration_seconds,
+                    transcript_error,
                     classification,
                     status,
                     last_seen_at
-                ) VALUES (?, ?, 'unknown', 'staged', ?)
+                ) VALUES (?, ?, 'Automatic transcription failed.', 'unknown', 'staged', ?)
                 """,
                 (str(raw_recording), 237.144, datetime.now(timezone.utc).isoformat()),
             )
@@ -2401,10 +2404,12 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(raw_recording.name.encode(), response.data)
         with sqlite3.connect(db_path) as connection:
             row = connection.execute(
-                "SELECT status FROM testimony_reviews WHERE source_path = ?",
+                "SELECT status, transcript_text, transcript_error FROM testimony_reviews WHERE source_path = ?",
                 (str(raw_recording),),
             ).fetchone()
-        self.assertEqual(row, ("needs_review",))
+        self.assertEqual(row[0], "needs_review")
+        self.assertEqual(row[1], "")
+        self.assertIn("failed", row[2].lower())
 
     def test_recorder_manifest_sync_is_reused_while_manifest_is_unchanged(self):
         app = create_app(
@@ -2574,7 +2579,6 @@ class RecordingRequestPanelTests(unittest.TestCase):
         )
         refreshed = client.get("/admin/recorder-review?status=needs_review")
         self.assertIn(b"Automatic transcription is busy", refreshed.data)
-        self.assertNotIn(b"Automatic transcript was rejected", refreshed.data)
         self.assertNotIn(b"whether this sounds like", refreshed.data)
         self.assertNotIn(b"429 Client Error", refreshed.data)
         self.assertNotIn(b"100.109.220.95", refreshed.data)
@@ -2591,7 +2595,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(retried_row["transcript_text"], "")
         self.assertEqual(
             retried_row["transcript_error"],
-            "Automatic transcription is busy. This recording remains queued for retry.",
+            "Automatic transcription is busy. Retry analysis for this recording later.",
         )
 
     def test_cached_transcript_is_reclassified_by_recorder_agent(self):
@@ -3363,7 +3367,6 @@ class RecordingRequestPanelTests(unittest.TestCase):
                 (recording_id,),
             ).fetchone()
         self.assertIn("recorder-review-v4", row["recorder_agent_reason"])
-        self.assertEqual(_automatic_review_analysis_ids([dict(row)]), set())
 
     def test_recorder_review_get_does_not_start_analysis_for_visible_rows(self):
         self.app.config["NTC_RECORDINGS_TESTIMONY_TRANSCRIBE_URL"] = "http://transcription.example.test"
@@ -3374,55 +3377,8 @@ class RecordingRequestPanelTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         start_job.assert_not_called()
+        self.assertFalse(hasattr(self.app, "recorder_analysis_worker"))
         self.assertIn(b'.review-row > .row-selector { grid-column:1; grid-row:1 / span 5; }', response.data)
-
-    def test_background_analysis_only_selects_unfinished_intake_rows(self):
-        items = [
-            {
-                "id": "needs-review",
-                "status": "needs_review",
-                "transcript_text": "",
-                "transcript_error": "",
-                "recorder_agent_reason": "",
-            },
-            {
-                "id": "identified",
-                "status": "identified",
-                "transcript_text": "",
-                "transcript_error": "",
-                "recorder_agent_reason": "",
-            },
-            {
-                "id": "discarded",
-                "status": "not_testimony",
-                "transcript_text": "",
-                "transcript_error": "",
-                "recorder_agent_reason": "",
-            },
-        ]
-        with (
-            patch("ntc_recordings_app._testimony_known_speakers", return_value=[]),
-            patch("ntc_recordings_app._testimony_review_items", return_value=items),
-        ):
-            recording_ids = _background_review_analysis_ids(self.app, limit=20)
-
-        self.assertEqual(recording_ids, {"needs-review"})
-
-    def test_background_analysis_queues_live_intake_while_repair_is_running(self):
-        self.app.testimony_transcript_job["state"] = "running"
-        with (
-            patch("ntc_recordings_app._background_review_analysis_ids", return_value={"new-intake"}),
-            patch("ntc_recordings_app._start_testimony_transcript_job", return_value=False) as starter,
-        ):
-            recording_ids = _queue_background_review_analysis(self.app, batch_size=20)
-
-        self.assertEqual(recording_ids, {"new-intake"})
-        starter.assert_called_once_with(
-            self.app,
-            limit=1,
-            statuses={"needs_review", "message_review"},
-            recording_ids={"new-intake"},
-        )
 
     def test_pending_live_intake_runs_before_remaining_repair_targets(self):
         repair_recording = self.root / "REC-REPAIR.mp3"
@@ -3464,18 +3420,6 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
 
         self.assertEqual(call_order, [live_recording.name, repair_recording.name])
-
-    def test_automatic_analysis_does_not_loop_failed_rows(self):
-        item = {
-            "id": "failed-row",
-            "status": "needs_review",
-            "transcript_text": "",
-            "transcript_error": "Automatic transcription failed.",
-            "recorder_agent_reason": "",
-            "transcript_source": "",
-        }
-
-        self.assertEqual(_automatic_review_analysis_ids([item]), set())
 
     def test_manual_retry_reprocesses_current_transcript_with_stored_error(self):
         recording = self.root / "REC-RETRY.mp3"
@@ -3531,28 +3475,6 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn("complete repaired transcript", row["transcript_text"])
         self.assertEqual(row["transcript_error"], "")
 
-    def test_background_analysis_reprocesses_legacy_transcripts_once(self):
-        base_item = {
-            "id": "legacy-transcript",
-            "status": "identified",
-            "transcript_text": "Praise the Lord. This transcript was stored by the old single-block pass.",
-            "transcript_error": "",
-            "recorder_agent_reason": "recorder-review-v4: Automatic transcript classification completed.",
-        }
-
-        self.assertEqual(
-            _automatic_review_analysis_ids(
-                [{**base_item, "transcript_source": "transcript_excerpt"}]
-            ),
-            {"legacy-transcript"},
-        )
-        self.assertEqual(
-            _automatic_review_analysis_ids(
-                [{**base_item, "transcript_source": "chunked-transcript-v1"}]
-            ),
-            set(),
-        )
-
     def test_chunked_transcript_preserves_start_and_covers_full_duration(self):
         recording = self.root / "REC00430.mp3"
         recording.write_bytes(b"audio")
@@ -3606,7 +3528,7 @@ class RecordingRequestPanelTests(unittest.TestCase):
             ["0", "60", "120"],
         )
         self.assertTrue(
-            all("adelay=500:all=1" in command for command in commands)
+            all("adelay=1000:all=1" in command for command in commands)
         )
 
     def test_chunked_transcript_skips_silent_chunks_and_keeps_later_speech(self):
@@ -3689,29 +3611,6 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(transcript, "")
         self.assertEqual(error, "Transcript was empty.")
         self.assertEqual(transcribe.call_count, 2)
-
-    def test_background_analysis_builds_review_items_without_browser_request(self):
-        review_root = self.root / "TestimonyReviewQueue"
-        review_root.mkdir()
-        recording = review_root / "REC00992.mp3"
-        recording.write_bytes(b"background-analysis-audio")
-        recording_id = _recording_id(recording)
-        _save_testimony_review(
-            self.app,
-            recording_id=recording_id,
-            source_path=str(recording),
-            status="needs_review",
-            service_date="2026-07-29",
-            speaker_name="",
-            testimony_title="",
-            notes="",
-            proposed_path="",
-            duration_seconds=90,
-        )
-
-        recording_ids = _background_review_analysis_ids(self.app, limit=20)
-
-        self.assertIn(recording_id, recording_ids)
 
     def test_finished_recorder_analysis_is_hidden_after_reload(self):
         self.app.testimony_transcript_job = {
