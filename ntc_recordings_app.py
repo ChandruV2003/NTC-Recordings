@@ -1167,7 +1167,9 @@ def create_app(test_config: dict | None = None) -> Flask:
             )
         known_speakers = _testimony_known_speakers(app)
         if status == "identified" and recording_kind in {"testimony", "message"}:
-            speaker_name = _valid_person_name_suggestion(speaker_name, known_speakers)
+            speaker_name = _clean_speaker_name(speaker_name)
+            if not _person_name_candidate(speaker_name, known_speakers):
+                speaker_name = ""
             if not speaker_name:
                 review_error = "Enter a speaker name before saving a speaker."
                 if _wants_json_response():
@@ -8858,16 +8860,44 @@ TESTIMONY_REVIEW_TEMPLATE = """
       label span { font:800 .64rem var(--mono); letter-spacing:.12em; text-transform:uppercase; }
       audio { width:100%; min-height:44px; }
       .banner {
-        margin-bottom:1rem;
+        margin:0;
         border:1px solid rgba(116,221,180,.35);
         background:var(--good-soft);
         color:var(--good);
         border-radius:16px;
-        padding:.85rem;
+        display:grid;
+        grid-template-columns:minmax(0,1fr) auto;
+        align-items:start;
+        gap:.75rem;
+        padding:.85rem .9rem;
         font-weight:850;
+        box-shadow:0 18px 48px rgba(0,0,0,.42);
+        pointer-events:auto;
       }
       .banner.error { border-color:rgba(255,154,154,.4); background:var(--bad-soft); color:#ffaaaa; }
+      .banner-dismiss {
+        width:2rem;
+        min-height:2rem;
+        border-radius:50%;
+        padding:0;
+        display:grid;
+        place-items:center;
+        color:inherit;
+        background:rgba(5,13,24,.35);
+        line-height:1;
+      }
+      .banner-stack {
+        position:fixed;
+        z-index:1000;
+        top:max(1rem, env(safe-area-inset-top));
+        right:max(1rem, env(safe-area-inset-right));
+        width:min(30rem, calc(100vw - 2rem));
+        display:grid;
+        gap:.6rem;
+        pointer-events:none;
+      }
       .banner-stack:empty { display:none; }
+      .review-card.has-submit-error { border-color:rgba(255,154,154,.72); }
       .metrics {
         display:grid;
         grid-template-columns:repeat(6,minmax(0,1fr));
@@ -9554,6 +9584,13 @@ TESTIMONY_REVIEW_TEMPLATE = """
         .panel-controls > .probe-form { grid-template-columns:minmax(0,1fr) 4.7rem; }
         .panel-controls > .probe-form > button { grid-column:1 / -1; }
       }
+      @media (max-width:600px) {
+        .banner-stack {
+          top:max(.65rem, env(safe-area-inset-top));
+          right:max(.65rem, env(safe-area-inset-right));
+          width:calc(100vw - 1.3rem);
+        }
+      }
     </style>
   </head>
   <body>
@@ -9576,9 +9613,9 @@ TESTIMONY_REVIEW_TEMPLATE = """
           <option value="{{ speaker_name }}"></option>
         {% endfor %}
       </datalist>
-      <div class="banner-stack" data-banner-stack>
-        {% if message %}<div class="banner">{{ message }}</div>{% endif %}
-        {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+      <div class="banner-stack" data-banner-stack aria-live="polite" aria-atomic="true">
+        {% if message %}<div class="banner" role="status"><span>{{ message }}</span><button class="banner-dismiss" type="button" data-banner-dismiss aria-label="Dismiss notification" title="Dismiss">X</button></div>{% endif %}
+        {% if error %}<div class="banner error" role="alert"><span>{{ error }}</span><button class="banner-dismiss" type="button" data-banner-dismiss aria-label="Dismiss notification" title="Dismiss">X</button></div>{% endif %}
       </div>
       <section class="metrics" aria-label="Recorder review status">
         <div class="metric"><span>Needs Review</span><strong data-count="needs_review">{{ counts.needs_review + counts.message_review }}</strong><small>Needs a type, speaker, or filing decision</small></div>
@@ -9930,13 +9967,46 @@ TESTIMONY_REVIEW_TEMPLATE = """
         });
       }
 
+      let bannerTimer = null;
+
+      function dismissBanner(banner) {
+        if (!banner) return;
+        banner.remove();
+        if (bannerTimer) {
+          window.clearTimeout(bannerTimer);
+          bannerTimer = null;
+        }
+      }
+
+      function armBanner(banner, isError = false) {
+        banner.querySelector("[data-banner-dismiss]")?.addEventListener("click", () => dismissBanner(banner));
+        if (!isError) {
+          bannerTimer = window.setTimeout(() => dismissBanner(banner), 5000);
+        }
+      }
+
       function showBanner(message, isError = false) {
         if (!bannerStack || !message) return;
+        if (bannerTimer) {
+          window.clearTimeout(bannerTimer);
+          bannerTimer = null;
+        }
         bannerStack.replaceChildren();
         const banner = document.createElement("div");
         banner.className = `banner${isError ? " error" : ""}`;
-        banner.textContent = message;
+        banner.setAttribute("role", isError ? "alert" : "status");
+        const text = document.createElement("span");
+        text.textContent = message;
+        const dismiss = document.createElement("button");
+        dismiss.className = "banner-dismiss";
+        dismiss.type = "button";
+        dismiss.dataset.bannerDismiss = "";
+        dismiss.setAttribute("aria-label", "Dismiss notification");
+        dismiss.title = "Dismiss";
+        dismiss.textContent = "X";
+        banner.append(text, dismiss);
         bannerStack.appendChild(banner);
+        armBanner(banner, isError);
       }
 
       function setText(card, field, value) {
@@ -10274,6 +10344,8 @@ TESTIMONY_REVIEW_TEMPLATE = """
           if (showSuccess) {
             showBanner(error.message || "The recorder update failed.", true);
           }
+          card.classList.add("has-submit-error");
+          window.setTimeout(() => card.classList.remove("has-submit-error"), 6000);
           return { ok: false, error: error.message || "The recorder update failed." };
         } finally {
           card.classList.remove("is-saving");
@@ -10356,9 +10428,18 @@ TESTIMONY_REVIEW_TEMPLATE = """
 
       document.addEventListener("keydown", (event) => {
         const selector = event.target.closest("[data-row-selector]");
-        if (!selector || !["Enter", " "].includes(event.key)) return;
+        if (selector && ["Enter", " "].includes(event.key)) {
+          event.preventDefault();
+          selector.click();
+          return;
+        }
+        if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+        if (!event.target.matches('input[name="speaker_name"], input[name="group_title"]')) return;
+        const form = event.target.closest(".review-form");
+        const saveButton = form?.querySelector('button[name="action"][value="save_review"]');
+        if (!form || !saveButton || saveButton.disabled) return;
         event.preventDefault();
-        selector.click();
+        form.requestSubmit(saveButton);
       });
 
       function hydrateReviewAudio(card) {
@@ -10456,6 +10537,7 @@ TESTIMONY_REVIEW_TEMPLATE = """
       }
 
       restoreOpenCards();
+      bannerStack?.querySelectorAll(".banner").forEach((banner) => armBanner(banner, banner.classList.contains("error")));
       updateBulkToolbar();
       document.querySelectorAll(".review-card[open]").forEach(hydrateReviewAudio);
       if (document.querySelector("[data-transcript-job]")?.dataset.state === "running") {

@@ -1036,6 +1036,53 @@ class RecordingRequestPanelTests(unittest.TestCase):
             )
             self.assertTrue(history[0][6])
 
+    def test_recorder_review_preserves_a_manually_added_speaker_title(self):
+        testimony_source_root = self.root / "TestimonyReviewQueue"
+        testimony_source_root.mkdir(exist_ok=True)
+        raw_recording = testimony_source_root / "REC00901.mp3"
+        raw_recording.write_bytes(b"manual-speaker-title-audio")
+        recording_id = _recording_id(raw_recording)
+
+        self._login()
+        first = self.client.post(
+            f"/admin/testimonies/{recording_id}/review",
+            data={
+                "action": "save_review",
+                "status_filter": "needs_review",
+                "source_path": str(raw_recording),
+                "service_date": "2026-08-02",
+                "recording_kind": "testimony",
+                "speaker_name": "Edwin",
+                "review_revision": "0",
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        first_payload = first.get_json()
+        filed_path = Path(first_payload["source_path"])
+        filed_recording_id = first_payload["recording_id"]
+
+        corrected = self.client.post(
+            f"/admin/testimonies/{filed_recording_id}/review",
+            data={
+                "action": "save_review",
+                "status_filter": "identified",
+                "source_path": str(filed_path),
+                "service_date": "2026-08-02",
+                "recording_kind": "testimony",
+                "speaker_name": "Brother Edwin",
+                "review_revision": str(first_payload["review_revision"]),
+            },
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(corrected.status_code, 200)
+        payload = corrected.get_json()
+        self.assertEqual(payload["speaker_name"], "Brother Edwin")
+        self.assertEqual(payload["title"], "August 2, 2026 - Brother Edwin's Testimony")
+        self.assertTrue(payload["source_path"].endswith("August 2, 2026 - Brother Edwin's Testimony.mp3"))
+
     def test_ntc_recorder_review_files_confirmed_worship_in_worship_library(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir()
@@ -1551,6 +1598,25 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"function submissionUrl(form, submitter)", response.data)
         self.assertIn(b'getAttribute("formaction")', response.data)
         self.assertNotIn(b"submitter.formAction ? submitter.formAction : form.action", response.data)
+
+    def test_recorder_review_enter_saves_and_feedback_stays_visible(self):
+        testimony_source_root = self.root / "TestimonyReviewQueue"
+        testimony_source_root.mkdir()
+        (testimony_source_root / "REC00089.mp3").write_bytes(b"async-testimony-audio")
+
+        self._login()
+        response = self.client.get("/admin/recorder-review")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            b'event.target.matches(\'input[name="speaker_name"], input[name="group_title"]\')',
+            response.data,
+        )
+        self.assertIn(b"form.requestSubmit(saveButton);", response.data)
+        self.assertIn(b'data-banner-stack aria-live="polite"', response.data)
+        self.assertIn(b'dismiss.setAttribute("aria-label", "Dismiss notification");', response.data)
+        self.assertIn(b'bannerStack?.querySelectorAll(".banner")', response.data)
+        self.assertIn(b"position:fixed;", response.data)
 
     def test_bulk_testimony_suggestions_route_starts_background_job(self):
         testimony_source_root = self.root / "TestimonyReviewQueue"
