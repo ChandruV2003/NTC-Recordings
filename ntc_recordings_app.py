@@ -3213,6 +3213,7 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                         decision = parsed
                 except json.JSONDecodeError:
                     decision = {}
+            decision_evidence = decision.get("evidence") if isinstance(decision.get("evidence"), dict) else {}
             manifest_transcript_text = str(row["transcript_text"] or "")
             manifest_transcript_quality_error = _transcript_quality_error(manifest_transcript_text)
             manifest_transcript_error = (
@@ -3234,16 +3235,56 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
             if not agent_kind and str(row["classification"] or "") == "testimony_candidate":
                 agent_kind = "testimony"
             service_date = _normalize_date(str(decision.get("service_date") or "")) or (str(existing["service_date"] or "") if existing else "") or candidate.recording_date
-            suggested_speaker = (
-                ""
-                if manifest_transcript_error
-                else _valid_person_name_suggestion(str(decision.get("speaker") or ""), known_speakers)
+            decision_speaker = _valid_person_name_suggestion(
+                str(decision.get("speaker") or ""),
+                known_speakers,
+            )
+            advisory_speaker = _valid_person_name_suggestion(
+                str(decision_evidence.get("advisor_speaker_candidate") or ""),
+                known_speakers,
+            )
+            suggested_speaker = "" if manifest_transcript_error else decision_speaker or advisory_speaker
+            suggested_speaker_source = (
+                "recorder_manifest"
+                if decision_speaker
+                else "service_codex_review"
+                if advisory_speaker
+                else ""
+            )
+            existing_suggested_speaker = (
+                _valid_person_name_suggestion(str(existing["suggested_speaker"] or ""), known_speakers)
+                if existing
+                else ""
+            )
+            existing_suggestion_source = str(existing["suggestion_source"] or "") if existing else ""
+            import_manifest_suggestion = bool(
+                suggested_speaker
+                and not (str(existing["speaker_name"] or "") if existing else "")
+                and (
+                    not existing_suggested_speaker
+                    or existing_suggestion_source in {"recorder_manifest", "service_codex_review"}
+                )
             )
             existing_status = str(existing["status"] or "") if existing else ""
             existing_agent_updated_at = _row_optional_text(existing, "recorder_agent_updated_at")
             manifest_agent_updated_at = str(row["agent_decision_at"] or "")
+            existing_agent_has_value = bool(
+                existing
+                and any(
+                    _row_optional_text(existing, column)
+                    for column in (
+                        "recorder_agent_kind",
+                        "recorder_agent_action",
+                        "recorder_agent_reason",
+                        "recorder_agent_version",
+                        "recorder_agent_traits_json",
+                        "recorder_agent_evidence_json",
+                    )
+                )
+            )
             preserve_existing_agent = bool(
                 existing
+                and existing_agent_has_value
                 and existing_agent_updated_at
                 and (
                     not manifest_agent_updated_at
@@ -3288,7 +3329,7 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                     proposed_path=proposed_path,
                     duration_seconds=row["duration_seconds"],
                     suggested_speaker=suggested_speaker,
-                    suggestion_source="recorder_manifest" if suggested_speaker else "",
+                    suggestion_source=suggested_speaker_source,
                     suggestion_text=(
                         _compact_transcript_excerpt(manifest_transcript_text)
                         if suggested_speaker and not manifest_transcript_error
@@ -3307,6 +3348,14 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                 )
                 existing = _testimony_review_row(app, review_recording_id)
             else:
+                import_manifest_review_fields = bool(
+                    archived_testimony
+                    or (
+                        review_title
+                        and not str(existing["testimony_title"] or "")
+                        and agent_kind in {"message", "worship"}
+                    )
+                )
                 _save_testimony_review(
                     app,
                     recording_id=review_recording_id,
@@ -3318,6 +3367,13 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                     notes=str(existing["notes"] or ""),
                     proposed_path=proposed_path,
                     duration_seconds=row["duration_seconds"],
+                    suggested_speaker=suggested_speaker if import_manifest_suggestion else None,
+                    suggestion_source=suggested_speaker_source if import_manifest_suggestion else None,
+                    suggestion_text=(
+                        _compact_transcript_excerpt(manifest_transcript_text)
+                        if import_manifest_suggestion and not manifest_transcript_error
+                        else None
+                    ),
                     recorder_agent_kind=None if preserve_existing_agent else agent_kind,
                     recorder_agent_action=None if preserve_existing_agent else agent_action,
                     recorder_agent_reason=None if preserve_existing_agent else agent_reason,
@@ -3327,7 +3383,7 @@ def _sync_testimony_recorder_manifest_reviews_uncached(
                     recorder_segments_json=str(row["recorder_segments_json"] or ""),
                     recorder_segment_reasons=str(row["recorder_segment_reasons"] or ""),
                     recorder_segment_warnings=str(row["recorder_segment_warnings"] or ""),
-                    update_review_fields=archived_testimony,
+                    update_review_fields=import_manifest_review_fields,
                 )
                 existing = _testimony_review_row(app, review_recording_id)
             should_import_manifest_transcript = (
@@ -4371,6 +4427,7 @@ def _testimony_suggestion_source_label(source: str) -> str:
         "transcript_excerpt": "from transcript",
         "history": "from confirmed history",
         "recorder_manifest": "from recorder pipeline",
+        "service_codex_review": "from service review",
     }
     return labels.get(source, source.replace("_", " ") if source else "")
 
@@ -4902,10 +4959,6 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
         transcript_text = _display_transcript_text(transcript_text)
         transcript_error = _friendly_transcription_error(transcript_error)
     updated_at = _utc_now()
-    transcript_rejected = transcript_error in {
-        TRANSCRIPTION_PROMPT_ECHO_ERROR,
-        TRANSCRIPTION_MALFORMED_ERROR,
-    }
     with _connect(app.config["NTC_RECORDINGS_DB_PATH"]) as connection:
         connection.execute(
             """
@@ -4914,14 +4967,6 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
                 transcript_source = ?,
                 transcript_error = ?,
                 transcript_updated_at = ?,
-                recorder_agent_kind = ?,
-                recorder_agent_action = ?,
-                recorder_agent_reason = ?,
-                recorder_agent_updated_at = ?,
-                recorder_agent_version = '',
-                recorder_agent_confidence = 0,
-                recorder_agent_traits_json = '',
-                recorder_agent_evidence_json = '',
                 updated_at = ?
             WHERE recording_id = ?
             """,
@@ -4929,10 +4974,6 @@ def _save_testimony_transcript(app: Flask, recording_id: str, transcript_text: s
                 transcript_text,
                 transcript_source,
                 transcript_error,
-                updated_at,
-                "unknown" if transcript_rejected else "",
-                "review" if transcript_rejected else "",
-                transcript_error if transcript_rejected else "",
                 updated_at,
                 updated_at,
                 recording_id,
@@ -4963,21 +5004,11 @@ def _sanitize_existing_testimony_transcripts(connection: sqlite3.Connection) -> 
             transcript_source = '',
             transcript_error = ?,
             transcript_updated_at = ?,
-            recorder_agent_kind = 'unknown',
-            recorder_agent_action = 'review',
-            recorder_agent_reason = ?,
-            recorder_agent_updated_at = ?,
-            recorder_agent_version = '',
-            recorder_agent_confidence = 0,
-            recorder_agent_traits_json = '',
-            recorder_agent_evidence_json = '',
             updated_at = ?
         WHERE recording_id = ?
         """,
         [
             (
-                quality_error,
-                updated_at,
                 quality_error,
                 updated_at,
                 updated_at,

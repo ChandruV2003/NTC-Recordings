@@ -1764,6 +1764,154 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"View full transcript", review_after.data)
         self.assertIn(b"thank God for helping me", review_after.data)
 
+    def test_saving_transcript_preserves_existing_agent_recommendation(self):
+        recording = self.root / "REC-PRESERVE-AGENT.mp3"
+        recording.write_bytes(b"preserve-agent-audio")
+        recording_id = _recording_id(recording)
+        _save_testimony_review(
+            self.app,
+            recording_id=recording_id,
+            source_path=str(recording),
+            status="needs_review",
+            service_date="2026-08-02",
+            speaker_name="",
+            testimony_title="Interceding for the World",
+            notes="",
+            proposed_path="",
+            duration_seconds=3489,
+            recorder_agent_kind="message",
+            recorder_agent_action="review",
+            recorder_agent_reason="No speaker was confirmed.",
+        )
+
+        _save_testimony_transcript(
+            self.app,
+            recording_id,
+            "[start] Shall we pray and intercede for the needs of the world.",
+            "live_transcript_alignment",
+            "",
+        )
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT testimony_title, recorder_agent_kind, recorder_agent_action,
+                       recorder_agent_reason, transcript_source
+                FROM testimony_reviews
+                WHERE recording_id = ?
+                """,
+                (recording_id,),
+            ).fetchone()
+        self.assertEqual(row["testimony_title"], "Interceding for the World")
+        self.assertEqual(row["recorder_agent_kind"], "message")
+        self.assertEqual(row["recorder_agent_action"], "review")
+        self.assertEqual(row["recorder_agent_reason"], "No speaker was confirmed.")
+        self.assertEqual(row["transcript_source"], "live_transcript_alignment")
+
+    def test_manifest_sync_recovers_advisory_speaker_after_blank_refresh(self):
+        intake_root = Path(self.tempdir.name) / "_IncomingRecorderIntake"
+        review_root = intake_root / "TestimonyReviewQueue"
+        staged_root = intake_root / "DN700R-primary"
+        review_root.mkdir(parents=True)
+        staged_root.mkdir(parents=True)
+        raw_recording = staged_root / "08022026122015_DN-700R.mp3"
+        raw_recording.write_bytes(b"message-audio")
+        manifest_path = Path(self.tempdir.name) / "advisory-speaker-manifest.sqlite3"
+        decision = {
+            "action": "review",
+            "recording_kind": "message",
+            "speaker": "",
+            "title": "Interceding for the World",
+            "service_date": "2026-08-02",
+            "evidence": {"advisor_speaker_candidate": "Pas Gregg"},
+        }
+        with sqlite3.connect(manifest_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE recorder_files (
+                    staged_path TEXT NOT NULL,
+                    duration_seconds REAL,
+                    transcript_text TEXT NOT NULL DEFAULT '',
+                    transcript_source TEXT NOT NULL DEFAULT '',
+                    transcript_at TEXT NOT NULL DEFAULT '',
+                    transcript_error TEXT NOT NULL DEFAULT '',
+                    classification TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    matched_path TEXT NOT NULL DEFAULT '',
+                    matched_kind TEXT NOT NULL DEFAULT '',
+                    agent_decision_json TEXT NOT NULL DEFAULT '',
+                    agent_decision_at TEXT NOT NULL DEFAULT '',
+                    agent_review_reason TEXT NOT NULL DEFAULT '',
+                    last_seen_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO recorder_files (
+                    staged_path, duration_seconds, transcript_text, transcript_source,
+                    transcript_at, classification, status, agent_decision_json,
+                    agent_decision_at, agent_review_reason, last_seen_at
+                ) VALUES (?, 3489, ?, 'local_transcription', ?, 'message_candidate',
+                          'staged', ?, ?, 'No speaker was confirmed.', ?)
+                """,
+                (
+                    str(raw_recording),
+                    "[start] Shall we pray and intercede for the world.",
+                    "2026-08-03T03:07:00+00:00",
+                    json.dumps(decision),
+                    "2026-08-03T03:20:00+00:00",
+                    "2026-08-03T03:20:00+00:00",
+                ),
+            )
+
+        db_path = Path(self.tempdir.name) / "advisory-speaker-requests.db"
+        app = create_app(
+            {
+                "TESTING": True,
+                "SECRET_KEY": "advisory-speaker-test-secret",
+                "NTC_RECORDINGS_DB_PATH": str(db_path),
+                "NTC_RECORDINGS_LIBRARY_DIRS": f"message:{self.root},worship:{self.worship_root},testimony:{self.testimony_root}",
+                "NTC_RECORDINGS_TESTIMONY_SOURCE_DIR": str(review_root),
+                "NTC_RECORDINGS_TESTIMONY_ALLOWED_DIRS": str(intake_root),
+                "NTC_RECORDINGS_TESTIMONY_RECORDER_MANIFESTS": str(manifest_path),
+                "NTC_RECORDINGS_TESTIMONY_LIBRARY_DIR": str(self.testimony_root),
+                "NTC_RECORDINGS_TESTIMONY_REJECTED_DIR": str(self.rejected_root),
+            }
+        )
+        _sync_testimony_recorder_manifest_reviews(app, known_speakers=["Pas Gregg"])
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                """
+                UPDATE testimony_reviews
+                SET recorder_agent_kind = '', recorder_agent_action = '', recorder_agent_reason = '',
+                    recorder_agent_updated_at = '2026-08-03T13:54:53+00:00', testimony_title = '',
+                    suggested_speaker = '', suggestion_source = '', suggestion_text = ''
+                WHERE source_path = ?
+                """,
+                (str(raw_recording),),
+            )
+
+        _sync_testimony_recorder_manifest_reviews(app, known_speakers=["Pas Gregg"])
+
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT testimony_title, suggested_speaker, suggestion_source,
+                       recorder_agent_kind, recorder_agent_action
+                FROM testimony_reviews
+                WHERE source_path = ?
+                """,
+                (str(raw_recording),),
+            ).fetchone()
+        self.assertEqual(row["testimony_title"], "Interceding for the World")
+        self.assertEqual(row["suggested_speaker"], "Pas Gregg")
+        self.assertEqual(row["suggestion_source"], "service_codex_review")
+        self.assertEqual(row["recorder_agent_kind"], "message")
+        self.assertEqual(row["recorder_agent_action"], "review")
+
     def test_transcript_display_hides_internal_window_markers(self):
         cleaned = _display_transcript_text(
             "[start] Praise the Lord. I thank God for His faithfulness.\n\n"
