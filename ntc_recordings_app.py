@@ -655,6 +655,7 @@ def create_app(test_config: dict | None = None) -> Flask:
             ),
         }
         tab_title, tab_description, empty_message = tab_copy[active_tab]
+        share_library_items = _share_library_items(app, recordings, limit=48)
         return render_template_string(
             RECORDING_ADMIN_TEMPLATE,
             title=app.config["NTC_RECORDINGS_PANEL_TITLE"],
@@ -674,6 +675,8 @@ def create_app(test_config: dict | None = None) -> Flask:
             auto_archive_days=int(app.config.get("NTC_RECORDINGS_AUTO_ARCHIVE_DAYS") or 0),
             candidates_by_request=candidates_by_request,
             candidate_groups_by_request=candidate_groups_by_request,
+            share_library_items=share_library_items,
+            share_library_search_url=_recordings_url_for(app, "admin_library_search"),
             email_enabled=_email_enabled(app),
             share_provider=(app.config.get("NTC_RECORDINGS_SHARE_PROVIDER") or "internal"),
             message=request.args.get("message"),
@@ -684,6 +687,77 @@ def create_app(test_config: dict | None = None) -> Flask:
             format_date=_format_date,
             format_datetime=_format_datetime,
         )
+
+    @app.get("/admin/library/search")
+    def admin_library_search():
+        guard = _require_admin()
+        if guard:
+            return guard
+        query = (request.args.get("q") or "").strip()
+        recording_kind = (request.args.get("kind") or "").strip()
+        return jsonify(
+            {
+                "ok": True,
+                "items": _share_library_items(
+                    app,
+                    _get_recordings(app),
+                    query=query,
+                    recording_kind=recording_kind,
+                    limit=80,
+                ),
+            }
+        )
+
+    @app.post("/admin/requests/create")
+    def create_admin_share():
+        guard = _require_admin()
+        if guard:
+            return guard
+        requester_name = (request.form.get("requester_name") or "").strip()
+        email = (request.form.get("email") or "").strip()
+        secondary_email = (request.form.get("secondary_email") or "").strip()
+        recording_id = (request.form.get("recording_id") or "").strip()
+        delivery_action = (request.form.get("delivery_action") or "prepare").strip().lower()
+        if not requester_name or not email:
+            return _redirect_to(app, "admin_panel", error="Recipient name and email are required.")
+        if not _valid_email_address(email) or (secondary_email and not _valid_email_address(secondary_email)):
+            return _redirect_to(app, "admin_panel", error="Enter a valid recipient email address.")
+        candidate = _recording_target_by_id(app, recording_id)
+        if not candidate:
+            return _redirect_to(app, "admin_panel", error="Choose a recording or worship folder to share.")
+        if delivery_action not in {"prepare", "send"}:
+            return _redirect_to(app, "admin_panel", error="Choose whether to create the link or send it by email.")
+        request_id = _insert_request(
+            app,
+            requester_name=requester_name,
+            email=email,
+            secondary_email=secondary_email,
+            phone="",
+            recording_kind=candidate.kind,
+            requested_date=candidate.recording_date or "",
+            notes=(request.form.get("notes") or "").strip(),
+            candidate=candidate,
+        )
+        row = _get_request(app, request_id)
+        if not row:  # pragma: no cover - defensive database guard
+            return _redirect_to(app, "admin_panel", error="The new share request could not be loaded.")
+        email_message = _normalize_recording_email_message((request.form.get("email_message") or "").strip())
+        if not email_message:
+            email_message = _default_recording_email_message(row, candidate)
+        _status, email_sent = _prepare_request_share(
+            app,
+            row,
+            candidate,
+            email_message,
+            send_email=delivery_action == "send",
+        )
+        if email_sent:
+            message = f"Recording link emailed to {email}."
+        elif delivery_action == "send":
+            message = "Share link is ready; email delivery needs attention."
+        else:
+            message = "Share link is ready."
+        return _redirect_to(app, "admin_panel", tab="completed", message=message)
 
     @app.route("/admin/service-completeness", methods=["GET", "POST"])
     @app.route("/admin/service-completeness/<service_date>", methods=["GET", "POST"])
@@ -1443,22 +1517,12 @@ def create_app(test_config: dict | None = None) -> Flask:
         email_message = _normalize_recording_email_message((request.form.get("email_message") or "").strip())
         if not email_message:
             email_message = _default_recording_email_message(row, candidate)
-        token = row["share_token"] or secrets.token_urlsafe(22)
-        share_url, share_provider, share_external_id, share_error = _create_share_link(app, candidate, token, existing_row=row)
-        email_sent, email_error = _send_recording_email(app, row, candidate, share_url, email_message)
-        status = "sent" if email_sent else "ready"
-        combined_error = "; ".join(item for item in (share_error, email_error) if item)
-        _mark_request_shared(
+        _status, email_sent = _prepare_request_share(
             app,
-            request_id,
+            row,
             candidate,
-            token,
-            share_url=share_url,
-            share_provider=share_provider,
-            share_external_id=share_external_id,
-            status=status,
-            email_error=combined_error,
-            email_message=email_message,
+            email_message,
+            send_email=True,
         )
         if email_sent:
             return _redirect_to(app, "admin_panel", tab=target_tab, message=f"Recording link emailed to {row['email']}.")
@@ -2698,6 +2762,51 @@ def _candidate_groups(candidates: Iterable[RecordingCandidate]) -> list[dict]:
         {"kind": kind, "label": _recording_kind_label(kind), "options": grouped[kind]}
         for kind in sorted(grouped, key=lambda item: order.get(item, 99))
     ]
+
+
+def _share_library_items(
+    app: Flask,
+    recordings: Iterable[RecordingCandidate],
+    *,
+    query: str = "",
+    recording_kind: str = "",
+    limit: int = 80,
+) -> list[dict]:
+    candidates = _all_recording_targets(app, recordings)
+    normalized_kind = _normalize_recording_kind(recording_kind)
+    if recording_kind.strip().lower() in {"", "all"}:
+        normalized_kind = ""
+    query_terms = [term for term in re.findall(r"[a-z0-9]+", query.casefold()) if term]
+    items = []
+    for candidate in candidates:
+        if normalized_kind and candidate.kind != normalized_kind:
+            continue
+        haystack = " ".join(
+            (
+                candidate.title,
+                candidate.recording_date,
+                candidate.kind,
+                candidate.relative_path,
+            )
+        ).casefold()
+        if query_terms and not all(term in haystack for term in query_terms):
+            continue
+        items.append(
+            {
+                "id": candidate.id,
+                "title": candidate.title,
+                "recording_date": candidate.recording_date,
+                "recording_date_label": _format_date(candidate.recording_date),
+                "kind": candidate.kind,
+                "kind_label": _recording_kind_label(candidate.kind),
+                "relative_path": candidate.relative_path,
+                "target_type": candidate.target_type,
+                "file_count": candidate.file_count,
+            }
+        )
+        if len(items) >= max(1, min(int(limit or 80), 100)):
+            break
+    return items
 
 
 def _request_groups(requests: Iterable[sqlite3.Row]) -> list[dict]:
@@ -6520,6 +6629,42 @@ def _create_share_link(
     return internal_url, "internal", "", f"Nextcloud share fallback: {error or 'not configured'}"
 
 
+def _prepare_request_share(
+    app: Flask,
+    row: sqlite3.Row,
+    candidate: RecordingCandidate,
+    email_message: str,
+    *,
+    send_email: bool,
+) -> tuple[str, bool]:
+    token = row["share_token"] or secrets.token_urlsafe(22)
+    share_url, share_provider, share_external_id, share_error = _create_share_link(
+        app,
+        candidate,
+        token,
+        existing_row=row,
+    )
+    email_sent = False
+    email_error = ""
+    if send_email:
+        email_sent, email_error = _send_recording_email(app, row, candidate, share_url, email_message)
+    status = "sent" if email_sent else "ready"
+    combined_error = "; ".join(item for item in (share_error, email_error) if item)
+    _mark_request_shared(
+        app,
+        int(row["id"]),
+        candidate,
+        token,
+        share_url=share_url,
+        share_provider=share_provider,
+        share_external_id=share_external_id,
+        status=status,
+        email_error=combined_error,
+        email_message=email_message,
+    )
+    return status, email_sent
+
+
 def _create_nextcloud_share_link(app: Flask, candidate: RecordingCandidate) -> tuple[str, str, str]:
     nextcloud_path = _nextcloud_path_for_candidate(app, candidate)
     if not nextcloud_path:
@@ -7207,6 +7352,14 @@ def _normalize_recording_email_message(value: str) -> str:
     message = (value or "").replace("\r\n", "\n").replace("\r", "\n")
     message = message.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
     return message.strip()
+
+
+def _valid_email_address(value: str) -> bool:
+    email = str(value or "").strip()
+    if len(email) > 254 or any(character.isspace() for character in email):
+        return False
+    local, separator, domain = email.rpartition("@")
+    return bool(separator and local and "." in domain and not domain.startswith(".") and not domain.endswith("."))
 
 
 def _recording_email_html(
@@ -8212,6 +8365,103 @@ RECORDING_ADMIN_TEMPLATE = """
         padding:1rem;
         box-shadow:var(--shadow);
       }
+      .share-composer {
+        margin-bottom:1rem;
+        border:1px solid rgba(116,221,180,.34);
+        border-radius:24px;
+        background:linear-gradient(145deg,rgba(12,29,45,.96),rgba(7,18,30,.96));
+        box-shadow:var(--shadow);
+        overflow:hidden;
+      }
+      .share-composer > summary {
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:1rem;
+        padding:1rem 1.1rem;
+        list-style:none;
+        cursor:pointer;
+      }
+      .share-composer > summary::-webkit-details-marker { display:none; }
+      .share-composer > summary strong { display:block; margin-top:.2rem; font-size:1.16rem; }
+      .share-composer > summary p { margin-top:.2rem; color:var(--muted); line-height:1.4; }
+      .share-composer > summary::after {
+        content:"Open";
+        border:1px solid rgba(116,221,180,.35);
+        border-radius:999px;
+        padding:.42rem .64rem;
+        color:var(--good);
+        background:rgba(116,221,180,.08);
+        font:900 .66rem var(--mono);
+        letter-spacing:.1em;
+        text-transform:uppercase;
+      }
+      .share-composer[open] > summary { border-bottom:1px solid var(--line-soft); }
+      .share-composer[open] > summary::after { content:"Close"; }
+      .share-form { display:grid; gap:1rem; padding:1.05rem; }
+      .recipient-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:.75rem; }
+      .form-field { display:grid; gap:.38rem; color:var(--muted); font-weight:850; }
+      .form-field input, .form-field select, .form-field textarea, .library-toolbar input, .library-toolbar select {
+        width:100%;
+        min-height:3rem;
+        border:1px solid var(--line);
+        border-radius:14px;
+        background:rgba(4,11,20,.62);
+        color:var(--text);
+        padding:.72rem .8rem;
+        font:inherit;
+      }
+      .form-field textarea { min-height:6.5rem; resize:vertical; line-height:1.45; }
+      .form-field input:focus, .form-field select:focus, .form-field textarea:focus, .library-toolbar input:focus, .library-toolbar select:focus {
+        outline:2px solid rgba(143,211,255,.42);
+        outline-offset:1px;
+        border-color:var(--accent);
+      }
+      .library-browser {
+        display:grid;
+        gap:.72rem;
+        border:1px solid var(--line);
+        border-radius:20px;
+        background:rgba(4,11,20,.34);
+        padding:.85rem;
+      }
+      .library-browser-head { display:flex; justify-content:space-between; gap:1rem; align-items:end; flex-wrap:wrap; }
+      .library-browser-head strong { display:block; margin-top:.18rem; }
+      .library-browser-head p, .library-status { color:var(--muted); line-height:1.4; }
+      .library-toolbar { display:grid; grid-template-columns:minmax(0,1fr) minmax(10rem,.28fr); gap:.65rem; }
+      .library-results {
+        display:grid;
+        grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:.55rem;
+        max-height:28rem;
+        overflow:auto;
+        padding:.08rem .18rem .08rem .08rem;
+      }
+      .library-item {
+        position:relative;
+        display:grid;
+        grid-template-columns:auto minmax(0,1fr);
+        gap:.68rem;
+        align-items:start;
+        border:1px solid rgba(143,211,255,.16);
+        border-radius:15px;
+        background:rgba(143,211,255,.035);
+        padding:.72rem;
+        cursor:pointer;
+        transition:border-color .16s ease, background .16s ease, transform .16s ease;
+      }
+      .library-item:hover { border-color:var(--line-strong); background:rgba(143,211,255,.07); transform:translateY(-1px); }
+      .library-item:has(input:checked) { border-color:rgba(116,221,180,.7); background:rgba(116,221,180,.11); box-shadow:inset 0 0 0 1px rgba(116,221,180,.14); }
+      .library-item input { width:1.05rem; height:1.05rem; margin:.16rem 0 0; accent-color:var(--good); }
+      .library-item strong { display:block; line-height:1.3; }
+      .library-item-meta { display:flex; gap:.42rem; margin-top:.35rem; flex-wrap:wrap; color:var(--muted); font-size:.78rem; }
+      .library-kind { color:var(--accent); font:850 .64rem var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+      .library-path { display:block; margin-top:.3rem; color:var(--muted); font-size:.76rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .selected-share { border-left:3px solid var(--good); padding:.25rem 0 .25rem .72rem; color:var(--muted); }
+      .selected-share strong { color:var(--text); }
+      .share-form-actions { display:flex; justify-content:flex-end; gap:.6rem; flex-wrap:wrap; }
+      .share-form-actions button { color:#dcfff0; background:rgba(116,221,180,.13); border-color:rgba(116,221,180,.42); }
+      .share-form-actions .secondary-action { color:var(--accent); background:rgba(143,211,255,.08); border-color:var(--line-strong); }
       .section-head { display:flex; justify-content:space-between; align-items:end; gap:1rem; margin-bottom:.85rem; flex-wrap:wrap; }
       .section-head p { max-width:46rem; margin-top:.28rem; color:var(--muted); line-height:1.45; }
       .request-groups { display:grid; gap:1rem; }
@@ -8402,6 +8652,7 @@ RECORDING_ADMIN_TEMPLATE = """
       .banner.error { border-color:rgba(255,154,154,.4); background:var(--bad-soft); color:#ffaaaa; }
       @media (max-width:1100px) {
         .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+        .recipient-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
         .request-table-head { display:none; }
         .request-head { grid-template-columns:minmax(0,1fr) minmax(0,1fr); align-items:start; }
         .approve-grid { grid-template-columns:1fr; }
@@ -8410,18 +8661,21 @@ RECORDING_ADMIN_TEMPLATE = """
       }
       @media (max-width:760px) {
         main { width:min(100vw - 24px, 1120px); padding-top:18px; }
-        header { grid-template-columns:minmax(0,1fr) auto; gap:.65rem; }
+        header { grid-template-columns:1fr; gap:.8rem; }
         header > div:first-child { min-width:0; }
         header h1 { font-size:clamp(1.65rem, 8vw, 2.9rem); }
         header .muted { font-size:.86rem; }
         .section-head, .approval-head { display:flex; align-items:flex-start; flex-direction:column; }
-        .actions { width:min(65vw, 15.5rem); justify-content:flex-end; flex-wrap:nowrap; gap:.35rem; }
-        .actions > a, .actions > form { flex:1 1 0; min-width:0; }
+        .actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); width:100%; justify-content:stretch; gap:.4rem; }
+        .actions > a, .actions > form { min-width:0; }
         .actions > form > button, header .actions a { width:100%; min-width:0; }
         header .actions a, header .actions button { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:.5rem .3rem; font-size:.72rem; border-radius:12px; }
         .tabs { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); border-radius:999px; width:100%; }
         .tab { justify-content:space-between; }
-        .metrics, .request-head { grid-template-columns:1fr; }
+        .metrics, .request-head, .recipient-grid, .library-toolbar, .library-results { grid-template-columns:1fr; }
+        .share-composer > summary { align-items:flex-start; }
+        .share-composer > summary::after { flex:0 0 auto; }
+        .share-form-actions, .share-form-actions button { width:100%; }
         .request-body { padding:.78rem; }
         .action-panel, .approve-form { border-radius:14px; padding:.78rem; }
         .approve-form select { font-size:.88rem; }
@@ -8441,6 +8695,7 @@ RECORDING_ADMIN_TEMPLATE = """
           <p class="muted">Approve message, worship, and testimony recording requests.</p>
         </div>
         <div class="actions">
+          <a href="#new-share">New Share</a>
           <a href="{{ recordings_url_for('testimony_review') }}">Recorder Review</a>
           <a href="{{ recordings_url_for('public_form') }}">Public Form</a>
           <form method="post" action="{{ recordings_url_for('admin_logout') }}"><button type="submit">Sign Out</button></form>
@@ -8448,6 +8703,90 @@ RECORDING_ADMIN_TEMPLATE = """
       </header>
       {% if message %}<div class="banner">{{ message }}</div>{% endif %}
       {% if error %}<div class="banner error">{{ error }}</div>{% endif %}
+      <details class="share-composer" id="new-share" data-share-composer data-library-url="{{ share_library_search_url }}" open>
+        <summary>
+          <div>
+            <div class="meta">Admin Share</div>
+            <strong>Create a Share</strong>
+            <p>Choose a library recording, add the recipient, then prepare the private link or send it immediately.</p>
+          </div>
+        </summary>
+        <form class="share-form" method="post" action="{{ recordings_url_for('create_admin_share') }}">
+          <div class="recipient-grid">
+            <label class="form-field">
+              Recipient name
+              <input type="text" name="requester_name" autocomplete="name" required placeholder="Name">
+            </label>
+            <label class="form-field">
+              Email address
+              <input type="email" name="email" autocomplete="email" required placeholder="name@example.com">
+            </label>
+            <label class="form-field">
+              Send copy to <span class="muted">Optional</span>
+              <input type="email" name="secondary_email" autocomplete="email" placeholder="second@example.com">
+            </label>
+          </div>
+          <section class="library-browser" aria-labelledby="share-library-title">
+            <div class="library-browser-head">
+              <div>
+                <div class="meta">NAS Library</div>
+                <strong id="share-library-title">Select a recording or worship folder</strong>
+                <p>Search by title, speaker, date, or folder. Newest recordings appear first.</p>
+              </div>
+              <span class="library-status" data-library-status>{{ share_library_items|length }} recent selections</span>
+            </div>
+            <div class="library-toolbar">
+              <label class="form-field">
+                Search library
+                <input type="search" data-library-search placeholder="Try a title, speaker, or date">
+              </label>
+              <label class="form-field">
+                Recording type
+                <select data-library-kind>
+                  <option value="all">All recordings</option>
+                  <option value="message">Messages</option>
+                  <option value="worship">Worship folders</option>
+                  <option value="testimony">Testimonies</option>
+                </select>
+              </label>
+            </div>
+            <div class="library-results" data-library-results>
+              {% for item in share_library_items %}
+                <label class="library-item">
+                  <input type="radio" name="recording_id" value="{{ item.id }}" required>
+                  <span>
+                    <strong>{{ item.title }}</strong>
+                    <span class="library-item-meta">
+                      <span class="library-kind">{{ item.kind_label }}</span>
+                      <span>{{ item.recording_date_label }}</span>
+                      {% if item.target_type == "folder" %}<span>{{ item.file_count }} files</span>{% endif %}
+                    </span>
+                    <span class="library-path">{{ item.relative_path }}</span>
+                  </span>
+                </label>
+              {% endfor %}
+            </div>
+            <div class="selected-share" data-selected-share><strong>No recording selected yet.</strong> Choose one from the library above.</div>
+          </section>
+          <details class="email-details">
+            <summary>Personalize message</summary>
+            <div class="recipient-grid">
+              <label class="form-field" style="grid-column:1 / -1;">
+                Email message <span class="muted">Optional</span>
+                <textarea name="email_message" placeholder="Leave blank to use the standard NTC recording message."></textarea>
+              </label>
+              <label class="form-field" style="grid-column:1 / -1;">
+                Internal note <span class="muted">Optional</span>
+                <input type="text" name="notes" placeholder="Only administrators will see this note">
+              </label>
+            </div>
+          </details>
+          <div class="share-form-actions">
+            <button class="secondary-action" type="submit" name="delivery_action" value="prepare">Create Link</button>
+            {% if email_enabled %}<button type="submit" name="delivery_action" value="send">Send by Email</button>{% endif %}
+          </div>
+        </form>
+      </details>
       <section class="metrics" aria-label="Recording request status">
         <div class="metric"><span>Pending</span><strong>{{ pending_count }}</strong><small>Needs review</small></div>
         <div class="metric"><span>Completed</span><strong>{{ completed_count }}</strong><small>{{ active_count }} active · {{ closed_count + archived_count }} closed</small></div>
@@ -8629,6 +8968,107 @@ RECORDING_ADMIN_TEMPLATE = """
         </section>
       </div>
     </main>
+    <script>
+      (() => {
+        const composer = document.querySelector("[data-share-composer]");
+        if (!composer) return;
+        const searchInput = composer.querySelector("[data-library-search]");
+        const kindInput = composer.querySelector("[data-library-kind]");
+        const results = composer.querySelector("[data-library-results]");
+        const status = composer.querySelector("[data-library-status]");
+        const selected = composer.querySelector("[data-selected-share]");
+        const libraryUrl = composer.dataset.libraryUrl;
+        let searchTimer = null;
+        let searchController = null;
+
+        const setSelectedCopy = (input) => {
+          const card = input ? input.closest(".library-item") : null;
+          const title = card ? card.querySelector("strong") : null;
+          if (!title) {
+            selected.innerHTML = "<strong>No recording selected yet.</strong> Choose one from the library above.";
+            return;
+          }
+          selected.replaceChildren();
+          const strong = document.createElement("strong");
+          strong.textContent = title.textContent;
+          selected.append(strong, document.createTextNode(" selected for sharing."));
+        };
+
+        const renderItems = (items) => {
+          results.replaceChildren();
+          if (!items.length) {
+            const empty = document.createElement("p");
+            empty.className = "muted";
+            empty.textContent = "No matching library recordings were found.";
+            results.append(empty);
+            status.textContent = "0 matches";
+            setSelectedCopy(null);
+            return;
+          }
+          items.forEach((item) => {
+            const card = document.createElement("label");
+            card.className = "library-item";
+            const radio = document.createElement("input");
+            radio.type = "radio";
+            radio.name = "recording_id";
+            radio.value = item.id;
+            radio.required = true;
+            const copy = document.createElement("span");
+            const title = document.createElement("strong");
+            title.textContent = item.title;
+            const meta = document.createElement("span");
+            meta.className = "library-item-meta";
+            const kind = document.createElement("span");
+            kind.className = "library-kind";
+            kind.textContent = item.kind_label;
+            const date = document.createElement("span");
+            date.textContent = item.recording_date_label;
+            meta.append(kind, date);
+            if (item.target_type === "folder") {
+              const count = document.createElement("span");
+              count.textContent = `${item.file_count} files`;
+              meta.append(count);
+            }
+            const path = document.createElement("span");
+            path.className = "library-path";
+            path.textContent = item.relative_path;
+            copy.append(title, meta, path);
+            card.append(radio, copy);
+            results.append(card);
+          });
+          status.textContent = `${items.length} match${items.length === 1 ? "" : "es"}`;
+          setSelectedCopy(null);
+        };
+
+        const searchLibrary = async () => {
+          if (searchController) searchController.abort();
+          searchController = new AbortController();
+          status.textContent = "Searching…";
+          const params = new URLSearchParams({q: searchInput.value.trim(), kind: kindInput.value});
+          try {
+            const response = await fetch(`${libraryUrl}?${params}`, {
+              headers: {"Accept": "application/json", "X-Requested-With": "fetch"},
+              signal: searchController.signal,
+            });
+            const payload = await response.json();
+            if (!response.ok || !payload.ok) throw new Error(payload.error || "Library search failed");
+            renderItems(payload.items || []);
+          } catch (error) {
+            if (error.name === "AbortError") return;
+            status.textContent = "Search unavailable";
+          }
+        };
+
+        results.addEventListener("change", (event) => {
+          if (event.target.matches('input[name="recording_id"]')) setSelectedCopy(event.target);
+        });
+        searchInput.addEventListener("input", () => {
+          window.clearTimeout(searchTimer);
+          searchTimer = window.setTimeout(searchLibrary, 220);
+        });
+        kindInput.addEventListener("change", searchLibrary);
+      })();
+    </script>
   </body>
 </html>
 """

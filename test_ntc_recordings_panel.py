@@ -196,6 +196,11 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertEqual(login.status_code, 302)
         self.assertEqual(login.headers["Location"], "/recordings/admin/panel")
 
+        panel = self.client.get("/admin/panel", base_url="https://ntcnas.myftp.org")
+        self.assertEqual(panel.status_code, 200)
+        self.assertIn(b'action="/recordings/admin/requests/create"', panel.data)
+        self.assertIn(b'data-library-url="/recordings/admin/library/search"', panel.data)
+
         testimony_source_root = self.root / "TestimonyReviewQueue"
         testimony_source_root.mkdir(exist_ok=True)
         (testimony_source_root / "REC00123.mp3").write_bytes(b"prefix-testimony-audio")
@@ -359,6 +364,92 @@ class RecordingRequestPanelTests(unittest.TestCase):
         self.assertIn(b"Completed Requests", revoked.data)
         self.assertIn(b"Access revoked", revoked.data)
         self.assertEqual(self.client.get(f"/share/{token}").status_code, 404)
+
+    def test_admin_can_create_share_without_public_request(self):
+        panel = self._login()
+
+        self.assertEqual(panel.status_code, 200)
+        self.assertIn(b"Create a Share", panel.data)
+        self.assertIn(b"Search library", panel.data)
+        self.assertIn(b"Send copy to", panel.data)
+        self.assertIn(b'action="/admin/requests/create"', panel.data)
+        self.assertIn(b'data-library-url="/admin/library/search"', panel.data)
+
+        prepared = self.client.post(
+            "/admin/requests/create",
+            data={
+                "requester_name": "Direct Recipient",
+                "email": "direct@example.test",
+                "recording_id": _recording_id(self.recording),
+                "delivery_action": "prepare",
+                "notes": "Created by an administrator.",
+            },
+            follow_redirects=True,
+        )
+
+        self.assertEqual(prepared.status_code, 200)
+        self.assertIn(b"Share link is ready", prepared.data)
+        self.assertIn(b"Completed Requests", prepared.data)
+        self.assertIn(b"Direct Recipient", prepared.data)
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT requester_name, email, status, recording_title, notes, share_token FROM recording_requests"
+            ).fetchone()
+        self.assertEqual(row[:5], ("Direct Recipient", "direct@example.test", "ready", "Jesus Is Our Peace - Bro Blessen", "Created by an administrator."))
+        self.assertTrue(row[5])
+
+    def test_admin_can_create_and_email_share_without_public_request(self):
+        self.app.config.update(
+            NTC_RECORDINGS_EMAIL_ENABLED="1",
+            NTC_RECORDINGS_EMAIL_FROM="recordings@example.test",
+            NTC_RECORDINGS_SMTP_HOST="smtp.example.test",
+        )
+        self._login()
+
+        with patch("ntc_recordings_app._send_recording_email", return_value=(True, "")) as sender:
+            sent = self.client.post(
+                "/admin/requests/create",
+                data={
+                    "requester_name": "Emailed Recipient",
+                    "email": "emailed@example.test",
+                    "secondary_email": "copy@example.test",
+                    "recording_id": _recording_id(self.recording),
+                    "delivery_action": "send",
+                },
+                follow_redirects=True,
+            )
+
+        self.assertEqual(sent.status_code, 200)
+        self.assertIn(b"Recording link emailed to emailed@example.test", sent.data)
+        sender.assert_called_once()
+        with sqlite3.connect(self.db_path) as connection:
+            row = connection.execute(
+                "SELECT email, secondary_email, status, sent_at FROM recording_requests"
+            ).fetchone()
+        self.assertEqual(row[:3], ("emailed@example.test", "copy@example.test", "sent"))
+        self.assertTrue(row[3])
+
+    def test_admin_library_search_filters_share_targets(self):
+        self._login()
+
+        response = self.client.get(
+            "/admin/library/search?q=Jesus+Peace&kind=message",
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["items"][0]["title"], "Jesus Is Our Peace - Bro Blessen")
+        self.assertEqual(payload["items"][0]["kind"], "message")
+
+        no_match = self.client.get(
+            "/admin/library/search?q=not-a-real-recording&kind=all",
+            headers={"Accept": "application/json", "X-Requested-With": "fetch"},
+        )
+        self.assertEqual(no_match.status_code, 200)
+        self.assertEqual(no_match.get_json()["items"], [])
 
     def test_closed_request_can_be_archived(self):
         self.client.post(
